@@ -1,0 +1,14 @@
+name: termite-config
+description: TermiteRS 配置助理，帮助用户生成和调整个人 fork 自动维护配置。
+system_prompt: system.md
+default_mode: propose-only
+allowed_files:
+  - termite.yml
+  - termite.docker.yml
+  - .env.example
+  - README.md
+forbidden_files:
+  - .env
+required_checks:
+  - cargo run -- doctor --config termite.yml
+  - cargo run -- sync --config termite.yml --dry-run

@@ -1,0 +1,100 @@
+repo:
+  path: /workspace/project
+  upstream: git@github.com:upstream-owner/project.git
+  fork: git@github.com:your-name/project.git
+  base_branch: master
+  upstream_remote: origin
+  fork_remote: fork
+
+branches:
+  - name: fix/sample-change
+    kind: pr
+    note: 测试样本分支；可用于单功能投稿，但不是长期维护复杂 PR 队列的主场景。
+    sync: rebase
+    push: force-with-lease
+    tests: []
+
+  - name: my/project
+    kind: product
+    note: 个人自用主分支，允许混合多个个人补丁，优先保证持续跟随上游。
+    sync: rebase
+    push: force-with-lease
+    tests: []
+
+daemon:
+  interval_seconds: 1800
+  jitter_seconds: 120
+  run_on_start: true
+  max_consecutive_failures: 3
+
+llm:
+  enabled: false
+  provider: deep-seek
+  model: deepseek-v4-pro
+  api_key_env: DEEPSEEK_API_KEY
+  temperature: 0.1
+  max_prompt_bytes: 81920
+  prompts:
+    # 可用占位符：{branch}、{base}、{conflict_files}、{git_status}、{combined_diff}
+    conflict_system: |
+      你是一个严谨的软件分支维护助手。请分析 Git rebase/merge 冲突，判断是机械冲突还是功能冲突，并给出安全处理建议。不要编造没有出现在 diff 中的代码。
+    conflict_user: |
+      请分析下面的冲突。
+
+      分支：{branch}
+      基线：{base}
+
+      冲突文件：
+      {conflict_files}
+
+      Git 状态：
+      {git_status}
+
+      Combined diff：
+      {combined_diff}
+    # 可用占位符：{report}
+    sync_summary_system: |
+      你是一个严谨的软件分支维护助手。请只根据同步报告做中文总结，不要编造不存在的提交、测试或冲突。
+    sync_summary_user: |
+      请总结下面这次 TermiteRS 同步报告。
+
+      要求：
+      - 控制在 5 条以内。
+      - 说明成功、失败或冲突的分支。
+      - 如果全部成功，说明是否已经推送远端。
+      - 如果有失败或冲突，给出下一步建议。
+
+      同步报告：
+      {report}
+
+notify:
+  enabled: false
+  subject_prefix: "[TermiteRS]"
+  events:
+    # true 时，每个分支开始同步前会发送“正在合并”通知。
+    sync_start: false
+    # true 时，每次同步结束后会调用 LLM 总结，并发送一封总结邮件。
+    sync_summary: false
+  policy:
+    mode: primary-with-fallback
+  channels:
+    - name: cloudflare
+      kind: cloudflare-email-service
+      enabled: false
+      api_token_env: CLOUDFLARE_API_TOKEN
+      account_id_env: CLOUDFLARE_ACCOUNT_ID
+      from: termite@example.com
+      to:
+        - your@qq.com
+
+    - name: qq
+      kind: smtp
+      enabled: true
+      smtp_host: smtp.qq.com
+      smtp_port: 465
+      tls: implicit
+      username_env: QQ_SMTP_USER
+      password_env: QQ_SMTP_AUTH_CODE
+      from: your@qq.com
+      to:
+        - your@qq.com

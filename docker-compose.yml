@@ -1,0 +1,14 @@
+services:
+  termiters:
+    build: .
+    image: termiters:local
+    working_dir: /app
+    env_file:
+      - .env
+    environment:
+      GIT_SSH_COMMAND: ssh -o StrictHostKeyChecking=accept-new
+    volumes:
+      - ./termite.docker.yml:/app/termite.yml:ro
+      - ${TERMITE_PROJECT_DIR:-../project}:/workspace/project
+      - ${TERMITE_SSH_DIR:-./.ssh-not-configured}:/root/.ssh:ro
+    command: ["assistant", "--config", "/app/termite.yml"]
