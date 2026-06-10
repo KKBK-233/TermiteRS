@@ -155,11 +155,15 @@ cargo run -- sync --config termite.yml --dry-run
 cargo run -- sync --config termite.yml
 ```
 
+手动 `sync` 会发送项目级总结邮件，即使本次没有上游更新。
+
 后台常驻：
 
 ```powershell
 cargo run -- daemon --config termite.yml
 ```
+
+daemon 自动触发的周期检查只有在出现上游更新、推送变更、失败或冲突时才发送邮件；如果只是无变化自检，不会发邮件。
 
 无参数启动会进入交互式 AI 助理入口：
 
