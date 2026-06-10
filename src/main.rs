@@ -40,7 +40,7 @@ fn main() -> Result<()> {
         }
         Commands::Daemon { config, once } => {
             let config = Config::read_from(config)?;
-            Daemon::new(config, once).run()?;
+            Daemon::new(config, once, once).run()?;
         }
         Commands::Sync {
             config,
@@ -48,7 +48,11 @@ fn main() -> Result<()> {
             dry_run,
         } => {
             let config = Config::read_from(config)?;
-            let options = SyncOptions { branch, dry_run };
+            let options = SyncOptions {
+                branch,
+                dry_run,
+                notify_on_noop: true,
+            };
             let report = SyncRunner::new(config, options).run()?;
             println!("{}", report.render_text());
         }

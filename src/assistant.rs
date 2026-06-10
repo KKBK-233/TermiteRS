@@ -88,13 +88,13 @@ impl Assistant {
 
     fn run_daemon_once(&self) -> Result<()> {
         let config = Config::read_from(&self.config_path)?;
-        Daemon::new(config, true).run()
+        Daemon::new(config, true, true).run()
     }
 
     fn run_daemon(&self) -> Result<()> {
         println!("正在启动常驻核心进程。停止请按 Ctrl+C。");
         let config = Config::read_from(&self.config_path)?;
-        Daemon::new(config, false).run()
+        Daemon::new(config, false, false).run()
     }
 
     fn reply_to_user(&self, input: &str, history: &mut Vec<ConversationMessage>) -> Result<()> {

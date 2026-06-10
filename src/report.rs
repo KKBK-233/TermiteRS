@@ -11,6 +11,7 @@ pub struct BranchReport {
     pub kind: BranchKind,
     pub status: BranchStatus,
     pub head: Option<String>,
+    pub activity: bool,
     pub details: Vec<String>,
 }
 
@@ -55,6 +56,10 @@ impl SyncReport {
 
         out
     }
+
+    pub fn has_activity(&self) -> bool {
+        self.entries.iter().any(|entry| entry.activity)
+    }
 }
 
 impl BranchReport {
@@ -64,6 +69,7 @@ impl BranchReport {
             kind,
             status,
             head: None,
+            activity: false,
             details: Vec::new(),
         }
     }
@@ -75,6 +81,15 @@ impl BranchReport {
 
     pub fn push_detail(&mut self, detail: impl Into<String>) {
         self.details.push(detail.into());
+    }
+
+    pub fn active(mut self) -> Self {
+        self.activity = true;
+        self
+    }
+
+    pub fn mark_active(&mut self) {
+        self.activity = true;
     }
 
     pub fn render_text(&self) -> String {

@@ -10,11 +10,16 @@ use crate::sync::{SyncOptions, SyncRunner};
 pub struct Daemon {
     config: Config,
     once: bool,
+    notify_on_noop: bool,
 }
 
 impl Daemon {
-    pub fn new(config: Config, once: bool) -> Self {
-        Self { config, once }
+    pub fn new(config: Config, once: bool, notify_on_noop: bool) -> Self {
+        Self {
+            config,
+            once,
+            notify_on_noop,
+        }
     }
 
     pub fn run(&self) -> Result<()> {
@@ -45,6 +50,7 @@ impl Daemon {
         let options = SyncOptions {
             branch: None,
             dry_run: false,
+            notify_on_noop: self.notify_on_noop,
         };
         match SyncRunner::new(self.config.clone(), options).run() {
             Ok(report) => {
