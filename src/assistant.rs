@@ -10,8 +10,16 @@ use crate::doctor::Doctor;
 use crate::llm::LlmService;
 use crate::sync::{SyncOptions, SyncRunner};
 
+const MAX_HISTORY_MESSAGES: usize = 12;
+
 pub struct Assistant {
     config_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct ConversationMessage {
+    role: &'static str,
+    content: String,
 }
 
 impl Assistant {
@@ -30,6 +38,7 @@ impl Assistant {
         println!();
 
         let stdin = io::stdin();
+        let mut history = Vec::new();
         loop {
             print!("termite> ");
             io::stdout().flush()?;
@@ -48,6 +57,10 @@ impl Assistant {
             match input {
                 "/exit" | "/quit" => return Ok(()),
                 "/help" => print_help(),
+                "/clear" => {
+                    history.clear();
+                    println!("已清空当前助理会话上下文。");
+                }
                 "/doctor" => self.run_doctor()?,
                 "/status" => self.run_status()?,
                 "/once" => self.run_daemon_once()?,
@@ -55,7 +68,7 @@ impl Assistant {
                     self.run_daemon()?;
                     return Ok(());
                 }
-                _ => self.reply_to_user(input)?,
+                _ => self.reply_to_user(input, &mut history)?,
             }
         }
     }
@@ -84,10 +97,10 @@ impl Assistant {
         Daemon::new(config, false).run()
     }
 
-    fn reply_to_user(&self, input: &str) -> Result<()> {
+    fn reply_to_user(&self, input: &str, history: &mut Vec<ConversationMessage>) -> Result<()> {
         let config = Config::read_from(&self.config_path)?;
         let system_prompt = read_agent_prompt(Path::new("agents/termite-config/system.md"))?;
-        let user_prompt = build_user_prompt(input, &config);
+        let user_prompt = build_user_prompt(input, &config, history);
         let llm = LlmService::new(config.llm.clone());
 
         match llm.assistant_reply(&system_prompt, &user_prompt) {
@@ -95,6 +108,8 @@ impl Assistant {
                 println!();
                 println!("{reply}");
                 println!();
+                push_history(history, "user", input.to_string());
+                push_history(history, "assistant", reply);
             }
             Ok(None) => {
                 println!(
@@ -116,6 +131,7 @@ fn print_help() {
     println!("  /status  查看分支状态");
     println!("  /once    运行一次 daemon 同步并退出本次同步");
     println!("  /daemon  启动常驻核心进程");
+    println!("  /clear   清空当前助理会话上下文");
     println!("  /exit    退出助理");
     println!();
     println!("自然语言示例：");
@@ -145,10 +161,13 @@ fn read_agent_prompt(path: &Path) -> Result<String> {
     fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))
 }
 
-fn build_user_prompt(input: &str, config: &Config) -> String {
+fn build_user_prompt(input: &str, config: &Config, history: &[ConversationMessage]) -> String {
     format!(
         r#"用户需求：
 {input}
+
+最近会话上下文：
+{}
 
 当前配置摘要：
 - repo.path: {}
@@ -160,8 +179,11 @@ fn build_user_prompt(input: &str, config: &Config) -> String {
 - branches:
 {}
 
-请根据助理规则给出配置建议。不要直接声称已经修改文件；如果需要修改，请列出建议修改的 YAML 片段和需要用户确认的问题。
+请根据助理规则给出配置建议。
+如果用户只回复了“是”、“否”、“B”、“第 2 个”等短回答，必须结合最近会话上下文理解它指向的上一个问题或选项。
+不要直接声称已经修改文件；如果需要修改，请列出建议修改的 YAML 片段和需要用户确认的问题。
 "#,
+        history_summary(history),
         config.repo.path.display(),
         config.repo.upstream_remote,
         config.repo.fork_remote,
@@ -170,6 +192,34 @@ fn build_user_prompt(input: &str, config: &Config) -> String {
         config.daemon.max_consecutive_failures,
         branch_summary(config)
     )
+}
+
+fn push_history(history: &mut Vec<ConversationMessage>, role: &'static str, content: String) {
+    history.push(ConversationMessage { role, content });
+    if history.len() > MAX_HISTORY_MESSAGES {
+        history.remove(0);
+    }
+}
+
+fn history_summary(history: &[ConversationMessage]) -> String {
+    if history.is_empty() {
+        return "  none".to_string();
+    }
+
+    history
+        .iter()
+        .map(|message| format!("  {}: {}", message.role, one_line(&message.content)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn one_line(text: &str) -> String {
+    let mut line = text.replace('\r', "").replace('\n', " | ");
+    if line.len() > 800 {
+        line.truncate(800);
+        line.push_str("...");
+    }
+    line
 }
 
 fn branch_summary(config: &Config) -> String {
