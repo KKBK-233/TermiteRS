@@ -68,7 +68,11 @@ impl Assistant {
                     self.run_daemon()?;
                     return Ok(());
                 }
-                _ => self.reply_to_user(input, &mut history)?,
+                _ => {
+                    if !self.try_handle_local_action(input)? {
+                        self.reply_to_user(input, &mut history)?;
+                    }
+                }
             }
         }
     }
@@ -105,6 +109,7 @@ impl Assistant {
 
         match llm.assistant_reply(&system_prompt, &user_prompt) {
             Ok(Some(reply)) => {
+                let reply = clean_terminal_reply(&reply);
                 println!();
                 println!("{reply}");
                 println!();
@@ -121,6 +126,28 @@ impl Assistant {
             }
         }
         Ok(())
+    }
+
+    fn try_handle_local_action(&self, input: &str) -> Result<bool> {
+        if !(input.contains("停止维护") || input.contains("不再维护")) {
+            return Ok(false);
+        }
+
+        let config = Config::read_from(&self.config_path)?;
+        let Some(branch) = config
+            .branches
+            .iter()
+            .find(|branch| input.contains(&branch.name))
+            .map(|branch| branch.name.clone())
+        else {
+            return Ok(false);
+        };
+
+        remove_branch_from_config(&self.config_path, &branch)?;
+        println!("已从 TermiteRS 配置中移除分支：{branch}");
+        println!("未删除本地 Git 分支，也未删除远端 fork 分支。");
+        println!("建议继续执行：/doctor，然后执行 /once 做一次人工检查。");
+        Ok(true)
     }
 }
 
@@ -215,11 +242,61 @@ fn history_summary(history: &[ConversationMessage]) -> String {
 
 fn one_line(text: &str) -> String {
     let mut line = text.replace('\r', "").replace('\n', " | ");
-    if line.len() > 800 {
-        line.truncate(800);
+    if line.chars().count() > 800 {
+        line = line.chars().take(800).collect();
         line.push_str("...");
     }
     line
+}
+
+fn clean_terminal_reply(reply: &str) -> String {
+    reply
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed == "---" || trimmed.starts_with("```") {
+                return None;
+            }
+            let line = trimmed
+                .trim_start_matches('#')
+                .trim()
+                .replace("**", "")
+                .replace('`', "");
+            Some(line)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn remove_branch_from_config(config_path: &Path, branch_name: &str) -> Result<()> {
+    let raw = fs::read_to_string(config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    let lines = raw.lines().collect::<Vec<_>>();
+    let target = format!("  - name: {branch_name}");
+    let Some(start) = lines.iter().position(|line| line.trim_end() == target) else {
+        return Ok(());
+    };
+
+    let mut end = lines.len();
+    for (index, line) in lines.iter().enumerate().skip(start + 1) {
+        if line.starts_with("  - name: ") || (is_top_level_key(line) && !line.trim().is_empty()) {
+            end = index;
+            break;
+        }
+    }
+
+    let mut next = Vec::new();
+    next.extend_from_slice(&lines[..start]);
+    next.extend_from_slice(&lines[end..]);
+    let mut output = next.join("\n");
+    output.push('\n');
+    fs::write(config_path, output)
+        .with_context(|| format!("failed to write {}", config_path.display()))?;
+    Ok(())
+}
+
+fn is_top_level_key(line: &str) -> bool {
+    !line.starts_with(' ') && line.ends_with(':')
 }
 
 fn branch_summary(config: &Config) -> String {
