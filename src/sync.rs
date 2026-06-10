@@ -14,6 +14,7 @@ const MAX_REPORTED_FILES: usize = 30;
 pub struct SyncOptions {
     pub branch: Option<String>,
     pub dry_run: bool,
+    pub notify_on_noop: bool,
 }
 
 impl SyncOptions {
@@ -21,6 +22,7 @@ impl SyncOptions {
         Self {
             branch: None,
             dry_run: true,
+            notify_on_noop: false,
         }
     }
 }
@@ -80,7 +82,11 @@ impl SyncRunner {
             report.push(branch_report);
         }
         if self.notifier.sync_summary_enabled() {
-            self.notify_sync_summary(&report)?;
+            if self.options.notify_on_noop || report.has_activity() {
+                self.notify_sync_summary(&report)?;
+            } else {
+                info!("sync summary skipped because daemon tick had no activity");
+            }
         } else {
             self.notify_failed_branches(&report)?;
         }
@@ -132,6 +138,7 @@ impl SyncRunner {
             let snapshot = self.git.conflict_snapshot(80 * 1024)?;
             self.git.abort_rebase_or_merge();
             let mut entry = BranchReport::new(&branch.name, branch.kind, BranchStatus::Conflict)
+                .active()
                 .detail(branch_note_detail(branch))
                 .detail(format!("before sync: {before_head}"))
                 .detail(format!("target base: {base} @ {base_head}"))
@@ -173,6 +180,7 @@ impl SyncRunner {
             let output = self.git.run_test(test)?;
             if !output.success() {
                 let mut entry = BranchReport::new(&branch.name, branch.kind, BranchStatus::Failed)
+                    .active()
                     .detail(format!("test failed: {test}"))
                     .detail(format!("exit code: {}", output.status));
                 if !output.stderr.trim().is_empty() {
@@ -223,6 +231,13 @@ impl SyncRunner {
 
         let mut entry = BranchReport::new(&branch.name, branch.kind, BranchStatus::Success);
         entry.head = Some(after_sync_head.clone());
+        if !upstream_commits.is_empty()
+            || !commits_to_push.is_empty()
+            || !files_to_push.is_empty()
+            || before_head != after_sync_head
+        {
+            entry.mark_active();
+        }
         entry.push_detail(branch_note_detail(branch));
         entry.push_detail(format!("before sync: {before_head}"));
         entry.push_detail(format!("after sync: {after_sync_head}"));
@@ -381,6 +396,7 @@ impl SyncRunner {
 
 fn push_failed_report(branch: &BranchConfig, status: i32, stderr: String) -> BranchReport {
     BranchReport::new(&branch.name, branch.kind, BranchStatus::Failed)
+        .active()
         .detail(branch_note_detail(branch))
         .detail(format!("push failed with code {status}"))
         .detail(format!("stderr: {}", one_line(&stderr)))
