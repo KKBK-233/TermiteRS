@@ -1,4 +1,5 @@
 use std::env;
+use std::io::Read;
 
 use anyhow::{Context, Result, anyhow, bail};
 use reqwest::blocking::Client;
@@ -95,11 +96,15 @@ impl LlmService {
         call_chat(config, &system_prompt, &user_prompt).map(Some)
     }
 
-    pub fn assistant_reply(
+    pub fn assistant_reply_streaming<F>(
         &self,
         system_prompt: &str,
         user_prompt: &str,
-    ) -> Result<Option<String>> {
+        mut on_delta: F,
+    ) -> Result<Option<String>>
+    where
+        F: FnMut(&str) -> Result<()>,
+    {
         let Some(config) = &self.config else {
             return Ok(None);
         };
@@ -107,7 +112,7 @@ impl LlmService {
             return Ok(None);
         }
 
-        call_chat(config, system_prompt, user_prompt).map(Some)
+        call_chat_streaming(config, system_prompt, user_prompt, &mut on_delta).map(Some)
     }
 }
 
@@ -115,6 +120,7 @@ impl LlmService {
 struct ChatRequest<'a> {
     model: &'a str,
     temperature: f32,
+    stream: bool,
     messages: Vec<ChatMessage<'a>>,
 }
 
@@ -150,6 +156,7 @@ fn call_chat(config: &LlmConfig, system_prompt: &str, user_prompt: &str) -> Resu
     let body = ChatRequest {
         model: &config.model,
         temperature: config.temperature,
+        stream: false,
         messages: vec![
             ChatMessage {
                 role: "system",
@@ -177,6 +184,81 @@ fn call_chat(config: &LlmConfig, system_prompt: &str, user_prompt: &str) -> Resu
     let content = response["choices"][0]["message"]["content"]
         .as_str()
         .ok_or_else(|| anyhow!("LLM response did not contain choices[0].message.content"))?;
+
+    Ok(content.trim().to_string())
+}
+
+fn call_chat_streaming<F>(
+    config: &LlmConfig,
+    system_prompt: &str,
+    user_prompt: &str,
+    on_delta: &mut F,
+) -> Result<String>
+where
+    F: FnMut(&str) -> Result<()>,
+{
+    let api_key = env::var(&config.api_key_env)
+        .with_context(|| format!("missing LLM API key env {}", config.api_key_env))?;
+    let endpoint = chat_completions_endpoint(config)?;
+
+    let body = ChatRequest {
+        model: &config.model,
+        temperature: config.temperature,
+        stream: true,
+        messages: vec![
+            ChatMessage {
+                role: "system",
+                content: system_prompt,
+            },
+            ChatMessage {
+                role: "user",
+                content: user_prompt,
+            },
+        ],
+    };
+
+    let mut response = Client::new()
+        .post(endpoint)
+        .bearer_auth(api_key)
+        .json(&body)
+        .send()
+        .context("failed to call LLM provider")?
+        .error_for_status()
+        .context("LLM provider returned an error status")?;
+
+    let mut buffer = [0_u8; 8192];
+    let mut pending = Vec::new();
+    let mut content = String::new();
+
+    loop {
+        let read = response
+            .read(&mut buffer)
+            .context("failed to read LLM stream")?;
+        if read == 0 {
+            break;
+        }
+
+        pending.extend_from_slice(&buffer[..read]);
+        while let Some(index) = pending.iter().position(|byte| *byte == b'\n') {
+            let line = pending.drain(..=index).collect::<Vec<_>>();
+            let line = String::from_utf8_lossy(&line);
+            let line = line.trim();
+            if line.is_empty() || !line.starts_with("data:") {
+                continue;
+            }
+
+            let data = line.trim_start_matches("data:").trim();
+            if data == "[DONE]" {
+                return Ok(content.trim().to_string());
+            }
+
+            let value: Value = serde_json::from_str(data).context("failed to parse LLM stream")?;
+            if let Some(delta) = value["choices"][0]["delta"]["content"].as_str() {
+                content.push_str(delta);
+                on_delta(delta)?;
+            }
+        }
+    }
 
     Ok(content.trim().to_string())
 }
