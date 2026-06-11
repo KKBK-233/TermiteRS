@@ -276,9 +276,10 @@ llm:
       {combined_diff}
     # 可用占位符：{report}
     sync_summary_system: |
-      你是一个严谨的软件分支维护助手。请只根据同步报告做中文总结。
+      你是一个严谨的软件分支维护助手。请只根据同步报告做中文总结。输出必须是纯文本，不要使用 Markdown、加粗、标题或代码块。
     sync_summary_user: |
       请总结下面这次 TermiteRS 同步报告，控制在 5 条以内。
+      输出纯文本，不要使用 Markdown、加粗、标题或代码块。
 
       同步报告：
       {report}
