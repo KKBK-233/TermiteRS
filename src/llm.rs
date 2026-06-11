@@ -22,7 +22,7 @@ Git status:
 Combined diff:
 {combined_diff}
 "#;
-const DEFAULT_SYNC_SUMMARY_SYSTEM_PROMPT: &str = "你是一个严谨的软件分支维护助手。请只根据用户提供的同步报告进行中文总结，不要编造不存在的提交、测试或冲突。";
+const DEFAULT_SYNC_SUMMARY_SYSTEM_PROMPT: &str = "你是一个严谨的软件分支维护助手。请只根据用户提供的同步报告进行中文总结，不要编造不存在的提交、测试或冲突。输出必须是纯文本，不要使用 Markdown、加粗、标题或代码块。";
 const DEFAULT_SYNC_SUMMARY_USER_PROMPT: &str = r#"请总结下面这次 TermiteRS 同步报告。
 
 要求：
@@ -32,6 +32,7 @@ const DEFAULT_SYNC_SUMMARY_USER_PROMPT: &str = r#"请总结下面这次 TermiteR
 - 如果全部成功，说明可以继续观察或等待下次上游更新。
 - 如果有失败或冲突，给出下一步处理建议。
 - 不要编造报告之外的信息。
+- 输出纯文本，不要使用 Markdown、加粗、标题或代码块。
 
 同步报告：
 {report}
@@ -298,7 +299,7 @@ fn conflict_template_values(request: &ConflictAnalysisRequest) -> Vec<(&'static 
 }
 
 fn sync_summary_template_values(report: &SyncReport) -> Vec<(&'static str, String)> {
-    vec![("report", report.render_text())]
+    vec![("report", report.render_email_text())]
 }
 
 fn render_template(template: &str, values: &[(&'static str, String)], max_bytes: usize) -> String {

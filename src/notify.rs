@@ -55,7 +55,9 @@ impl Notifier {
     }
 
     pub fn send_sync_summary(&self, summary: &str, report: &str) -> Result<bool> {
-        let body = format!("{summary}\n\n--- 原始报告 ---\n{report}");
+        let summary = plain_email_text(summary);
+        let report = plain_email_text(report);
+        let body = format!("{summary}\n\n原始报告：\n{report}");
         self.send("同步总结", &body)
     }
 
@@ -278,6 +280,32 @@ fn default_smtp_port(tls: Option<SmtpTlsMode>) -> u16 {
     }
 }
 
+fn plain_email_text(text: &str) -> String {
+    text.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.starts_with("```") || is_title_rule_line(trimmed) {
+                return None;
+            }
+
+            let line = trimmed
+                .trim_start_matches('#')
+                .trim()
+                .replace("**", "")
+                .replace('`', "");
+
+            Some(line)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+fn is_title_rule_line(line: &str) -> bool {
+    line.len() >= 3 && line.chars().all(|ch| matches!(ch, '=' | '_'))
+}
+
 #[derive(Debug, Serialize)]
 struct CloudflareEmailRequest<'a> {
     personalizations: Vec<CloudflarePersonalization<'a>>,
@@ -301,4 +329,21 @@ struct CloudflareEmailContent<'a> {
     #[serde(rename = "type")]
     content_type: &'a str,
     value: &'a str,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_email_text_keeps_dash_rules_and_strips_markdown() {
+        let text = plain_email_text("**成功**\n=====\n------------\n`my/ok-ww`\n```yaml\nx\n```");
+
+        assert!(text.contains("成功"));
+        assert!(text.contains("------------"));
+        assert!(text.contains("my/ok-ww"));
+        assert!(!text.contains("====="));
+        assert!(!text.contains("**"));
+        assert!(!text.contains('`'));
+    }
 }
