@@ -40,17 +40,25 @@ impl SyncReport {
 
         for entry in &self.entries {
             out.push_str("------------\n");
-            out.push_str(&format!(
-                "- {} [{:?}] {:?}",
-                entry.branch, entry.kind, entry.status
-            ));
-            if let Some(head) = &entry.head {
-                out.push_str(&format!(" @ {head}"));
-            }
+            out.push_str(&entry.render_text());
             out.push('\n');
-            for detail in &entry.details {
-                out.push_str(&format!("  - {detail}\n"));
-            }
+        }
+
+        out
+    }
+
+    pub fn render_email_text(&self) -> String {
+        let mut out = String::new();
+        out.push_str("TermiteRS sync report\n\n");
+
+        if self.entries.is_empty() {
+            out.push_str("No branches were processed.\n");
+            return out;
+        }
+
+        for entry in &self.entries {
+            out.push_str("------------\n");
+            out.push_str(&entry.render_text());
             out.push('\n');
         }
 
@@ -102,5 +110,25 @@ impl BranchReport {
             out.push_str(&format!("  - {detail}\n"));
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn email_report_keeps_branch_separators_without_title_rule() {
+        let mut report = SyncReport::default();
+        report.push(
+            BranchReport::new("my/project", BranchKind::Product, BranchStatus::Success)
+                .detail("1 test command(s) passed"),
+        );
+
+        let text = report.render_email_text();
+
+        assert!(text.contains("TermiteRS sync report"));
+        assert!(text.contains("------------"));
+        assert!(!text.contains("====================="));
     }
 }

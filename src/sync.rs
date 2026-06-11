@@ -373,7 +373,7 @@ impl SyncRunner {
             return Ok(());
         }
 
-        let raw_report = report.render_text();
+        let raw_report = report.render_email_text();
         let summary = match self.llm.summarize_sync_report(report) {
             Ok(Some(summary)) => summary,
             Ok(None) => raw_report.clone(),
