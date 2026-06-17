@@ -9,6 +9,7 @@ use serde_json::Value;
 use crate::config::{LlmConfig, LlmProvider};
 use crate::git::ConflictSnapshot;
 use crate::report::SyncReport;
+use crate::text::truncate_to_char_boundary;
 
 const DEFAULT_CONFLICT_SYSTEM_PROMPT: &str = "You are a senior software maintainer. Analyze git rebase conflicts. Explain whether the conflict is mechanical or functional, recommend a safe resolution strategy, and call out when human review is required. Do not invent missing code.";
 const DEFAULT_CONFLICT_USER_PROMPT: &str = r#"Branch: {branch}
@@ -308,7 +309,7 @@ fn render_template(template: &str, values: &[(&'static str, String)], max_bytes:
         prompt = prompt.replace(&format!("{{{key}}}"), value);
     }
     if prompt.len() > max_bytes {
-        prompt.truncate(max_bytes);
+        truncate_to_char_boundary(&mut prompt, max_bytes);
         prompt.push_str("\n... prompt truncated by TermiteRS ...\n");
     }
     prompt

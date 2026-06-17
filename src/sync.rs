@@ -6,6 +6,7 @@ use crate::git::Git;
 use crate::llm::{ConflictAnalysisRequest, LlmService};
 use crate::notify::Notifier;
 use crate::report::{BranchReport, BranchStatus, SyncReport};
+use crate::text::truncate_to_char_boundary;
 
 const MAX_REPORTED_COMMITS: usize = 12;
 const MAX_REPORTED_FILES: usize = 30;
@@ -437,7 +438,7 @@ fn push_list_details(entry: &mut BranchReport, title: &str, items: &[String]) {
 fn one_line(text: &str) -> String {
     let mut line = text.replace('\r', "").replace('\n', " | ");
     if line.len() > 500 {
-        line.truncate(500);
+        truncate_to_char_boundary(&mut line, 500);
         line.push_str("...");
     }
     line

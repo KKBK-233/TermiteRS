@@ -9,6 +9,7 @@ mod llm;
 mod notify;
 mod report;
 mod sync;
+mod text;
 
 use anyhow::Result;
 use clap::Parser;

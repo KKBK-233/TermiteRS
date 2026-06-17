@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::command::{CommandOutput, run};
 use crate::config::RepoConfig;
+use crate::text::truncate_to_char_boundary;
 
 #[derive(Debug, Clone)]
 pub struct Git {
@@ -200,7 +201,7 @@ impl Git {
             .collect();
         let mut combined_diff = self.git(&["diff", "--cc"])?.stdout;
         if combined_diff.len() > max_diff_bytes {
-            combined_diff.truncate(max_diff_bytes);
+            truncate_to_char_boundary(&mut combined_diff, max_diff_bytes);
             combined_diff.push_str("\n... diff truncated ...\n");
         }
         Ok(ConflictSnapshot {
