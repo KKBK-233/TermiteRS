@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
@@ -16,6 +17,12 @@ pub struct ConflictSnapshot {
     pub status: String,
     pub files: Vec<String>,
     pub combined_diff: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConflictFileContent {
+    pub path: String,
+    pub content: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -68,6 +75,15 @@ impl Git {
         let _ = self.git(&["merge", "--abort"]);
     }
 
+    pub fn continue_sync(&self, strategy: crate::config::SyncStrategy) -> Result<CommandOutput> {
+        match strategy {
+            crate::config::SyncStrategy::Rebase => {
+                self.git(&["-c", "core.editor=true", "rebase", "--continue"])
+            }
+            crate::config::SyncStrategy::Merge => self.git(&["commit", "--no-edit"]),
+        }
+    }
+
     pub fn push(
         &self,
         remote: &str,
@@ -88,6 +104,19 @@ impl Git {
 
     pub fn run_test(&self, command: &str) -> Result<CommandOutput> {
         crate::command::run_shell(command, &self.root)
+    }
+
+    pub fn add_file(&self, path: &str) -> Result<()> {
+        self.git_checked(&["add", path])?;
+        Ok(())
+    }
+
+    pub fn write_file(&self, path: &str, content: &str) -> Result<()> {
+        ensure_relative_repo_path(path)?;
+        let full_path = self.root.join(path);
+        fs::write(&full_path, content)
+            .with_context(|| format!("failed to write {}", full_path.display()))?;
+        Ok(())
     }
 
     pub fn head(&self) -> Result<String> {
@@ -211,6 +240,30 @@ impl Git {
         })
     }
 
+    pub fn conflict_file_contents(
+        &self,
+        files: &[String],
+        max_file_bytes: usize,
+    ) -> Result<Vec<ConflictFileContent>> {
+        files
+            .iter()
+            .map(|path| {
+                ensure_relative_repo_path(path)?;
+                let full_path = self.root.join(path);
+                let mut content = fs::read_to_string(&full_path)
+                    .with_context(|| format!("failed to read {}", full_path.display()))?;
+                if content.len() > max_file_bytes {
+                    truncate_to_char_boundary(&mut content, max_file_bytes);
+                    content.push_str("\n... file truncated by TermiteRS ...\n");
+                }
+                Ok(ConflictFileContent {
+                    path: path.clone(),
+                    content,
+                })
+            })
+            .collect()
+    }
+
     fn ensure_remote(&self, name: &str, url: &str) -> Result<()> {
         let output = self.git(&["remote", "get-url", name])?;
         if output.success() {
@@ -241,4 +294,16 @@ impl Git {
         }
         Ok(output)
     }
+}
+
+fn ensure_relative_repo_path(path: &str) -> Result<()> {
+    let path = Path::new(path);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        bail!("unsafe repository path: {}", path.display());
+    }
+    Ok(())
 }

@@ -215,6 +215,13 @@ branches:
     push: force-with-lease
     tests:
       - python -m py_compile src\task\BaseCombatTask.py src\task\AutoCombatTask.py src\char\Aemeath.py src\char\Linnai.py
+    auto_resolve:
+      enabled: false
+      max_conflict_files: 1
+      max_file_bytes: 40960
+      require_tests: true
+      allowed_paths:
+        - src/char/
 
 daemon:
   interval_seconds: 1800
@@ -228,6 +235,13 @@ daemon:
 - `kind: pr`：单功能 PR 分支，保持改动干净。
 - `kind: product`：自用总分支，可以包含多个功能。
 - `note`：用户备注，说明分支用途。AI 总结邮件和后续配置助理会参考这个字段。
+
+自动修冲突：
+
+- `auto_resolve.enabled: true` 后，TermiteRS 会在 rebase/merge 冲突时把冲突文件交给 LLM 分析。
+- 只有 LLM 返回 `risk: low`，且返回文件都属于冲突文件、路径在 `allowed_paths` 内、内容不含冲突标记时，才会写回文件并继续同步。
+- `require_tests: true` 时，自动修复后必须有测试命令并全部通过，否则不会推送。
+- 这个功能适合低风险兼容性修复，不适合语义复杂、重构型或多文件大冲突。
 
 ## AI 助理
 
@@ -274,6 +288,26 @@ llm:
 
       Combined diff：
       {combined_diff}
+    # 可用占位符：{branch}、{base}、{conflict_files}、{git_status}、{combined_diff}、{file_contents}
+    auto_resolve_system: |
+      你是一个谨慎的软件维护助手。你只能做低风险兼容性冲突修复。必须只输出 JSON，不要 Markdown，不要解释。
+    auto_resolve_user: |
+      请分析下面的 Git 冲突，并仅在低风险时返回修复后的完整文件内容。
+      如果风险不是 low，files 必须为空。
+
+      分支：{branch}
+      基线：{base}
+      冲突文件：
+      {conflict_files}
+
+      Git 状态：
+      {git_status}
+
+      Combined diff：
+      {combined_diff}
+
+      冲突文件内容：
+      {file_contents}
     # 可用占位符：{report}
     sync_summary_system: |
       你是一个严谨的软件分支维护助手。请只根据同步报告做中文总结。输出必须是纯文本，不要使用 Markdown、加粗、标题或代码块。

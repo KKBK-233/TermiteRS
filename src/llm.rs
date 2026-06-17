@@ -3,11 +3,11 @@ use std::io::Read;
 
 use anyhow::{Context, Result, anyhow, bail};
 use reqwest::blocking::Client;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::{LlmConfig, LlmProvider};
-use crate::git::ConflictSnapshot;
+use crate::git::{ConflictFileContent, ConflictSnapshot};
 use crate::report::SyncReport;
 use crate::text::truncate_to_char_boundary;
 
@@ -22,6 +22,41 @@ Git status:
 
 Combined diff:
 {combined_diff}
+"#;
+const DEFAULT_AUTO_RESOLVE_SYSTEM_PROMPT: &str = "你是一个谨慎的软件维护助手。你只能做低风险兼容性冲突修复。必须只输出 JSON，不要 Markdown，不要解释。风险不低、信息不足、功能语义不确定、需要新增设计时，risk 必须是 high 或 medium，并且 files 为空。";
+const DEFAULT_AUTO_RESOLVE_USER_PROMPT: &str = r#"请分析下面的 Git 冲突，并仅在低风险时给出修复后的完整文件内容。
+
+低风险的定义：
+- 只是在上游新增逻辑和本地已有逻辑之间做兼容保留。
+- 不删除本地补丁的核心行为。
+- 不删除上游新增的功能入口。
+- 不重构，不改无关文件。
+
+必须输出 JSON，格式如下：
+{
+  "risk": "low|medium|high",
+  "summary": "一句中文说明",
+  "files": [
+    {
+      "path": "repo/relative/path",
+      "content": "修复后的完整文件内容"
+    }
+  ]
+}
+
+分支：{branch}
+基线：{base}
+冲突文件：
+{conflict_files}
+
+Git 状态：
+{git_status}
+
+Combined diff：
+{combined_diff}
+
+冲突文件内容：
+{file_contents}
 "#;
 const DEFAULT_SYNC_SUMMARY_SYSTEM_PROMPT: &str = "你是一个严谨的软件分支维护助手。请只根据用户提供的同步报告进行中文总结，不要编造不存在的提交、测试或冲突。输出必须是纯文本，不要使用 Markdown、加粗、标题或代码块。";
 const DEFAULT_SYNC_SUMMARY_USER_PROMPT: &str = r#"请总结下面这次 TermiteRS 同步报告。
@@ -44,6 +79,28 @@ pub struct ConflictAnalysisRequest {
     pub branch: String,
     pub base: String,
     pub snapshot: ConflictSnapshot,
+}
+
+#[derive(Debug, Clone)]
+pub struct AutoResolveConflictRequest {
+    pub branch: String,
+    pub base: String,
+    pub snapshot: ConflictSnapshot,
+    pub files: Vec<ConflictFileContent>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AutoResolveDecision {
+    pub risk: String,
+    pub summary: String,
+    #[serde(default)]
+    pub files: Vec<ResolvedFile>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResolvedFile {
+    pub path: String,
+    pub content: String,
 }
 
 pub struct LlmService {
@@ -74,6 +131,41 @@ impl LlmService {
         );
         let user_prompt = build_conflict_prompt(request, config);
         call_chat(config, &system_prompt, &user_prompt).map(Some)
+    }
+
+    pub fn auto_resolve_conflict(
+        &self,
+        request: &AutoResolveConflictRequest,
+    ) -> Result<Option<AutoResolveDecision>> {
+        let Some(config) = &self.config else {
+            return Ok(None);
+        };
+        if !config.enabled {
+            return Ok(None);
+        }
+
+        let system_prompt = render_template(
+            config
+                .prompts
+                .auto_resolve_system
+                .as_deref()
+                .unwrap_or(DEFAULT_AUTO_RESOLVE_SYSTEM_PROMPT),
+            &auto_resolve_template_values(request),
+            config.max_prompt_bytes,
+        );
+        let user_prompt = render_template(
+            config
+                .prompts
+                .auto_resolve_user
+                .as_deref()
+                .unwrap_or(DEFAULT_AUTO_RESOLVE_USER_PROMPT),
+            &auto_resolve_template_values(request),
+            config.max_prompt_bytes,
+        );
+        let response = call_chat(config, &system_prompt, &user_prompt)?;
+        let json = extract_json_object(&response)?;
+        let decision = serde_json::from_str(json).context("failed to parse auto resolve JSON")?;
+        Ok(Some(decision))
     }
 
     pub fn summarize_sync_report(&self, report: &SyncReport) -> Result<Option<String>> {
@@ -299,6 +391,35 @@ fn conflict_template_values(request: &ConflictAnalysisRequest) -> Vec<(&'static 
     ]
 }
 
+fn auto_resolve_template_values(
+    request: &AutoResolveConflictRequest,
+) -> Vec<(&'static str, String)> {
+    vec![
+        ("branch", request.branch.clone()),
+        ("base", request.base.clone()),
+        ("conflict_files", request.snapshot.files.join("\n")),
+        ("git_status", request.snapshot.status.clone()),
+        ("combined_diff", request.snapshot.combined_diff.clone()),
+        (
+            "file_contents",
+            render_conflict_file_contents(&request.files),
+        ),
+    ]
+}
+
+fn render_conflict_file_contents(files: &[ConflictFileContent]) -> String {
+    files
+        .iter()
+        .map(|file| {
+            format!(
+                "===== FILE: {} =====\n{}\n===== END FILE: {} =====",
+                file.path, file.content, file.path
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 fn sync_summary_template_values(report: &SyncReport) -> Vec<(&'static str, String)> {
     vec![("report", report.render_email_text())]
 }
@@ -313,4 +434,22 @@ fn render_template(template: &str, values: &[(&'static str, String)], max_bytes:
         prompt.push_str("\n... prompt truncated by TermiteRS ...\n");
     }
     prompt
+}
+
+fn extract_json_object(text: &str) -> Result<&str> {
+    let trimmed = text.trim();
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        return Ok(trimmed);
+    }
+
+    let start = trimmed
+        .find('{')
+        .ok_or_else(|| anyhow!("auto resolve response did not contain JSON object"))?;
+    let end = trimmed
+        .rfind('}')
+        .ok_or_else(|| anyhow!("auto resolve response did not contain JSON object end"))?;
+    if start >= end {
+        bail!("auto resolve response contained invalid JSON object bounds");
+    }
+    Ok(&trimmed[start..=end])
 }
