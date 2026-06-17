@@ -3,6 +3,7 @@ use std::path::Path;
 use crate::command::{CommandOutput, run};
 use crate::config::{Config, PushStrategy};
 use crate::git::Git;
+use crate::text::truncate_to_char_boundary;
 
 pub struct Doctor {
     config: Config,
@@ -255,7 +256,7 @@ fn one_line_output(output: &CommandOutput) -> String {
         .replace('\r', "")
         .replace('\n', " | ");
     if text.len() > 500 {
-        text.truncate(500);
+        truncate_to_char_boundary(&mut text, 500);
         text.push_str("...");
     }
     text.trim().to_string()
