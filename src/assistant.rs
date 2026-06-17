@@ -64,6 +64,7 @@ impl Assistant {
                     println!("已清空当前助理会话上下文。");
                 }
                 "/check" => self.run_check()?,
+                "/sync" => self.run_sync()?,
                 "/doctor" => self.run_doctor()?,
                 "/status" => self.run_status()?,
                 "/once" => self.run_daemon_once()?,
@@ -72,7 +73,7 @@ impl Assistant {
                     return Ok(());
                 }
                 _ => {
-                    if !self.try_handle_local_action(input, &history)? {
+                    if !self.try_handle_local_action(input, &mut history)? {
                         self.reply_to_user(input, &mut history)?;
                     }
                 }
@@ -110,6 +111,21 @@ impl Assistant {
         self.run_doctor()?;
         println!("开始执行 sync --dry-run...");
         self.run_dry_run()
+    }
+
+    fn run_sync(&self) -> Result<()> {
+        println!("开始执行 doctor...");
+        self.run_doctor()?;
+        println!("开始执行 sync...");
+        let config = Config::read_from(&self.config_path)?;
+        let options = SyncOptions {
+            branch: None,
+            dry_run: false,
+            notify_on_noop: true,
+        };
+        let report = SyncRunner::new(config, options).run()?;
+        println!("{}", report.render_text());
+        Ok(())
     }
 
     fn run_daemon_once(&self) -> Result<()> {
@@ -157,18 +173,35 @@ impl Assistant {
     fn try_handle_local_action(
         &self,
         input: &str,
-        history: &[ConversationMessage],
+        history: &mut Vec<ConversationMessage>,
     ) -> Result<bool> {
+        if wants_confirmed_sync(input, history) {
+            push_history(history, "user", input.to_string());
+            self.run_sync()?;
+            push_history(history, "assistant", "已执行 doctor 和 sync。".to_string());
+            return Ok(true);
+        }
+
         if wants_validation(input) {
+            push_history(history, "user", input.to_string());
             self.run_check()?;
+            push_history(
+                history,
+                "assistant",
+                "已执行 doctor 和 sync --dry-run。".to_string(),
+            );
             return Ok(true);
         }
 
         if self.try_remove_branch(input)? {
+            push_history(history, "user", input.to_string());
+            push_history(history, "assistant", "已从配置中移除分支维护。".to_string());
             return Ok(true);
         }
 
         if self.try_add_branch(input, history)? {
+            push_history(history, "user", input.to_string());
+            push_history(history, "assistant", "已更新分支维护配置。".to_string());
             return Ok(true);
         }
 
@@ -246,6 +279,7 @@ fn print_help() {
     println!("可用命令：");
     println!("  /help    显示帮助");
     println!("  /check   执行 doctor 和 sync --dry-run");
+    println!("  /sync    执行 doctor 和 sync");
     println!("  /doctor  检查 Git、SSH、远端和推送权限");
     println!("  /status  查看分支状态");
     println!("  /once    运行一次 daemon 同步并退出本次同步");
@@ -472,6 +506,59 @@ fn wants_validation(input: &str) -> bool {
         || input.contains("看看")
 }
 
+fn wants_confirmed_sync(input: &str, history: &[ConversationMessage]) -> bool {
+    if is_direct_sync_request(input) {
+        return true;
+    }
+
+    if is_push_choice(input) && recent_assistant_asked_sync_choice(history) {
+        return true;
+    }
+
+    wants_execute_now(input) && recent_user_confirmed_sync_push(history)
+}
+
+fn is_direct_sync_request(input: &str) -> bool {
+    input == "/sync"
+        || input.contains("执行同步")
+        || input.contains("正式同步")
+        || input.contains("正常同步")
+        || input.contains("同步并推送")
+}
+
+fn is_push_choice(input: &str) -> bool {
+    let normalized = input.trim().to_lowercase();
+    normalized == "b"
+        || normalized == "选b"
+        || normalized == "选 b"
+        || normalized == "选择b"
+        || normalized == "选择 b"
+}
+
+fn wants_execute_now(input: &str) -> bool {
+    input.contains("直接上")
+        || input.contains("直接执行")
+        || input.contains("开始执行")
+        || input.contains("执行吧")
+        || input.contains("跑吧")
+}
+
+fn recent_assistant_asked_sync_choice(history: &[ConversationMessage]) -> bool {
+    history.iter().rev().take(4).any(|message| {
+        message.role == "assistant"
+            && message.content.contains("正常同步")
+            && message.content.contains("推送")
+    })
+}
+
+fn recent_user_confirmed_sync_push(history: &[ConversationMessage]) -> bool {
+    history
+        .iter()
+        .rev()
+        .take(4)
+        .any(|message| message.role == "user" && is_push_choice(&message.content))
+}
+
 fn extract_branch_name(input: &str) -> Option<String> {
     input
         .split_whitespace()
@@ -528,4 +615,39 @@ fn branch_summary(config: &Config) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn b_confirms_sync_when_previous_assistant_asked_choice() {
+        let history = vec![ConversationMessage {
+            role: "assistant",
+            content: "A. 仅本地更新\nB. 正常同步并推送到远端\nC. dry-run".to_string(),
+        }];
+
+        assert!(wants_confirmed_sync("B", &history));
+    }
+
+    #[test]
+    fn b_does_not_confirm_without_sync_context() {
+        let history = vec![ConversationMessage {
+            role: "assistant",
+            content: "请选择一个配置项。".to_string(),
+        }];
+
+        assert!(!wants_confirmed_sync("B", &history));
+    }
+
+    #[test]
+    fn execute_now_uses_recent_b_confirmation() {
+        let history = vec![ConversationMessage {
+            role: "user",
+            content: "B".to_string(),
+        }];
+
+        assert!(wants_confirmed_sync("你直接上", &history));
+    }
 }
