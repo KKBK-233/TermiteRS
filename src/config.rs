@@ -43,6 +43,22 @@ pub struct BranchConfig {
     pub push: PushStrategy,
     #[serde(default)]
     pub tests: Vec<String>,
+    #[serde(default)]
+    pub auto_resolve: AutoResolveConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AutoResolveConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_auto_resolve_max_conflict_files")]
+    pub max_conflict_files: usize,
+    #[serde(default = "default_auto_resolve_max_file_bytes")]
+    pub max_file_bytes: usize,
+    #[serde(default = "default_auto_resolve_require_tests")]
+    pub require_tests: bool,
+    #[serde(default)]
+    pub allowed_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -83,6 +99,10 @@ pub struct LlmPromptsConfig {
     pub conflict_system: Option<String>,
     #[serde(default)]
     pub conflict_user: Option<String>,
+    #[serde(default)]
+    pub auto_resolve_system: Option<String>,
+    #[serde(default)]
+    pub auto_resolve_user: Option<String>,
     #[serde(default)]
     pub sync_summary_system: Option<String>,
     #[serde(default)]
@@ -270,6 +290,30 @@ impl Default for DaemonConfig {
             max_consecutive_failures: default_daemon_max_consecutive_failures(),
         }
     }
+}
+
+impl Default for AutoResolveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_conflict_files: default_auto_resolve_max_conflict_files(),
+            max_file_bytes: default_auto_resolve_max_file_bytes(),
+            require_tests: default_auto_resolve_require_tests(),
+            allowed_paths: Vec::new(),
+        }
+    }
+}
+
+fn default_auto_resolve_max_conflict_files() -> usize {
+    1
+}
+
+fn default_auto_resolve_max_file_bytes() -> usize {
+    40 * 1024
+}
+
+fn default_auto_resolve_require_tests() -> bool {
+    true
 }
 
 fn default_daemon_interval_seconds() -> u64 {

@@ -3,13 +3,20 @@ use tracing::{info, warn};
 
 use crate::config::{BranchConfig, Config, PushStrategy, SyncStrategy};
 use crate::git::Git;
-use crate::llm::{ConflictAnalysisRequest, LlmService};
+use crate::llm::{
+    AutoResolveConflictRequest, AutoResolveDecision, ConflictAnalysisRequest, LlmService,
+};
 use crate::notify::Notifier;
 use crate::report::{BranchReport, BranchStatus, SyncReport};
 use crate::text::truncate_to_char_boundary;
 
 const MAX_REPORTED_COMMITS: usize = 12;
 const MAX_REPORTED_FILES: usize = 30;
+
+struct AutoResolveOutcome {
+    applied: bool,
+    details: Vec<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct SyncOptions {
@@ -134,47 +141,41 @@ impl SyncRunner {
             SyncStrategy::Merge => self.git.merge(&base)?,
         };
 
+        let mut auto_resolve_details = Vec::new();
         if !sync_output.success() {
             warn!("branch {} has conflicts", branch.name);
             let snapshot = self.git.conflict_snapshot(80 * 1024)?;
-            self.git.abort_rebase_or_merge();
-            let mut entry = BranchReport::new(&branch.name, branch.kind, BranchStatus::Conflict)
-                .active()
-                .detail(branch_note_detail(branch))
-                .detail(format!("before sync: {before_head}"))
-                .detail(format!("target base: {base} @ {base_head}"))
-                .detail(format!(
-                    "sync failed with code {} against {}",
-                    sync_output.status, base
-                ))
-                .detail(format!("conflict files: {}", snapshot.files.join(", ")));
-            push_commit_details(&mut entry, "upstream commits planned", &upstream_commits);
-            if !snapshot.status.trim().is_empty() {
-                entry.push_detail(format!(
-                    "git status: {}",
-                    snapshot.status.replace('\n', "; ")
+            if let Some(outcome) =
+                self.try_auto_resolve_conflict(branch, &base, snapshot.clone())?
+            {
+                if outcome.applied {
+                    auto_resolve_details = outcome.details;
+                } else {
+                    self.git.abort_rebase_or_merge();
+                    return Ok(self.conflict_report(
+                        branch,
+                        &base,
+                        &base_head,
+                        &before_head,
+                        sync_output.status,
+                        snapshot,
+                        upstream_commits,
+                        outcome.details,
+                    ));
+                }
+            } else {
+                self.git.abort_rebase_or_merge();
+                return Ok(self.conflict_report(
+                    branch,
+                    &base,
+                    &base_head,
+                    &before_head,
+                    sync_output.status,
+                    snapshot,
+                    upstream_commits,
+                    Vec::new(),
                 ));
             }
-            if !snapshot.combined_diff.trim().is_empty() {
-                entry.push_detail("combined diff captured for future LLM analysis");
-            }
-            let analysis_request = ConflictAnalysisRequest {
-                branch: branch.name.clone(),
-                base,
-                snapshot,
-            };
-            match self.llm.analyze_conflict(&analysis_request) {
-                Ok(Some(analysis)) => {
-                    entry.push_detail(format!("LLM analysis: {}", one_line(&analysis)));
-                }
-                Ok(None) => {
-                    entry.push_detail("LLM analysis skipped");
-                }
-                Err(err) => {
-                    entry.push_detail(format!("LLM analysis failed: {err:#}"));
-                }
-            }
-            return Ok(entry);
         }
 
         for test in &branch.tests {
@@ -184,11 +185,28 @@ impl SyncRunner {
                     .active()
                     .detail(format!("test failed: {test}"))
                     .detail(format!("exit code: {}", output.status));
+                if !auto_resolve_details.is_empty() {
+                    for detail in auto_resolve_details {
+                        entry.push_detail(detail);
+                    }
+                }
                 if !output.stderr.trim().is_empty() {
                     entry.push_detail(format!("stderr: {}", one_line(&output.stderr)));
                 }
                 return Ok(entry);
             }
+        }
+
+        if branch.tests.is_empty()
+            && branch.auto_resolve.enabled
+            && branch.auto_resolve.require_tests
+            && !auto_resolve_details.is_empty()
+        {
+            return Ok(
+                BranchReport::new(&branch.name, branch.kind, BranchStatus::Failed)
+                    .active()
+                    .detail("auto resolve failed: require_tests is true but no tests configured"),
+            );
         }
 
         let after_sync_head = self.git.head()?;
@@ -253,6 +271,9 @@ impl SyncRunner {
         push_commit_details(&mut entry, "upstream commits included", &upstream_commits);
         push_commit_details(&mut entry, "commits pushed to remote", &commits_to_push);
         push_list_details(&mut entry, "files pushed to remote", &files_to_push);
+        for detail in auto_resolve_details {
+            entry.push_detail(detail);
+        }
         if branch.tests.is_empty() {
             entry.push_detail("no tests configured");
         } else {
@@ -267,6 +288,176 @@ impl SyncRunner {
             }
         }
         Ok(entry)
+    }
+
+    fn conflict_report(
+        &self,
+        branch: &BranchConfig,
+        base: &str,
+        base_head: &str,
+        before_head: &str,
+        sync_status: i32,
+        snapshot: crate::git::ConflictSnapshot,
+        upstream_commits: Vec<String>,
+        auto_resolve_details: Vec<String>,
+    ) -> BranchReport {
+        let mut entry = BranchReport::new(&branch.name, branch.kind, BranchStatus::Conflict)
+            .active()
+            .detail(branch_note_detail(branch))
+            .detail(format!("before sync: {before_head}"))
+            .detail(format!("target base: {base} @ {base_head}"))
+            .detail(format!(
+                "sync failed with code {} against {}",
+                sync_status, base
+            ))
+            .detail(format!("conflict files: {}", snapshot.files.join(", ")));
+        push_commit_details(&mut entry, "upstream commits planned", &upstream_commits);
+        for detail in auto_resolve_details {
+            entry.push_detail(detail);
+        }
+        if !snapshot.status.trim().is_empty() {
+            entry.push_detail(format!(
+                "git status: {}",
+                snapshot.status.replace('\n', "; ")
+            ));
+        }
+        if !snapshot.combined_diff.trim().is_empty() {
+            entry.push_detail("combined diff captured for future LLM analysis");
+        }
+        let analysis_request = ConflictAnalysisRequest {
+            branch: branch.name.clone(),
+            base: base.to_string(),
+            snapshot,
+        };
+        match self.llm.analyze_conflict(&analysis_request) {
+            Ok(Some(analysis)) => {
+                entry.push_detail(format!("LLM analysis: {}", one_line(&analysis)));
+            }
+            Ok(None) => {
+                entry.push_detail("LLM analysis skipped");
+            }
+            Err(err) => {
+                entry.push_detail(format!("LLM analysis failed: {err:#}"));
+            }
+        }
+        entry
+    }
+
+    fn try_auto_resolve_conflict(
+        &self,
+        branch: &BranchConfig,
+        base: &str,
+        snapshot: crate::git::ConflictSnapshot,
+    ) -> Result<Option<AutoResolveOutcome>> {
+        let config = &branch.auto_resolve;
+        if !config.enabled {
+            return Ok(None);
+        }
+
+        let mut details = vec!["auto resolve: enabled".to_string()];
+        if config.allowed_paths.is_empty() {
+            details.push("auto resolve skipped: allowed_paths is empty".to_string());
+            return Ok(Some(AutoResolveOutcome {
+                applied: false,
+                details,
+            }));
+        }
+        if snapshot.files.len() > config.max_conflict_files {
+            details.push(format!(
+                "auto resolve skipped: {} conflict files exceeds limit {}",
+                snapshot.files.len(),
+                config.max_conflict_files
+            ));
+            return Ok(Some(AutoResolveOutcome {
+                applied: false,
+                details,
+            }));
+        }
+        if let Some(path) = snapshot
+            .files
+            .iter()
+            .find(|path| !path_is_allowed(path, &config.allowed_paths))
+        {
+            details.push(format!("auto resolve skipped: path not allowed: {path}"));
+            return Ok(Some(AutoResolveOutcome {
+                applied: false,
+                details,
+            }));
+        }
+
+        let files = self
+            .git
+            .conflict_file_contents(&snapshot.files, config.max_file_bytes)?;
+        let request = AutoResolveConflictRequest {
+            branch: branch.name.clone(),
+            base: base.to_string(),
+            snapshot: snapshot.clone(),
+            files,
+        };
+        let decision = match self.llm.auto_resolve_conflict(&request) {
+            Ok(Some(decision)) => decision,
+            Ok(None) => {
+                details.push("auto resolve skipped: LLM disabled".to_string());
+                return Ok(Some(AutoResolveOutcome {
+                    applied: false,
+                    details,
+                }));
+            }
+            Err(err) => {
+                details.push(format!("auto resolve failed: {err:#}"));
+                return Ok(Some(AutoResolveOutcome {
+                    applied: false,
+                    details,
+                }));
+            }
+        };
+
+        details.push(format!("auto resolve risk: {}", decision.risk));
+        details.push(format!(
+            "auto resolve summary: {}",
+            one_line(&decision.summary)
+        ));
+        if !decision.risk.eq_ignore_ascii_case("low") {
+            return Ok(Some(AutoResolveOutcome {
+                applied: false,
+                details,
+            }));
+        }
+        if let Err(reason) = validate_auto_resolve_decision(&decision, &snapshot.files) {
+            details.push(format!("auto resolve rejected: {reason}"));
+            return Ok(Some(AutoResolveOutcome {
+                applied: false,
+                details,
+            }));
+        }
+
+        for file in &decision.files {
+            self.git.write_file(&file.path, &file.content)?;
+            self.git.add_file(&file.path)?;
+        }
+        let output = self.git.continue_sync(branch.sync)?;
+        if !output.success() {
+            details.push(format!(
+                "auto resolve failed: continue sync exited {}",
+                output.status
+            ));
+            if !output.stderr.trim().is_empty() {
+                details.push(format!("continue stderr: {}", one_line(&output.stderr)));
+            }
+            return Ok(Some(AutoResolveOutcome {
+                applied: false,
+                details,
+            }));
+        }
+
+        details.push(format!(
+            "auto resolve applied files: {}",
+            decision.files.len()
+        ));
+        Ok(Some(AutoResolveOutcome {
+            applied: true,
+            details,
+        }))
     }
 
     fn upstream_commits_since_branch_base(&self, base: &str) -> Result<Vec<String>> {
@@ -435,6 +626,50 @@ fn push_list_details(entry: &mut BranchReport, title: &str, items: &[String]) {
     }
 }
 
+fn validate_auto_resolve_decision(
+    decision: &AutoResolveDecision,
+    conflict_files: &[String],
+) -> std::result::Result<(), String> {
+    if decision.files.is_empty() {
+        return Err("no resolved files returned".to_string());
+    }
+
+    for file in &decision.files {
+        if !conflict_files.iter().any(|path| path == &file.path) {
+            return Err(format!(
+                "resolved file is not a conflict file: {}",
+                file.path
+            ));
+        }
+        if file.content.contains("<<<<<<<")
+            || file.content.contains("=======")
+            || file.content.contains(">>>>>>>")
+        {
+            return Err(format!(
+                "resolved file still contains conflict markers: {}",
+                file.path
+            ));
+        }
+        if file.content.contains("... file truncated by TermiteRS ...") {
+            return Err(format!(
+                "resolved file was based on truncated content: {}",
+                file.path
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn path_is_allowed(path: &str, allowed_paths: &[String]) -> bool {
+    let normalized = path.replace('\\', "/");
+    allowed_paths.iter().any(|allowed| {
+        let allowed = allowed.replace('\\', "/");
+        let allowed = allowed.trim_end_matches('/');
+        normalized == allowed || normalized.starts_with(&format!("{allowed}/"))
+    })
+}
+
 fn one_line(text: &str) -> String {
     let mut line = text.replace('\r', "").replace('\n', " | ");
     if line.len() > 500 {
@@ -442,4 +677,33 @@ fn one_line(text: &str) -> String {
         line.push_str("...");
     }
     line
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::ResolvedFile;
+
+    #[test]
+    fn allowed_path_does_not_match_neighbor_prefix() {
+        let allowed = vec!["src".to_string()];
+
+        assert!(path_is_allowed("src/char/Linnai.py", &allowed));
+        assert!(!path_is_allowed("src2/char/Linnai.py", &allowed));
+    }
+
+    #[test]
+    fn auto_resolve_rejects_conflict_markers() {
+        let decision = AutoResolveDecision {
+            risk: "low".to_string(),
+            summary: "test".to_string(),
+            files: vec![ResolvedFile {
+                path: "src/char/Linnai.py".to_string(),
+                content: "<<<<<<< HEAD\nx\n>>>>>>> upstream".to_string(),
+            }],
+        };
+        let conflict_files = vec!["src/char/Linnai.py".to_string()];
+
+        assert!(validate_auto_resolve_decision(&decision, &conflict_files).is_err());
+    }
 }
