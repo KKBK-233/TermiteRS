@@ -1,0 +1,13 @@
+pub mod assistant;
+pub mod cli;
+pub mod command;
+pub mod config;
+pub mod daemon;
+pub mod doctor;
+pub mod git;
+pub mod llm;
+pub mod notify;
+pub mod report;
+pub mod service;
+pub mod sync;
+pub mod text;

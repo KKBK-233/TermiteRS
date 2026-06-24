@@ -441,6 +441,35 @@ notify:
 - AI 目前只分析冲突，不自动改代码。
 - 邮件只在同步失败或冲突时作为通知渠道使用。
 - Cloudflare 通道按 Email Service API 设计，不支持把 Email Routing 当 SMTP 发件人。
+
+## 协作看板服务
+
+`serve` 子命令通过 Unix Socket 为博客后台提供受限接口：
+
+```bash
+termiters serve --config /etc/termiters/termite.yml
+```
+
+服务使用 SQLite 保存任务、对话、候选修改、推送挑战和通知状态。每次正式同步都在独立 detached worktree 中执行。低风险冲突继续按原规则自动处理；功能性冲突会保留现场，等待后台多轮指导。
+
+```yaml
+service:
+  socket_path: /run/termiters/termiters.sock
+  data_dir: /var/lib/termiters
+  public_dashboard_url: https://blog.example.com/admin/termite
+  operation_password_hash: "Argon2id 哈希"
+```
+
+可通过标准输入生成独立操作密码哈希：
+
+```bash
+printf '%s' '你的独立操作密码' | termiters hash-password
+```
+
+- GitHub Deploy Key、DeepSeek Key 和 SMTP 凭证只能由 `termiters` 用户读取。
+- 博客只通过 Unix Socket 调用固定动作，不读取仓库或密钥。
+- 最终推送使用五分钟有效的一次性挑战和独立操作密码。
+- `deploy/` 提供 systemd、tmpfiles 和 Nginx 示例。
 - 如果测试命令本身需要特殊环境，需要在配置里写清楚。
 
 ## 后续计划

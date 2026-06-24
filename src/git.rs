@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 
 use crate::command::{CommandOutput, run};
 use crate::config::RepoConfig;
@@ -12,14 +13,14 @@ pub struct Git {
     root: PathBuf,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ConflictSnapshot {
     pub status: String,
     pub files: Vec<String>,
     pub combined_diff: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ConflictFileContent {
     pub path: String,
     pub content: String,
@@ -95,6 +96,34 @@ impl Git {
         } else {
             self.git(&["push", remote, branch])
         }
+    }
+
+    pub fn push_with_lease(
+        &self,
+        remote: &str,
+        branch: &str,
+        expected_remote_head: &str,
+    ) -> Result<CommandOutput> {
+        let lease = format!("--force-with-lease=refs/heads/{branch}:{expected_remote_head}");
+        let refspec = format!("HEAD:refs/heads/{branch}");
+        self.git(&["push", &lease, remote, &refspec])
+    }
+
+    pub fn remote_head(&self, remote: &str, branch: &str) -> Result<Option<String>> {
+        let reference = format!("refs/heads/{branch}");
+        let output = self.git(&["ls-remote", "--heads", remote, &reference])?;
+        if !output.success() {
+            bail!("failed to read remote head for {remote}/{branch}");
+        }
+        Ok(output
+            .stdout
+            .split_whitespace()
+            .next()
+            .map(ToOwned::to_owned))
+    }
+
+    pub fn run_git(&self, args: &[&str]) -> Result<CommandOutput> {
+        self.git(args)
     }
 
     pub fn push_dry_run(&self, remote: &str, branch: &str) -> Result<CommandOutput> {
