@@ -76,4 +76,14 @@ pub enum Commands {
         #[arg(long, default_value = "TermiteRS notification channel is working.")]
         body: String,
     },
+
+    /// 启动仅通过 Unix Socket 提供服务的协作控制端。
+    Serve {
+        /// YAML 配置文件路径。
+        #[arg(short, long, default_value = "termite.yml")]
+        config: PathBuf,
+    },
+
+    /// 从标准输入读取密码并生成 Argon2id 哈希。
+    HashPassword,
 }
