@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -15,6 +15,21 @@ pub struct Config {
     pub llm: Option<LlmConfig>,
     #[serde(default)]
     pub notify: Option<NotifyConfig>,
+    #[serde(default)]
+    pub service: ServiceConfig,
+}
+
+/// 协作服务只接受本机 Unix Socket 请求，敏感凭证仍由 TermiteRS 独占。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServiceConfig {
+    #[serde(default = "default_service_socket_path")]
+    pub socket_path: PathBuf,
+    #[serde(default = "default_service_data_dir")]
+    pub data_dir: PathBuf,
+    #[serde(default)]
+    pub public_dashboard_url: String,
+    #[serde(default)]
+    pub operation_password_hash: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -109,7 +124,7 @@ pub struct LlmPromptsConfig {
     pub sync_summary_user: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LlmProvider {
     DeepSeek,
@@ -148,7 +163,7 @@ pub struct NotifyEventsConfig {
     pub sync_summary: bool,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum NotifyPolicyMode {
     FirstSuccess,
@@ -187,7 +202,7 @@ pub struct NotifyChannelConfig {
     pub to: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum NotifyChannelKind {
     Smtp,
@@ -220,21 +235,21 @@ pub struct EmailConfig {
     pub to: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BranchKind {
     Product,
     Pr,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SyncStrategy {
     Rebase,
     Merge,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PushStrategy {
     None,
@@ -326,6 +341,25 @@ fn default_daemon_run_on_start() -> bool {
 
 fn default_daemon_max_consecutive_failures() -> u32 {
     3
+}
+
+impl Default for ServiceConfig {
+    fn default() -> Self {
+        Self {
+            socket_path: default_service_socket_path(),
+            data_dir: default_service_data_dir(),
+            public_dashboard_url: String::new(),
+            operation_password_hash: String::new(),
+        }
+    }
+}
+
+fn default_service_socket_path() -> PathBuf {
+    PathBuf::from("/run/termiters/termiters.sock")
+}
+
+fn default_service_data_dir() -> PathBuf {
+    PathBuf::from("/var/lib/termiters")
 }
 
 impl Default for LlmProvider {

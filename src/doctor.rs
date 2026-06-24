@@ -137,22 +137,36 @@ impl Doctor {
         }
 
         for branch in &self.config.branches {
-            match git.local_branch_exists(&branch.name) {
-                Ok(true) => report.ok(format!("本地分支存在：{}", branch.name)),
-                Ok(false) => report.fail(format!("本地分支不存在：{}", branch.name)),
-                Err(err) => report.fail(format!("检查本地分支失败 {}：{err:#}", branch.name)),
-            }
+            let local_exists = match git.local_branch_exists(&branch.name) {
+                Ok(value) => value,
+                Err(err) => {
+                    report.fail(format!("检查本地分支失败 {}：{err:#}", branch.name));
+                    false
+                }
+            };
+            let remote_exists =
+                match git.remote_branch_exists(&self.config.repo.fork_remote, &branch.name) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        report.warn(format!("检查 fork 分支失败 {}：{err:#}", branch.name));
+                        false
+                    }
+                };
 
-            match git.remote_branch_exists(&self.config.repo.fork_remote, &branch.name) {
-                Ok(true) => report.ok(format!(
-                    "fork 远端分支存在：{}/{}",
+            match (local_exists, remote_exists) {
+                (true, true) => report.ok(format!("维护分支可用：{}", branch.name)),
+                (false, true) => report.ok(format!(
+                    "维护分支可用：{}/{}；服务模式会从远端创建 worktree",
                     self.config.repo.fork_remote, branch.name
                 )),
-                Ok(false) => report.warn(format!(
+                (true, false) => report.warn(format!(
                     "fork 远端分支不存在：{}/{}；首次 push 后会出现",
                     self.config.repo.fork_remote, branch.name
                 )),
-                Err(err) => report.warn(format!("检查 fork 分支失败 {}：{err:#}", branch.name)),
+                (false, false) => report.fail(format!(
+                    "维护分支不存在：{} 或 {}/{}",
+                    branch.name, self.config.repo.fork_remote, branch.name
+                )),
             }
         }
     }

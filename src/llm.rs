@@ -97,7 +97,28 @@ pub struct AutoResolveDecision {
     pub files: Vec<ResolvedFile>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ConflictOption {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub tradeoffs: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ConflictOptionsDecision {
+    pub classification: String,
+    pub summary: String,
+    pub options: Vec<ConflictOption>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ConflictProposal {
+    pub summary: String,
+    pub files: Vec<ResolvedFile>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResolvedFile {
     pub path: String,
     pub content: String,
@@ -188,6 +209,69 @@ impl LlmService {
         );
         let user_prompt = build_sync_summary_prompt(report, config);
         call_chat(config, &system_prompt, &user_prompt).map(Some)
+    }
+
+    pub fn conflict_options(
+        &self,
+        request: &AutoResolveConflictRequest,
+        conversation: &str,
+    ) -> Result<Option<ConflictOptionsDecision>> {
+        let Some(config) = &self.config else {
+            return Ok(None);
+        };
+        if !config.enabled {
+            return Ok(None);
+        }
+
+        let system_prompt = "你是严谨的软件维护助手。当前冲突已被判定为不能自动处理。请给出 2 到 4 种明确且互不重复的修改方案，只输出 JSON。不要修改文件。";
+        let values = auto_resolve_template_values(request);
+        let context = render_template(
+            "分支：{branch}\n基线：{base}\n冲突文件：\n{conflict_files}\n\nGit 状态：\n{git_status}\n\nCombined diff：\n{combined_diff}\n\n文件内容：\n{file_contents}",
+            &values,
+            config.max_prompt_bytes,
+        );
+        let user_prompt = format!(
+            "{context}\n\n对话与人工要求：\n{conversation}\n\n输出格式：\n{{\"classification\":\"functional|uncertain\",\"summary\":\"中文摘要\",\"options\":[{{\"id\":\"短标识\",\"title\":\"方案名\",\"description\":\"具体做法\",\"tradeoffs\":\"取舍\"}}]}}"
+        );
+        let response = call_chat(config, system_prompt, &user_prompt)?;
+        let json = extract_json_object(&response)?;
+        let decision: ConflictOptionsDecision =
+            serde_json::from_str(json).context("failed to parse conflict options JSON")?;
+        if !(2..=4).contains(&decision.options.len()) {
+            bail!("conflict options must contain 2 to 4 items");
+        }
+        Ok(Some(decision))
+    }
+
+    pub fn conflict_proposal(
+        &self,
+        request: &AutoResolveConflictRequest,
+        conversation: &str,
+        selected_option: &str,
+        requirements: &str,
+    ) -> Result<Option<ConflictProposal>> {
+        let Some(config) = &self.config else {
+            return Ok(None);
+        };
+        if !config.enabled {
+            return Ok(None);
+        }
+
+        let system_prompt = "你是严谨的软件维护助手。请根据用户确认的方案生成候选修改，只输出 JSON。只能返回原冲突文件的完整内容，不得修改其他文件，不得保留 Git 冲突标记。";
+        let values = auto_resolve_template_values(request);
+        let context = render_template(
+            "分支：{branch}\n基线：{base}\n冲突文件：\n{conflict_files}\n\nGit 状态：\n{git_status}\n\nCombined diff：\n{combined_diff}\n\n文件内容：\n{file_contents}",
+            &values,
+            config.max_prompt_bytes,
+        );
+        let user_prompt = format!(
+            "{context}\n\n对话记录：\n{conversation}\n\n选定方案：\n{selected_option}\n\n补充要求：\n{requirements}\n\n输出格式：\n{{\"summary\":\"中文摘要\",\"files\":[{{\"path\":\"仓库相对路径\",\"content\":\"修改后的完整文件\"}}]}}"
+        );
+        let response = call_chat(config, system_prompt, &user_prompt)?;
+        let json = extract_json_object(&response)?;
+        serde_json::from_str(json)
+            .context("failed to parse conflict proposal JSON")
+            .map(Some)
     }
 
     pub fn assistant_reply_streaming<F>(

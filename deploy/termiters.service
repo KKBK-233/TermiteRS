@@ -1,0 +1,30 @@
+[Unit]
+Description=TermiteRS branch maintenance service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=termiters
+Group=termite-control
+SupplementaryGroups=termiters
+WorkingDirectory=/opt/termiters
+EnvironmentFile=-/etc/termiters/termiters.env
+Environment=HOME=/var/lib/termiters
+Environment=RUST_LOG=TermiteRS=info
+ExecStart=/opt/termiters/TermiteRS serve --config /etc/termiters/termite.yml
+Restart=on-failure
+RestartSec=5
+UMask=0007
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/termiters /run/termiters
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target
