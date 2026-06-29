@@ -1,6 +1,7 @@
 use anyhow::Result;
 use tracing::{info, warn};
 
+use crate::command::CommandOutput;
 use crate::config::{BranchConfig, Config, PushStrategy, SyncStrategy};
 use crate::git::Git;
 use crate::llm::{
@@ -16,6 +17,14 @@ const MAX_REPORTED_FILES: usize = 30;
 struct AutoResolveOutcome {
     applied: bool,
     details: Vec<String>,
+}
+
+enum AutoContinueOutcome {
+    Applied(Vec<String>),
+    Stopped {
+        snapshot: crate::git::ConflictSnapshot,
+        details: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -145,7 +154,39 @@ impl SyncRunner {
         if !sync_output.success() {
             warn!("branch {} has conflicts", branch.name);
             let snapshot = self.git.conflict_snapshot(80 * 1024)?;
-            if let Some(outcome) =
+            if snapshot.files.is_empty() {
+                match self.try_continue_autoresolved_sync(branch, &sync_output)? {
+                    Some(AutoContinueOutcome::Applied(details)) => {
+                        auto_resolve_details = details;
+                    }
+                    Some(AutoContinueOutcome::Stopped { snapshot, details }) => {
+                        self.git.abort_rebase_or_merge();
+                        return Ok(self.conflict_report(
+                            branch,
+                            &base,
+                            &base_head,
+                            &before_head,
+                            sync_output.status,
+                            snapshot,
+                            upstream_commits,
+                            details,
+                        ));
+                    }
+                    None => {
+                        self.git.abort_rebase_or_merge();
+                        return Ok(self.conflict_report(
+                            branch,
+                            &base,
+                            &base_head,
+                            &before_head,
+                            sync_output.status,
+                            snapshot,
+                            upstream_commits,
+                            Vec::new(),
+                        ));
+                    }
+                }
+            } else if let Some(outcome) =
                 self.try_auto_resolve_conflict(branch, &base, snapshot.clone())?
             {
                 if outcome.applied {
@@ -460,6 +501,56 @@ impl SyncRunner {
         }))
     }
 
+    fn try_continue_autoresolved_sync(
+        &self,
+        branch: &BranchConfig,
+        first_output: &CommandOutput,
+    ) -> Result<Option<AutoContinueOutcome>> {
+        if !has_staged_changes(&self.git)? {
+            return Ok(None);
+        }
+
+        let mut details = vec![
+            "rerere/autostaged resolution detected: continuing sync".to_string(),
+            format!(
+                "initial continue stderr: {}",
+                one_line(&first_output.stderr)
+            ),
+        ];
+        let mut last_head = self.git.head().unwrap_or_default();
+        for _ in 0..20 {
+            let output = self.git.continue_sync(branch.sync)?;
+            if output.success() {
+                details.push("rerere/autostaged resolution applied".to_string());
+                return Ok(Some(AutoContinueOutcome::Applied(details)));
+            }
+            if !output.stderr.trim().is_empty() {
+                details.push(format!("continue stderr: {}", one_line(&output.stderr)));
+            }
+
+            let snapshot = self.git.conflict_snapshot(80 * 1024)?;
+            if !snapshot.files.is_empty() {
+                details.push("continue stopped on another conflict".to_string());
+                return Ok(Some(AutoContinueOutcome::Stopped { snapshot, details }));
+            }
+
+            let current_head = self.git.head().unwrap_or_default();
+            if current_head == last_head {
+                details.push("continue did not advance HEAD; stopped retrying".to_string());
+                return Ok(Some(AutoContinueOutcome::Stopped { snapshot, details }));
+            }
+            last_head = current_head;
+            if !has_staged_changes(&self.git)? {
+                details.push("continue stopped without staged changes".to_string());
+                return Ok(Some(AutoContinueOutcome::Stopped { snapshot, details }));
+            }
+        }
+
+        let snapshot = self.git.conflict_snapshot(80 * 1024)?;
+        details.push("continue retried more than 20 times; stopped".to_string());
+        Ok(Some(AutoContinueOutcome::Stopped { snapshot, details }))
+    }
+
     fn upstream_commits_since_branch_base(&self, base: &str) -> Result<Vec<String>> {
         let Some(merge_base) = self.git.merge_base("HEAD", base)? else {
             return Ok(Vec::new());
@@ -659,6 +750,15 @@ fn validate_auto_resolve_decision(
     }
 
     Ok(())
+}
+
+fn has_staged_changes(git: &Git) -> Result<bool> {
+    let output = git.run_git(&["diff", "--cached", "--quiet"])?;
+    match output.status {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => anyhow::bail!("failed to inspect staged changes: {}", output.stderr.trim()),
+    }
 }
 
 fn path_is_allowed(path: &str, allowed_paths: &[String]) -> bool {

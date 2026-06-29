@@ -28,7 +28,7 @@ use axum::{
 };
 use chrono::Utc;
 use futures_util::StreamExt;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use similar::TextDiff;
 use tokio::sync::broadcast;
@@ -39,6 +39,7 @@ use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::{
+    command::CommandOutput,
     config::{BranchConfig, Config, PushStrategy},
     doctor::Doctor,
     git::{ConflictFileContent, ConflictSnapshot, Git},
@@ -53,6 +54,7 @@ const ACTIVE_STATES: &[&str] = &[
     "queued",
     "running",
     "waiting_guidance",
+    "generating_proposal",
     "applying",
     "test_failed",
     "waiting_push",
@@ -77,6 +79,17 @@ pub struct ServiceEvent {
     pub kind: String,
     pub message: String,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CleanupReport {
+    pub cutoff: String,
+    pub jobs: usize,
+    pub messages: usize,
+    pub events: usize,
+    pub challenges: usize,
+    pub notifications: usize,
+    pub worktrees: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -155,6 +168,18 @@ struct ProposalRequest {
     requirements: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ConflictSide {
+    Ours,
+    Theirs,
+}
+
+enum AutoResolvedSync {
+    Completed,
+    Conflict(ConflictSnapshot, Vec<ConflictFileContent>),
+    Failed(String),
+}
+
 #[derive(Debug, Deserialize)]
 struct PushConfirmRequest {
     challenge_id: String,
@@ -194,6 +219,26 @@ pub fn run(config_path: PathBuf) -> Result<()> {
     }
 }
 
+pub fn cleanup_old_jobs(config_path: PathBuf, days: u32) -> Result<CleanupReport> {
+    anyhow::ensure!(days > 0, "cleanup days must be greater than zero");
+
+    let config = Config::read_from(&config_path)?;
+    fs::create_dir_all(&config.service.data_dir)?;
+    fs::create_dir_all(config.service.data_dir.join("worktrees"))?;
+
+    let (event_sender, _) = broadcast::channel(1);
+    let state = ServiceState {
+        config_path,
+        data_dir: config.service.data_dir.clone(),
+        database_path: config.service.data_dir.join("termite.db"),
+        events: event_sender,
+        repository_lock: Arc::new(Mutex::new(())),
+        password_attempts: Arc::new(Mutex::new(Vec::new())),
+    };
+    state.initialize_database()?;
+    state.cleanup_old_jobs(days)
+}
+
 #[cfg(unix)]
 async fn run_unix(config_path: PathBuf) -> Result<()> {
     use hyperlocal::UnixListenerExt;
@@ -206,9 +251,6 @@ async fn run_unix(config_path: PathBuf) -> Result<()> {
     fs::create_dir_all(config.service.data_dir.join("worktrees"))?;
     if let Some(parent) = config.service.socket_path.parent() {
         fs::create_dir_all(parent)?;
-    }
-    if config.service.socket_path.exists() {
-        fs::remove_file(&config.service.socket_path)?;
     }
 
     let database_path = config.service.data_dir.join("termite.db");
@@ -237,21 +279,29 @@ async fn run_unix(config_path: PathBuf) -> Result<()> {
         .route("/v1/events", get(events))
         .with_state(state.clone());
 
-    let listener = UnixListener::bind(&config.service.socket_path)?;
-    set_socket_permissions(&config.service.socket_path)?;
-    info!(
-        "TermiteRS service listening on {}",
-        config.service.socket_path.display()
-    );
+    loop {
+        if config.service.socket_path.exists() {
+            fs::remove_file(&config.service.socket_path)?;
+        }
+        let listener = UnixListener::bind(&config.service.socket_path)?;
+        set_socket_permissions(&config.service.socket_path)?;
+        info!(
+            "TermiteRS service listening on {}",
+            config.service.socket_path.display()
+        );
 
-    listener
-        .serve(move || {
-            let app = app.clone();
-            move |request| app.clone().oneshot(request)
-        })
-        .await
-        .map_err(|err| anyhow::anyhow!("Unix Socket 服务异常：{err}"))?;
-    Ok(())
+        let app = app.clone();
+        if let Err(err) = listener
+            .serve(move || {
+                let app = app.clone();
+                move |request| app.clone().oneshot(request)
+            })
+            .await
+        {
+            warn!("Unix Socket 服务异常，正在重新监听：{err}");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
 }
 
 fn validate_service_config(config: &Config) -> Result<()> {
@@ -353,8 +403,23 @@ async fn generate_proposal(
     AxumPath(id): AxumPath<String>,
     Json(request): Json<ProposalRequest>,
 ) -> Response {
-    match state.generate_proposal(&id, &request.option_id, &request.requirements) {
-        Ok(proposal) => Json(proposal).into_response(),
+    if request.requirements.chars().count() > 4000 {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            anyhow::anyhow!("补充修改要求不能超过 4000 个字符"),
+        );
+    }
+    match state.mark_generating_proposal(&id, &request.option_id) {
+        Ok(()) => {
+            let worker = state.clone();
+            let worker_id = id.clone();
+            let option_id = request.option_id;
+            let requirements = request.requirements;
+            thread::spawn(move || {
+                worker.execute_generate_proposal(&worker_id, &option_id, &requirements)
+            });
+            (StatusCode::ACCEPTED, Json(AcceptedResponse { job_id: id })).into_response()
+        }
         Err(err) => api_error(StatusCode::CONFLICT, err),
     }
 }
@@ -513,11 +578,96 @@ impl ServiceState {
         Ok(())
     }
 
+    fn cleanup_old_jobs(&self, days: u32) -> Result<CleanupReport> {
+        anyhow::ensure!(days > 0, "cleanup days must be greater than zero");
+
+        let cutoff = (Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
+        let connection = self.open_database()?;
+        let targets = {
+            let mut statement = connection.prepare(
+                "SELECT id, worktree_path FROM jobs
+                 WHERE state IN ('completed', 'abandoned', 'failed') AND updated_at < ?1",
+            )?;
+            statement
+                .query_map(params![cutoff], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        drop(connection);
+
+        let mut removed_worktrees = 0;
+        for (job_id, worktree_path) in &targets {
+            if worktree_path.is_empty() || !Path::new(worktree_path).exists() {
+                continue;
+            }
+            Git::new(worktree_path).abort_rebase_or_merge();
+            self.remove_worktree(job_id)?;
+            if !Path::new(worktree_path).exists() {
+                removed_worktrees += 1;
+            }
+        }
+
+        if targets.is_empty() {
+            return Ok(CleanupReport {
+                cutoff,
+                jobs: 0,
+                messages: 0,
+                events: 0,
+                challenges: 0,
+                notifications: 0,
+                worktrees: removed_worktrees,
+            });
+        }
+
+        let job_ids = targets
+            .iter()
+            .map(|(job_id, _)| job_id.clone())
+            .collect::<Vec<_>>();
+        let placeholders = std::iter::repeat_n("?", job_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut connection = self.open_database()?;
+        connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+        let transaction = connection.transaction()?;
+        let messages = transaction.execute(
+            &format!("DELETE FROM messages WHERE job_id IN ({placeholders})"),
+            params_from_iter(job_ids.iter().map(String::as_str)),
+        )?;
+        let events = transaction.execute(
+            &format!("DELETE FROM events WHERE job_id IN ({placeholders})"),
+            params_from_iter(job_ids.iter().map(String::as_str)),
+        )?;
+        let challenges = transaction.execute(
+            &format!("DELETE FROM challenges WHERE job_id IN ({placeholders})"),
+            params_from_iter(job_ids.iter().map(String::as_str)),
+        )?;
+        let notifications = transaction.execute(
+            &format!("DELETE FROM notifications WHERE job_id IN ({placeholders})"),
+            params_from_iter(job_ids.iter().map(String::as_str)),
+        )?;
+        let jobs = transaction.execute(
+            &format!("DELETE FROM jobs WHERE id IN ({placeholders})"),
+            params_from_iter(job_ids.iter().map(String::as_str)),
+        )?;
+        transaction.commit()?;
+
+        Ok(CleanupReport {
+            cutoff,
+            jobs,
+            messages,
+            events,
+            challenges,
+            notifications,
+            worktrees: removed_worktrees,
+        })
+    }
+
     fn recover_interrupted_jobs(&self) -> Result<()> {
         let connection = self.open_database()?;
         let now = timestamp();
         connection.execute(
-            "UPDATE jobs SET state = 'failed', summary = '服务重启时任务仍在执行，请重新发起', updated_at = ?1 WHERE state IN ('queued', 'running', 'applying', 'pushing')",
+            "UPDATE jobs SET state = 'failed', summary = '服务重启时任务仍在执行，请重新发起', updated_at = ?1 WHERE state IN ('queued', 'running', 'generating_proposal', 'applying', 'pushing')",
             params![now],
         )?;
         Ok(())
@@ -687,22 +837,60 @@ impl ServiceState {
             return self.finish_automatic_sync(job_id, &config, &branch, &git);
         }
 
-        let mut snapshot = git.conflict_snapshot(80 * 1024)?;
-        let mut files = git.conflict_file_contents(
-            &snapshot.files,
-            branch.auto_resolve.max_file_bytes.max(40 * 1024),
-        )?;
-        if let Some(decision) =
-            self.try_low_risk_auto_resolve(&config, &branch, &git, &snapshot, &files)?
-        {
-            if decision {
-                return self.finish_automatic_sync(job_id, &config, &branch, &git);
+        let (mut snapshot, mut files) = capture_conflict_files(&git, &branch)?;
+        if snapshot.files.is_empty() {
+            match continue_autoresolved_sync(
+                &git,
+                &branch,
+                "同步失败，但没有检测到 Git 未合并冲突文件",
+                &output,
+            )? {
+                AutoResolvedSync::Completed => {
+                    return self.finish_automatic_sync(job_id, &config, &branch, &git);
+                }
+                AutoResolvedSync::Conflict(next_snapshot, next_files) => {
+                    snapshot = next_snapshot;
+                    files = next_files;
+                }
+                AutoResolvedSync::Failed(details) => {
+                    git.abort_rebase_or_merge();
+                    let _ = self.remove_worktree(job_id);
+                    self.open_database()?.execute(
+                        "UPDATE jobs SET state = 'failed', summary = '同步失败，未检测到冲突文件', test_output = ?2, updated_at = ?3 WHERE id = ?1",
+                        params![job_id, details, timestamp()],
+                    )?;
+                    self.emit(
+                        Some(job_id),
+                        "sync",
+                        "同步失败，但没有检测到可分析的冲突文件",
+                    )?;
+                    return Ok(());
+                }
             }
-            snapshot = git.conflict_snapshot(80 * 1024)?;
-            files = git.conflict_file_contents(
-                &snapshot.files,
-                branch.auto_resolve.max_file_bytes.max(40 * 1024),
-            )?;
+        }
+        match self.try_low_risk_auto_resolve(&config, &branch, &git, &snapshot, &files) {
+            Ok(Some(decision)) => {
+                if decision {
+                    return self.finish_automatic_sync(job_id, &config, &branch, &git);
+                }
+                (snapshot, files) = capture_conflict_files(&git, &branch)?;
+                if snapshot.files.is_empty() {
+                    self.open_database()?.execute(
+                        "UPDATE jobs SET state = 'failed', summary = '低风险自动修复后未检测到剩余冲突文件，但同步尚未完成', updated_at = ?2 WHERE id = ?1",
+                        params![job_id, timestamp()],
+                    )?;
+                    self.emit(
+                        Some(job_id),
+                        "sync",
+                        "低风险自动修复后没有剩余冲突文件，任务已停止等待人工检查",
+                    )?;
+                    return Ok(());
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                warn!("低风险自动修复失败，保留冲突现场等待人工指导：{err:#}");
+            }
         }
 
         self.save_conflict(job_id, &snapshot, &files)?;
@@ -713,6 +901,7 @@ impl ServiceState {
             snapshot: snapshot.clone(),
             files: files.clone(),
         };
+        let mut options_error = None;
         let options = match llm.conflict_options(&request, "尚无人工补充要求") {
             Ok(Some(options)) => Some(options),
             Ok(None) => {
@@ -720,7 +909,9 @@ impl ServiceState {
                 None
             }
             Err(err) => {
-                warn!("生成功能冲突方案失败，冲突任务保留：{err:#}");
+                let message = format!("{err:#}");
+                warn!("生成功能冲突方案失败，冲突任务保留：{message}");
+                options_error = Some(message);
                 None
             }
         };
@@ -741,17 +932,9 @@ impl ServiceState {
             ],
         )?;
         self.emit(Some(job_id), "conflict", "功能性冲突正在等待人工指导")?;
-        self.notify_once(
-            job_id,
-            "waiting_guidance",
-            &format!("{} 等待处理", branch.name),
-            &format!(
-                "分支 {} 发生功能性冲突。\n冲突文件：{}\n\n{}",
-                branch.name,
-                snapshot.files.join(", "),
-                dashboard_link(&config, job_id)
-            ),
-        )?;
+        if let Some(message) = options_error {
+            warn!("DeepSeek 方案生成失败，等待后台人工处理：{message}");
+        }
         Ok(())
     }
 
@@ -883,26 +1066,65 @@ impl ServiceState {
         self.emit(Some(job_id), "conflict", "DeepSeek 已根据新指导更新方案")
     }
 
-    fn generate_proposal(
+    fn mark_generating_proposal(&self, job_id: &str, option_id: &str) -> Result<()> {
+        let job = self.job(job_id)?;
+        ensure_state(&job, &["waiting_guidance", "test_failed"])?;
+        anyhow::ensure!(
+            !job.conflict_files.is_empty(),
+            "当前任务没有可用于生成候选修改的冲突文件内容，请放弃后重新同步生成新的冲突现场"
+        );
+        let options = job.options.clone().context("当前任务没有可选方案")?;
+        options
+            .options
+            .iter()
+            .find(|option| option.id == option_id)
+            .context("选择的方案不存在")?;
+        self.open_database()?.execute(
+            "UPDATE jobs SET state = 'generating_proposal', proposal_json = NULL, summary = '正在生成候选修改', updated_at = ?2 WHERE id = ?1",
+            params![job_id, timestamp()],
+        )?;
+        self.emit(Some(job_id), "proposal", "正在生成候选修改")
+    }
+
+    fn execute_generate_proposal(&self, job_id: &str, option_id: &str, requirements: &str) {
+        match self.generate_proposal_inner(job_id, option_id, requirements) {
+            Ok(_) => {
+                let _ = self.set_state(job_id, "waiting_guidance", "候选修改已生成，等待确认应用");
+            }
+            Err(err) => {
+                error!("proposal job {job_id} failed: {err:#}");
+                let _ = self.set_state(
+                    job_id,
+                    "waiting_guidance",
+                    &format!("生成候选修改失败：{err:#}"),
+                );
+            }
+        }
+    }
+
+    fn generate_proposal_inner(
         &self,
         job_id: &str,
         option_id: &str,
         requirements: &str,
     ) -> Result<StoredProposal> {
         let job = self.job(job_id)?;
-        ensure_state(&job, &["waiting_guidance", "test_failed"])?;
+        ensure_state(&job, &["generating_proposal"])?;
         let options = job.options.clone().context("当前任务没有可选方案")?;
         let option = options
             .options
             .iter()
             .find(|option| option.id == option_id)
             .context("选择的方案不存在")?;
-        let (config, _, request) = self.conflict_request(&job)?;
+        let (config, branch, request) = self.conflict_request(&job)?;
         let conversation = self.conversation_text(job_id)?;
         let selected = serde_json::to_string(option)?;
-        let proposal = LlmService::new(config.llm.clone())
-            .conflict_proposal(&request, &conversation, &selected, requirements)?
-            .context("DeepSeek 未启用")?;
+        let proposal = match deterministic_proposal(&request.files, option_id, branch.sync)? {
+            Some(proposal) => proposal,
+            None => LlmService::new(config.llm.clone())
+                .conflict_proposal(&request, &conversation, &selected, requirements)?
+                .context("DeepSeek 未启用")?,
+        };
         validate_files(&proposal.files, &request.snapshot.files).map_err(anyhow::Error::msg)?;
         let diff = proposal_diff(&request.files, &proposal)?;
         let stored = StoredProposal {
@@ -957,21 +1179,62 @@ impl ServiceState {
         if in_progress {
             let output = git.continue_sync(branch.sync)?;
             if !output.success() {
-                let snapshot = git.conflict_snapshot(80 * 1024)?;
-                let files = git.conflict_file_contents(
-                    &snapshot.files,
-                    branch.auto_resolve.max_file_bytes.max(40 * 1024),
-                )?;
-                self.save_conflict(job_id, &snapshot, &files)?;
-                self.open_database()?.execute(
-                    "UPDATE jobs SET state = 'waiting_guidance', proposal_json = NULL, options_json = NULL, summary = '继续同步时出现新的冲突', updated_at = ?2 WHERE id = ?1",
-                    params![job_id, timestamp()],
-                )?;
-                self.add_message_and_refresh_options(
-                    job_id,
-                    "继续同步时出现了下一组冲突，请重新分析。",
-                )?;
-                return Ok(());
+                let (snapshot, files) = capture_conflict_files(&git, &branch)?;
+                if snapshot.files.is_empty() {
+                    match continue_autoresolved_sync(
+                        &git,
+                        &branch,
+                        "继续同步失败，但没有检测到新的 Git 冲突文件",
+                        &output,
+                    )? {
+                        AutoResolvedSync::Completed => {}
+                        AutoResolvedSync::Conflict(next_snapshot, next_files) => {
+                            self.save_conflict(job_id, &next_snapshot, &next_files)?;
+                            self.open_database()?.execute(
+                                "UPDATE jobs SET state = 'waiting_guidance', proposal_json = NULL, options_json = NULL, summary = '继续同步时出现新的冲突', updated_at = ?2 WHERE id = ?1",
+                                params![job_id, timestamp()],
+                            )?;
+                            self.add_message_and_refresh_options(
+                                job_id,
+                                "继续同步时出现了下一组冲突，请重新分析。",
+                            )?;
+                            return Ok(());
+                        }
+                        AutoResolvedSync::Failed(details) => {
+                            self.open_database()?.execute(
+                                "UPDATE jobs SET state = 'test_failed', proposal_json = NULL, test_output = ?2, summary = '继续同步失败，未检测到新的冲突文件', updated_at = ?3 WHERE id = ?1",
+                                params![job_id, details, timestamp()],
+                            )?;
+                            self.emit(
+                                Some(job_id),
+                                "sync",
+                                "候选修改已写入，但继续同步失败且没有新的冲突文件",
+                            )?;
+                            self.notify_once(
+                                job_id,
+                                "sync_continue_failed",
+                                &format!("{} 继续同步失败", branch.name),
+                                &format!(
+                                    "候选修改已经写入隔离 worktree，但 git continue 没有产生新的冲突文件。\n\n{}\n\n{}",
+                                    details,
+                                    dashboard_link(&config, job_id)
+                                ),
+                            )?;
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    self.save_conflict(job_id, &snapshot, &files)?;
+                    self.open_database()?.execute(
+                        "UPDATE jobs SET state = 'waiting_guidance', proposal_json = NULL, options_json = NULL, summary = '继续同步时出现新的冲突', updated_at = ?2 WHERE id = ?1",
+                        params![job_id, timestamp()],
+                    )?;
+                    self.add_message_and_refresh_options(
+                        job_id,
+                        "继续同步时出现了下一组冲突，请重新分析。",
+                    )?;
+                    return Ok(());
+                }
             }
         } else {
             let output = git.run_git(&["commit", "--amend", "--no-edit"])?;
@@ -1136,13 +1399,7 @@ impl ServiceState {
         }
         self.remove_worktree(job_id)?;
         self.set_state(job_id, "abandoned", "任务已由管理员放弃")?;
-        let config = self.config()?;
-        self.notify_once(
-            job_id,
-            "abandoned",
-            &format!("{} 已放弃", job.branch),
-            &format!("任务已经清理。\n\n{}", dashboard_link(&config, job_id)),
-        )
+        Ok(())
     }
 
     fn remove_worktree(&self, job_id: &str) -> Result<()> {
@@ -1217,12 +1474,19 @@ impl ServiceState {
         {
             return Ok(());
         }
-        connection.execute(
-            "INSERT INTO notifications (job_id, event, created_at) VALUES (?1, ?2, ?3)",
-            params![job_id, event, timestamp()],
-        )?;
-        if let Err(err) = Notifier::new(self.config()?.notify).send(subject, body) {
-            warn!("failed to send {event} notification: {err:#}");
+        match Notifier::new(self.config()?.notify).send(subject, body) {
+            Ok(true) => {
+                connection.execute(
+                    "INSERT INTO notifications (job_id, event, created_at) VALUES (?1, ?2, ?3)",
+                    params![job_id, event, timestamp()],
+                )?;
+            }
+            Ok(false) => {
+                warn!("notification {event} was not sent because no channel is enabled");
+            }
+            Err(err) => {
+                warn!("failed to send {event} notification: {err:#}");
+            }
         }
         Ok(())
     }
@@ -1395,6 +1659,77 @@ fn ensure_state(job: &JobView, allowed: &[&str]) -> Result<()> {
     }
 }
 
+fn capture_conflict_files(
+    git: &Git,
+    branch: &BranchConfig,
+) -> Result<(ConflictSnapshot, Vec<ConflictFileContent>)> {
+    let snapshot = git.conflict_snapshot(80 * 1024)?;
+    let files = git.conflict_file_contents(
+        &snapshot.files,
+        branch.auto_resolve.max_file_bytes.max(40 * 1024),
+    )?;
+    Ok((snapshot, files))
+}
+
+fn command_output_details(action: &str, output: &CommandOutput) -> String {
+    format!(
+        "{}\n\nexit code: {}\n\nstdout:\n{}\n\nstderr:\n{}",
+        action,
+        output.status,
+        output.stdout.trim(),
+        output.stderr.trim()
+    )
+}
+
+fn has_staged_changes(git: &Git) -> Result<bool> {
+    let output = git.run_git(&["diff", "--cached", "--quiet"])?;
+    match output.status {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => bail!("检查暂存区失败：{}", output.stderr.trim()),
+    }
+}
+
+fn continue_autoresolved_sync(
+    git: &Git,
+    branch: &BranchConfig,
+    action: &str,
+    first_output: &CommandOutput,
+) -> Result<AutoResolvedSync> {
+    let mut details = command_output_details(action, first_output);
+    let mut last_head = git.head().unwrap_or_default();
+    for _ in 0..20 {
+        if !has_staged_changes(git)? {
+            return Ok(AutoResolvedSync::Failed(details));
+        }
+
+        let output = git.continue_sync(branch.sync)?;
+        if output.success() {
+            return Ok(AutoResolvedSync::Completed);
+        }
+        details.push_str("\n\n--- git continue ---\n");
+        details.push_str(&command_output_details(
+            "Git 已有暂存解决结果，但继续同步仍未完成",
+            &output,
+        ));
+
+        let (snapshot, files) = capture_conflict_files(git, branch)?;
+        if !snapshot.files.is_empty() {
+            return Ok(AutoResolvedSync::Conflict(snapshot, files));
+        }
+
+        let current_head = git.head().unwrap_or_default();
+        if current_head == last_head {
+            details.push_str("\n\nGit continue 没有产生新冲突，也没有推进 HEAD，已停止重试。");
+            return Ok(AutoResolvedSync::Failed(details));
+        }
+        last_head = current_head;
+    }
+
+    details.push_str("\n\n自动继续次数超过 20 次，已停止。");
+    Ok(AutoResolvedSync::Failed(details))
+}
+
 fn run_tests(git: &Git, branch: &BranchConfig) -> Result<String> {
     if branch.tests.is_empty() && branch.auto_resolve.require_tests {
         bail!("该分支要求测试，但未配置测试命令");
@@ -1432,6 +1767,96 @@ fn validate_files(
         }
     }
     Ok(())
+}
+
+fn deterministic_proposal(
+    files: &[ConflictFileContent],
+    option_id: &str,
+    sync: crate::config::SyncStrategy,
+) -> Result<Option<ConflictProposal>> {
+    let branch_side = if matches!(sync, crate::config::SyncStrategy::Rebase) {
+        ConflictSide::Theirs
+    } else {
+        ConflictSide::Ours
+    };
+    let upstream_side = if matches!(sync, crate::config::SyncStrategy::Rebase) {
+        ConflictSide::Ours
+    } else {
+        ConflictSide::Theirs
+    };
+    let (summary, side) = match option_id {
+        "accept-mine" => ("全盘接受分支版本", branch_side),
+        "accept-theirs" => ("全盘采用主干版本", upstream_side),
+        _ => return Ok(None),
+    };
+    anyhow::ensure!(
+        !files.is_empty(),
+        "当前任务没有可用于生成候选修改的冲突文件内容，请放弃后重新同步生成新的冲突现场"
+    );
+
+    let mut resolved = Vec::new();
+    for file in files {
+        anyhow::ensure!(
+            !file.content.contains("... file truncated by TermiteRS ..."),
+            "{} 内容已被截断，不能执行全盘接收",
+            file.path
+        );
+        resolved.push(ResolvedFile {
+            path: file.path.clone(),
+            content: resolve_conflict_side(&file.content, side)
+                .with_context(|| format!("无法解析 {}", file.path))?,
+        });
+    }
+
+    Ok(Some(ConflictProposal {
+        summary: summary.to_string(),
+        files: resolved,
+    }))
+}
+
+fn resolve_conflict_side(content: &str, side: ConflictSide) -> Result<String> {
+    enum Mode {
+        Normal,
+        Ours,
+        Theirs,
+    }
+
+    let mut mode = Mode::Normal;
+    let mut output = String::new();
+    let mut ours = String::new();
+    let mut theirs = String::new();
+    let mut saw_conflict = false;
+
+    for segment in content.split_inclusive('\n') {
+        let marker = segment.trim_end_matches(['\r', '\n']);
+        if marker.starts_with("<<<<<<<") {
+            anyhow::ensure!(matches!(mode, Mode::Normal), "冲突标记嵌套或顺序错误");
+            saw_conflict = true;
+            ours.clear();
+            theirs.clear();
+            mode = Mode::Ours;
+        } else if marker.starts_with("=======") {
+            anyhow::ensure!(matches!(mode, Mode::Ours), "冲突分隔符顺序错误");
+            mode = Mode::Theirs;
+        } else if marker.starts_with(">>>>>>>") {
+            anyhow::ensure!(matches!(mode, Mode::Theirs), "冲突结束标记顺序错误");
+            output.push_str(match side {
+                ConflictSide::Ours => &ours,
+                ConflictSide::Theirs => &theirs,
+            });
+            mode = Mode::Normal;
+        } else {
+            match mode {
+                Mode::Normal => output.push_str(segment),
+                Mode::Ours => ours.push_str(segment),
+                Mode::Theirs => theirs.push_str(segment),
+            }
+        }
+    }
+
+    anyhow::ensure!(matches!(mode, Mode::Normal), "冲突标记未闭合");
+    anyhow::ensure!(saw_conflict, "文件不包含 Git 冲突标记");
+    Ok(output)
 }
 
 fn path_is_allowed(path: &str, allowed_paths: &[String]) -> bool {
@@ -1514,5 +1939,129 @@ mod tests {
         let diff = proposal_diff(&original, &proposal).unwrap();
         assert!(diff.contains("-old"));
         assert!(diff.contains("+new"));
+    }
+
+    #[test]
+    fn deterministic_accept_mine_uses_branch_side_during_rebase() {
+        let files = vec![ConflictFileContent {
+            path: "src/main.py".to_string(),
+            content: "keep\n<<<<<<< HEAD\nupstream\n=======\nbranch\n>>>>>>> my/branch\nend\n"
+                .to_string(),
+        }];
+        let proposal =
+            deterministic_proposal(&files, "accept-mine", crate::config::SyncStrategy::Rebase)
+                .unwrap()
+                .unwrap();
+        assert_eq!(proposal.files[0].content, "keep\nbranch\nend\n");
+    }
+
+    #[test]
+    fn deterministic_accept_theirs_uses_upstream_side_during_rebase() {
+        let files = vec![ConflictFileContent {
+            path: "src/main.py".to_string(),
+            content: "keep\n<<<<<<< HEAD\nupstream\n=======\nbranch\n>>>>>>> my/branch\nend\n"
+                .to_string(),
+        }];
+        let proposal =
+            deterministic_proposal(&files, "accept-theirs", crate::config::SyncStrategy::Rebase)
+                .unwrap()
+                .unwrap();
+        assert_eq!(proposal.files[0].content, "keep\nupstream\nend\n");
+    }
+
+    #[test]
+    fn cleanup_old_jobs_deletes_only_old_terminal_jobs() {
+        let root = std::env::temp_dir().join(format!("termiters-cleanup-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let database_path = root.join("termite.db");
+        let (event_sender, _) = broadcast::channel(1);
+        let state = ServiceState {
+            config_path: root.join("termite.yml"),
+            data_dir: root.clone(),
+            database_path,
+            events: event_sender,
+            repository_lock: Arc::new(Mutex::new(())),
+            password_attempts: Arc::new(Mutex::new(Vec::new())),
+        };
+        state.initialize_database().unwrap();
+
+        let old = (Utc::now() - chrono::Duration::days(31)).to_rfc3339();
+        let fresh = Utc::now().to_rfc3339();
+        let connection = state.open_database().unwrap();
+        for (job_id, state_name, updated_at) in [
+            ("old-completed", "completed", old.as_str()),
+            ("old-abandoned", "abandoned", old.as_str()),
+            ("old-failed", "failed", old.as_str()),
+            ("old-running", "running", old.as_str()),
+            ("fresh-completed", "completed", fresh.as_str()),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO jobs (id, kind, branch, state, created_at, updated_at)
+                     VALUES (?1, 'sync', 'main', ?2, ?3, ?4)",
+                    params![job_id, state_name, old, updated_at],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO messages (job_id, role, content, created_at)
+                     VALUES (?1, 'assistant', 'ok', ?2)",
+                    params![job_id, old],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO events (id, job_id, kind, message, created_at)
+                     VALUES (?1, ?2, 'state', 'ok', ?3)",
+                    params![format!("event-{job_id}"), job_id, old],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO challenges (id, job_id, expected_remote_head, expires_at, used)
+                     VALUES (?1, ?2, 'head', 0, 0)",
+                    params![format!("challenge-{job_id}"), job_id],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO notifications (job_id, event, created_at)
+                     VALUES (?1, 'done', ?2)",
+                    params![job_id, old],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        let report = state.cleanup_old_jobs(30).unwrap();
+        assert_eq!(report.jobs, 3);
+        assert_eq!(report.messages, 3);
+        assert_eq!(report.events, 3);
+        assert_eq!(report.challenges, 3);
+        assert_eq!(report.notifications, 3);
+
+        let connection = state.open_database().unwrap();
+        let mut statement = connection
+            .prepare("SELECT id FROM jobs ORDER BY id")
+            .unwrap();
+        let remaining = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(remaining, vec!["fresh-completed", "old-running"]);
+
+        for table in ["messages", "events", "challenges", "notifications"] {
+            let count: i64 = connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 2, "{table}");
+        }
+
+        drop(statement);
+        drop(connection);
+        fs::remove_dir_all(root).unwrap();
     }
 }
