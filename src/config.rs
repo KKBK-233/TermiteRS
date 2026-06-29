@@ -104,6 +104,10 @@ pub struct LlmConfig {
     pub temperature: f32,
     #[serde(default = "default_max_prompt_bytes")]
     pub max_prompt_bytes: usize,
+    #[serde(default = "default_llm_timeout_seconds")]
+    pub timeout_seconds: u64,
+    #[serde(default = "default_llm_max_retries")]
+    pub max_retries: u32,
     #[serde(default)]
     pub prompts: LlmPromptsConfig,
 }
@@ -382,6 +386,14 @@ fn default_llm_temperature() -> f32 {
 
 fn default_max_prompt_bytes() -> usize {
     80 * 1024
+}
+
+fn default_llm_timeout_seconds() -> u64 {
+    300
+}
+
+fn default_llm_max_retries() -> u32 {
+    2
 }
 
 fn default_smtp_port() -> u16 {

@@ -452,6 +452,11 @@ termiters serve --config /etc/termiters/termite.yml
 
 服务使用 SQLite 保存任务、对话、候选修改、推送挑战和通知状态。每次正式同步都在独立 detached worktree 中执行。低风险冲突继续按原规则自动处理；功能性冲突会保留现场，等待后台多轮指导。
 
+推送行为分两类：
+
+- 无冲突同步，或被判定为低风险且测试通过的自动解冲突，会按分支的 `push` 策略直接推送。
+- 功能性冲突需要人工选择方案、生成候选修改、应用并测试通过后，才会进入等待推送确认；这类人工确认推送需要五分钟有效的一次性挑战和独立操作密码。
+
 ```yaml
 service:
   socket_path: /run/termiters/termiters.sock
@@ -468,7 +473,8 @@ printf '%s' '你的独立操作密码' | termiters hash-password
 
 - GitHub Deploy Key、DeepSeek Key 和 SMTP 凭证只能由 `termiters` 用户读取。
 - 博客只通过 Unix Socket 调用固定动作，不读取仓库或密钥。
-- 最终推送使用五分钟有效的一次性挑战和独立操作密码。
+- Dashboard 和任务接口会返回仓库路径、远端地址、任务输出、人工对话、候选 diff 和冲突上下文，只能提供给可信后台，不要直接暴露到公网。
+- 公网反代默认只开放必要的确认入口，例如 `deploy/nginx-termite.conf` 中的 `/termite-control/v1/push/confirm`；不要把 `/v1/dashboard`、`/v1/jobs/*`、`/v1/conflicts/*`、`/v1/events` 直接代理给公网用户。
 - `deploy/` 提供 systemd、tmpfiles 和 Nginx 示例。
 - 如果测试命令本身需要特殊环境，需要在配置里写清楚。
 

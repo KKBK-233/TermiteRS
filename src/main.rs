@@ -51,6 +51,19 @@ fn main() -> Result<()> {
             let report = SyncRunner::new(config, options).run()?;
             println!("{}", report.render_text());
         }
+        Commands::Cleanup { config, days } => {
+            let report = service::cleanup_old_jobs(config, days)?;
+            println!(
+                "cleaned cutoff={}, jobs={}, messages={}, events={}, challenges={}, notifications={}, worktrees={}",
+                report.cutoff,
+                report.jobs,
+                report.messages,
+                report.events,
+                report.challenges,
+                report.notifications,
+                report.worktrees
+            );
+        }
         Commands::Status { config } => {
             let config = Config::read_from(config)?;
             let report = SyncRunner::new(config, SyncOptions::status_only()).status()?;
