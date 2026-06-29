@@ -1,10 +1,13 @@
 use std::env;
 use std::io::Read;
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tracing::warn;
 
 use crate::config::{LlmConfig, LlmProvider};
 use crate::git::{ConflictFileContent, ConflictSnapshot};
@@ -327,6 +330,21 @@ fn chat_completions_endpoint(config: &LlmConfig) -> Result<String> {
 }
 
 fn call_chat(config: &LlmConfig, system_prompt: &str, user_prompt: &str) -> Result<String> {
+    let attempts = config.max_retries.saturating_add(1);
+    for attempt in 1..=attempts {
+        match call_chat_once(config, system_prompt, user_prompt) {
+            Ok(content) => return Ok(content),
+            Err(err) if attempt < attempts && is_retryable_llm_error(&err) => {
+                warn!("LLM request attempt {attempt}/{attempts} failed, retrying: {err:#}");
+                thread::sleep(Duration::from_secs(u64::from(attempt.min(5))));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    bail!("LLM request did not run")
+}
+
+fn call_chat_once(config: &LlmConfig, system_prompt: &str, user_prompt: &str) -> Result<String> {
     let api_key = env::var(&config.api_key_env)
         .with_context(|| format!("missing LLM API key env {}", config.api_key_env))?;
     let endpoint = chat_completions_endpoint(config)?;
@@ -347,7 +365,7 @@ fn call_chat(config: &LlmConfig, system_prompt: &str, user_prompt: &str) -> Resu
         ],
     };
 
-    let client = Client::new();
+    let client = llm_client(config)?;
     let response: Value = client
         .post(endpoint)
         .bearer_auth(api_key)
@@ -364,6 +382,26 @@ fn call_chat(config: &LlmConfig, system_prompt: &str, user_prompt: &str) -> Resu
         .ok_or_else(|| anyhow!("LLM response did not contain choices[0].message.content"))?;
 
     Ok(content.trim().to_string())
+}
+
+fn llm_client(config: &LlmConfig) -> Result<Client> {
+    Client::builder()
+        .timeout(Duration::from_secs(config.timeout_seconds.max(1)))
+        .build()
+        .context("failed to build LLM HTTP client")
+}
+
+fn is_retryable_llm_error(err: &anyhow::Error) -> bool {
+    let message = err
+        .chain()
+        .map(|cause| cause.to_string().to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    message.contains("timed out")
+        || message.contains("timeout")
+        || message.contains("connection")
+        || message.contains("server error")
+        || message.contains("body")
 }
 
 fn call_chat_streaming<F>(
@@ -395,7 +433,7 @@ where
         ],
     };
 
-    let mut response = Client::new()
+    let mut response = llm_client(config)?
         .post(endpoint)
         .bearer_auth(api_key)
         .json(&body)

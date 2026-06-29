@@ -45,6 +45,17 @@ pub enum Commands {
         dry_run: bool,
     },
 
+    /// Clean old completed, abandoned and failed service jobs.
+    Cleanup {
+        /// Path to YAML config.
+        #[arg(short, long, default_value = "termite.yml")]
+        config: PathBuf,
+
+        /// Delete terminal jobs updated more than this many days ago.
+        #[arg(long, default_value_t = 30)]
+        days: u32,
+    },
+
     /// Show branch status without changing anything.
     Status {
         /// Path to YAML config.
