@@ -57,6 +57,11 @@ impl Git {
         Ok(())
     }
 
+    pub fn fetch_branch(&self, remote: &str, branch: &str) -> Result<()> {
+        self.git_checked(&["fetch", "--prune", remote, branch])?;
+        Ok(())
+    }
+
     pub fn checkout(&self, branch: &str) -> Result<()> {
         self.git_checked(&["checkout", branch])
             .with_context(|| format!("failed to checkout {branch}"))?;
