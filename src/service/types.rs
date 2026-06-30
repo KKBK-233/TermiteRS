@@ -47,6 +47,28 @@ pub(crate) struct Dashboard {
     pub(crate) upstream_url: String,
     pub(crate) branches: Vec<BranchDashboard>,
     pub(crate) jobs: Vec<JobView>,
+    pub(crate) stats: ServiceStats,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct StatusView {
+    pub(crate) repository: String,
+    pub(crate) upstream_url: String,
+    pub(crate) fork_url: String,
+    pub(crate) branch_count: usize,
+    pub(crate) active_jobs: usize,
+    pub(crate) stats: ServiceStats,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ServiceStats {
+    pub(crate) sync_total: u32,
+    pub(crate) sync_completed: u32,
+    pub(crate) sync_failed: u32,
+    pub(crate) sync_conflict: u32,
+    pub(crate) sync_active: u32,
+    pub(crate) check_total: u32,
+    pub(crate) job_total: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -114,6 +136,11 @@ pub(crate) struct MessageRequest {
 pub(crate) struct ProposalRequest {
     pub(crate) option_id: String,
     pub(crate) requirements: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct CleanupRequest {
+    pub(crate) days: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy)]

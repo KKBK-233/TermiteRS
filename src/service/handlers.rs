@@ -15,11 +15,77 @@ use tokio_stream::wrappers::BroadcastStream;
 
 use super::state::ServiceState;
 use super::types::{
-    AcceptedResponse, ApiMessage, MessageRequest, ProposalRequest, PushConfirmRequest, SyncRequest,
+    AcceptedResponse, ApiMessage, CleanupRequest, MessageRequest, ProposalRequest,
+    PushConfirmRequest, SyncRequest,
 };
+
+pub(crate) async fn status(State(state): State<ServiceState>) -> Response {
+    match state.status_view() {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => api_error(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }
+}
+
 pub(crate) async fn dashboard(State(state): State<ServiceState>) -> Response {
     match state.dashboard() {
         Ok(value) => Json(value).into_response(),
+        Err(err) => api_error(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }
+}
+
+pub(crate) async fn stats(State(state): State<ServiceState>) -> Response {
+    match state.job_stats() {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => api_error(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }
+}
+
+pub(crate) async fn branches(State(state): State<ServiceState>) -> Response {
+    match state.branches_view() {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => api_error(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }
+}
+
+pub(crate) async fn branch(
+    State(state): State<ServiceState>,
+    AxumPath(name): AxumPath<String>,
+) -> Response {
+    match state.branch_view(&name) {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => api_error(StatusCode::NOT_FOUND, err),
+    }
+}
+
+pub(crate) async fn jobs(State(state): State<ServiceState>) -> Response {
+    match state.jobs() {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => api_error(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }
+}
+
+pub(crate) async fn job(
+    State(state): State<ServiceState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    match state.job(&id) {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => api_error(StatusCode::NOT_FOUND, err),
+    }
+}
+
+pub(crate) async fn config_summary(State(state): State<ServiceState>) -> Response {
+    match state.dashboard() {
+        Ok(value) => Json(serde_json::json!({
+            "repository": value.repository,
+            "upstream_url": value.upstream_url,
+            "fork_url": value.fork_url,
+            "branches": value.branches.into_iter().map(|branch| serde_json::json!({
+                "name": branch.name,
+                "note": branch.note,
+            })).collect::<Vec<_>>(),
+        }))
+        .into_response(),
         Err(err) => api_error(StatusCode::INTERNAL_SERVER_ERROR, err),
     }
 }
@@ -34,6 +100,32 @@ pub(crate) async fn start_check(State(state): State<ServiceState>) -> Response {
         }
         Err(err) => api_error(StatusCode::CONFLICT, err),
     }
+}
+
+pub(crate) async fn start_sync_all(State(state): State<ServiceState>) -> Response {
+    let config = match state.config() {
+        Ok(config) => config,
+        Err(err) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+    for branch in &config.branches {
+        if let Err(err) = state.ensure_no_active_sync(&branch.name) {
+            return api_error(StatusCode::CONFLICT, err);
+        }
+    }
+    let mut job_ids = Vec::new();
+    for branch in config.branches {
+        match state.create_job("sync", &branch.name) {
+            Ok(job_id) => {
+                let worker = state.clone();
+                let worker_job_id = job_id.clone();
+                let branch_name = branch.name;
+                thread::spawn(move || worker.execute_sync(&worker_job_id, &branch_name));
+                job_ids.push(job_id);
+            }
+            Err(err) => return api_error(StatusCode::CONFLICT, err),
+        }
+    }
+    Json(serde_json::json!({ "job_ids": job_ids })).into_response()
 }
 
 pub(crate) async fn start_sync(
@@ -63,6 +155,50 @@ pub(crate) async fn start_sync(
             (StatusCode::ACCEPTED, Json(AcceptedResponse { job_id })).into_response()
         }
         Err(err) => api_error(StatusCode::CONFLICT, err),
+    }
+}
+
+pub(crate) async fn cancel_job(
+    State(state): State<ServiceState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    match state.abandon(&id) {
+        Ok(()) => Json(ApiMessage {
+            message: "任务已取消并清理".to_string(),
+        })
+        .into_response(),
+        Err(err) => api_error(StatusCode::CONFLICT, err),
+    }
+}
+
+pub(crate) async fn retry_job(
+    State(state): State<ServiceState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let job = match state.job(&id) {
+        Ok(job) => job,
+        Err(err) => return api_error(StatusCode::NOT_FOUND, err),
+    };
+    if job.kind == "check" {
+        return start_check(State(state)).await;
+    }
+    if job.kind != "sync" {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            anyhow::anyhow!("只支持重试 check 或 sync 任务"),
+        );
+    }
+    let request = SyncRequest { branch: job.branch };
+    start_sync(State(state), Json(request)).await
+}
+
+pub(crate) async fn cleanup_jobs(
+    State(state): State<ServiceState>,
+    Json(request): Json<CleanupRequest>,
+) -> Response {
+    match state.cleanup_old_jobs(request.days.unwrap_or(30)) {
+        Ok(report) => Json(report).into_response(),
+        Err(err) => api_error(StatusCode::BAD_REQUEST, err),
     }
 }
 

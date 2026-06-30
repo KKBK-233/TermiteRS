@@ -97,9 +97,20 @@ async fn run_unix(config_path: PathBuf) -> Result<()> {
     state.recover_interrupted_jobs()?;
 
     let app = Router::new()
+        .route("/v1/status", get(handlers::status))
+        .route("/v1/stats", get(handlers::stats))
         .route("/v1/dashboard", get(handlers::dashboard))
+        .route("/v1/branches", get(handlers::branches))
+        .route("/v1/branches/:name", get(handlers::branch))
+        .route("/v1/config/summary", get(handlers::config_summary))
+        .route("/v1/jobs", get(handlers::jobs))
+        .route("/v1/jobs/:id", get(handlers::job))
         .route("/v1/jobs/check", post(handlers::start_check))
+        .route("/v1/jobs/sync-all", post(handlers::start_sync_all))
         .route("/v1/jobs/sync", post(handlers::start_sync))
+        .route("/v1/jobs/:id/cancel", post(handlers::cancel_job))
+        .route("/v1/jobs/:id/retry", post(handlers::retry_job))
+        .route("/v1/jobs/cleanup", post(handlers::cleanup_jobs))
         .route("/v1/conflicts/:id/messages", post(handlers::add_message))
         .route(
             "/v1/conflicts/:id/proposal",
