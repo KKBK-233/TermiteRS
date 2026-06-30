@@ -13,6 +13,7 @@ use crate::text::truncate_to_char_boundary;
 
 const MAX_REPORTED_COMMITS: usize = 12;
 const MAX_REPORTED_FILES: usize = 30;
+const MAX_REMOTE_CHANGED_RETRIES: usize = 1;
 
 struct AutoResolveOutcome {
     applied: bool,
@@ -24,6 +25,22 @@ enum AutoContinueOutcome {
     Stopped {
         snapshot: crate::git::ConflictSnapshot,
         details: Vec<String>,
+    },
+}
+
+enum SyncBranchOutcome {
+    Report(BranchReport),
+    RemoteChanged {
+        expected: Option<String>,
+        current: Option<String>,
+    },
+}
+
+enum PushGuard {
+    Unchanged,
+    RemoteChanged {
+        expected: Option<String>,
+        current: Option<String>,
     },
 }
 
@@ -125,19 +142,48 @@ impl SyncRunner {
     }
 
     fn sync_branch(&self, branch: &BranchConfig) -> Result<BranchReport> {
+        for attempt in 0..=MAX_REMOTE_CHANGED_RETRIES {
+            match self.sync_branch_once(branch)? {
+                SyncBranchOutcome::Report(report) => return Ok(report),
+                SyncBranchOutcome::RemoteChanged { expected, current }
+                    if attempt < MAX_REMOTE_CHANGED_RETRIES =>
+                {
+                    warn!(
+                        "remote branch changed before push, retrying sync branch {}",
+                        branch.name
+                    );
+                    self.git.abort_rebase_or_merge();
+                    let _ = (expected, current);
+                }
+                SyncBranchOutcome::RemoteChanged { expected, current } => {
+                    return Ok(remote_changed_report(
+                        branch,
+                        &format!("{}/{}", self.config.repo.fork_remote, branch.name),
+                        expected.as_deref(),
+                        current.as_deref(),
+                    ));
+                }
+            }
+        }
+
+        Ok(
+            BranchReport::new(&branch.name, branch.kind, BranchStatus::Failed)
+                .active()
+                .detail("sync failed: remote changed retry loop exited unexpectedly"),
+        )
+    }
+
+    fn sync_branch_once(&self, branch: &BranchConfig) -> Result<SyncBranchOutcome> {
         info!("sync branch {}", branch.name);
-        self.git.checkout(&branch.name)?;
         let base = format!(
             "{}/{}",
             self.config.repo.upstream_remote, self.config.repo.base_branch
         );
+        let remote_branch = format!("{}/{}", self.config.repo.fork_remote, branch.name);
+        let remote_before = self.prepare_branch_for_sync(branch, &remote_branch)?;
         let before_head = self.git.head()?;
         let base_head = self.git.short_ref(&base)?;
         let upstream_commits = self.upstream_commits_since_branch_base(&base)?;
-        let remote_branch = format!("{}/{}", self.config.repo.fork_remote, branch.name);
-        let remote_before = self
-            .git
-            .remote_head(&self.config.repo.fork_remote, &branch.name)?;
         self.notify_sync_start(branch, &base)?;
 
         let sync_output = match branch.sync {
@@ -156,7 +202,7 @@ impl SyncRunner {
                     }
                     Some(AutoContinueOutcome::Stopped { snapshot, details }) => {
                         self.git.abort_rebase_or_merge();
-                        return Ok(self.conflict_report(
+                        return Ok(SyncBranchOutcome::Report(self.conflict_report(
                             branch,
                             &base,
                             &base_head,
@@ -165,11 +211,11 @@ impl SyncRunner {
                             snapshot,
                             upstream_commits,
                             details,
-                        ));
+                        )));
                     }
                     None => {
                         self.git.abort_rebase_or_merge();
-                        return Ok(self.conflict_report(
+                        return Ok(SyncBranchOutcome::Report(self.conflict_report(
                             branch,
                             &base,
                             &base_head,
@@ -178,7 +224,7 @@ impl SyncRunner {
                             snapshot,
                             upstream_commits,
                             Vec::new(),
-                        ));
+                        )));
                     }
                 }
             } else if let Some(outcome) =
@@ -188,7 +234,7 @@ impl SyncRunner {
                     auto_resolve_details = outcome.details;
                 } else {
                     self.git.abort_rebase_or_merge();
-                    return Ok(self.conflict_report(
+                    return Ok(SyncBranchOutcome::Report(self.conflict_report(
                         branch,
                         &base,
                         &base_head,
@@ -197,11 +243,11 @@ impl SyncRunner {
                         snapshot,
                         upstream_commits,
                         outcome.details,
-                    ));
+                    )));
                 }
             } else {
                 self.git.abort_rebase_or_merge();
-                return Ok(self.conflict_report(
+                return Ok(SyncBranchOutcome::Report(self.conflict_report(
                     branch,
                     &base,
                     &base_head,
@@ -210,7 +256,7 @@ impl SyncRunner {
                     snapshot,
                     upstream_commits,
                     Vec::new(),
-                ));
+                )));
             }
         }
 
@@ -229,7 +275,7 @@ impl SyncRunner {
                 if !output.stderr.trim().is_empty() {
                     entry.push_detail(format!("stderr: {}", one_line(&output.stderr)));
                 }
-                return Ok(entry);
+                return Ok(SyncBranchOutcome::Report(entry));
             }
         }
 
@@ -238,11 +284,11 @@ impl SyncRunner {
             && branch.auto_resolve.require_tests
             && !auto_resolve_details.is_empty()
         {
-            return Ok(
+            return Ok(SyncBranchOutcome::Report(
                 BranchReport::new(&branch.name, branch.kind, BranchStatus::Failed)
                     .active()
                     .detail("auto resolve failed: require_tests is true but no tests configured"),
-            );
+            ));
         }
 
         let after_sync_head = self.git.head()?;
@@ -267,23 +313,27 @@ impl SyncRunner {
         match branch.push {
             PushStrategy::None => {}
             PushStrategy::Normal => {
-                if let Some(report) =
+                if let PushGuard::RemoteChanged { expected, current } =
                     self.verify_remote_before_push(branch, remote_before.as_deref())?
                 {
-                    return Ok(report);
+                    return Ok(SyncBranchOutcome::RemoteChanged { expected, current });
                 }
                 let output = self
                     .git
                     .push(&self.config.repo.fork_remote, &branch.name, false)?;
                 if !output.success() {
-                    return Ok(push_failed_report(branch, output.status, output.stderr));
+                    return Ok(SyncBranchOutcome::Report(push_failed_report(
+                        branch,
+                        output.status,
+                        output.stderr,
+                    )));
                 }
             }
             PushStrategy::ForceWithLease => {
-                if let Some(report) =
+                if let PushGuard::RemoteChanged { expected, current } =
                     self.verify_remote_before_push(branch, remote_before.as_deref())?
                 {
-                    return Ok(report);
+                    return Ok(SyncBranchOutcome::RemoteChanged { expected, current });
                 }
                 let output = if let Some(expected_remote_head) = remote_before.as_deref() {
                     self.git.push_with_lease(
@@ -296,7 +346,11 @@ impl SyncRunner {
                         .push(&self.config.repo.fork_remote, &branch.name, false)?
                 };
                 if !output.success() {
-                    return Ok(push_failed_report(branch, output.status, output.stderr));
+                    return Ok(SyncBranchOutcome::Report(push_failed_report(
+                        branch,
+                        output.status,
+                        output.stderr,
+                    )));
                 }
             }
         }
@@ -341,40 +395,45 @@ impl SyncRunner {
                 entry.push_detail(format!("pushed to {remote_branch}"));
             }
         }
-        Ok(entry)
+        Ok(SyncBranchOutcome::Report(entry))
+    }
+
+    fn prepare_branch_for_sync(
+        &self,
+        branch: &BranchConfig,
+        remote_branch: &str,
+    ) -> Result<Option<String>> {
+        self.git
+            .fetch_branch(&self.config.repo.fork_remote, &branch.name)?;
+        let remote_before = self
+            .git
+            .remote_head(&self.config.repo.fork_remote, &branch.name)?;
+        if remote_before.is_some() && !matches!(branch.push, PushStrategy::None) {
+            self.git.checkout_branch_at(&branch.name, remote_branch)?;
+        } else {
+            self.git.checkout(&branch.name)?;
+        }
+        Ok(remote_before)
     }
 
     fn verify_remote_before_push(
         &self,
         branch: &BranchConfig,
         expected_remote_head: Option<&str>,
-    ) -> Result<Option<BranchReport>> {
+    ) -> Result<PushGuard> {
         self.git
             .fetch_branch(&self.config.repo.fork_remote, &branch.name)?;
         let current_remote_head = self
             .git
             .remote_head(&self.config.repo.fork_remote, &branch.name)?;
         if current_remote_head.as_deref() == expected_remote_head {
-            return Ok(None);
+            return Ok(PushGuard::Unchanged);
         }
 
-        let remote_branch = format!("{}/{}", self.config.repo.fork_remote, branch.name);
-        Ok(Some(
-            BranchReport::new(&branch.name, branch.kind, BranchStatus::Failed)
-                .active()
-                .detail(branch_note_detail(branch))
-                .detail("push blocked: remote branch changed before push")
-                .detail(format!("remote branch: {remote_branch}"))
-                .detail(format!(
-                    "expected remote head: {}",
-                    display_remote_head(expected_remote_head)
-                ))
-                .detail(format!(
-                    "current remote head: {}",
-                    display_remote_head(current_remote_head.as_deref())
-                ))
-                .detail("rerun sync after fetching the latest remote branch"),
-        ))
+        Ok(PushGuard::RemoteChanged {
+            expected: expected_remote_head.map(ToOwned::to_owned),
+            current: current_remote_head,
+        })
     }
 
     fn conflict_report(
@@ -729,6 +788,28 @@ fn push_failed_report(branch: &BranchConfig, status: i32, stderr: String) -> Bra
         .detail(branch_note_detail(branch))
         .detail(format!("push failed with code {status}"))
         .detail(format!("stderr: {}", one_line(&stderr)))
+}
+
+fn remote_changed_report(
+    branch: &BranchConfig,
+    remote_branch: &str,
+    expected_remote_head: Option<&str>,
+    current_remote_head: Option<&str>,
+) -> BranchReport {
+    BranchReport::new(&branch.name, branch.kind, BranchStatus::Failed)
+        .active()
+        .detail(branch_note_detail(branch))
+        .detail("push blocked: remote branch changed before push")
+        .detail(format!("remote branch: {remote_branch}"))
+        .detail(format!(
+            "expected remote head: {}",
+            display_remote_head(expected_remote_head)
+        ))
+        .detail(format!(
+            "current remote head: {}",
+            display_remote_head(current_remote_head)
+        ))
+        .detail("sync retried once from the latest remote branch but remote changed again")
 }
 
 fn branch_note_detail(branch: &BranchConfig) -> String {
