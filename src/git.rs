@@ -68,6 +68,12 @@ impl Git {
         Ok(())
     }
 
+    pub fn checkout_branch_at(&self, branch: &str, start_point: &str) -> Result<()> {
+        self.git_checked(&["checkout", "-B", branch, start_point])
+            .with_context(|| format!("failed to checkout {branch} at {start_point}"))?;
+        Ok(())
+    }
+
     pub fn rebase(&self, target: &str) -> Result<CommandOutput> {
         self.git(&["rebase", target])
     }
