@@ -83,6 +83,7 @@ impl ServiceState {
         self.set_state(&job.id, "pushing", "正在校验远端并推送")?;
         let branch = configured_branch(&config, &job.branch)?.clone();
         let git = Git::new(&job.worktree_path);
+        git.fetch_branch(&config.repo.fork_remote, &job.branch)?;
         let current_remote = git
             .remote_head(&config.repo.fork_remote, &job.branch)?
             .unwrap_or_default();
@@ -117,13 +118,24 @@ impl ServiceState {
             return Ok(());
         }
         let job = self.job(job_id)?;
-        let output = if require_lease || matches!(branch.push, PushStrategy::ForceWithLease) {
-            let lease = format!(
-                "--force-with-lease=refs/heads/{}:{}",
-                branch.name, job.remote_head
+        git.fetch_branch(&config.repo.fork_remote, &branch.name)?;
+        let current_remote = git
+            .remote_head(&config.repo.fork_remote, &branch.name)?
+            .unwrap_or_default();
+        if current_remote != job.remote_head {
+            bail!(
+                "远端分支已变化，拒绝推送。expected={} current={}",
+                display_remote_head(&job.remote_head),
+                display_remote_head(&current_remote)
             );
-            let refspec = format!("HEAD:refs/heads/{}", branch.name);
-            git.run_git(&["push", &lease, &config.repo.fork_remote, &refspec])?
+        }
+        let output = if require_lease || matches!(branch.push, PushStrategy::ForceWithLease) {
+            if job.remote_head.is_empty() {
+                let refspec = format!("HEAD:refs/heads/{}", branch.name);
+                git.run_git(&["push", &config.repo.fork_remote, &refspec])?
+            } else {
+                git.push_with_lease(&config.repo.fork_remote, &branch.name, &job.remote_head)?
+            }
         } else {
             let refspec = format!("HEAD:refs/heads/{}", branch.name);
             git.run_git(&["push", &config.repo.fork_remote, &refspec])?
@@ -222,4 +234,8 @@ impl ServiceState {
         attempts.push(now);
         Ok(())
     }
+}
+
+fn display_remote_head(head: &str) -> &str {
+    if head.is_empty() { "not found" } else { head }
 }
