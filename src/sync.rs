@@ -135,14 +135,9 @@ impl SyncRunner {
         let base_head = self.git.short_ref(&base)?;
         let upstream_commits = self.upstream_commits_since_branch_base(&base)?;
         let remote_branch = format!("{}/{}", self.config.repo.fork_remote, branch.name);
-        let remote_before = if self
+        let remote_before = self
             .git
-            .remote_branch_exists(&self.config.repo.fork_remote, &branch.name)?
-        {
-            Some(self.git.short_ref(&remote_branch)?)
-        } else {
-            None
-        };
+            .remote_head(&self.config.repo.fork_remote, &branch.name)?;
         self.notify_sync_start(branch, &base)?;
 
         let sync_output = match branch.sync {
@@ -272,6 +267,11 @@ impl SyncRunner {
         match branch.push {
             PushStrategy::None => {}
             PushStrategy::Normal => {
+                if let Some(report) =
+                    self.verify_remote_before_push(branch, remote_before.as_deref())?
+                {
+                    return Ok(report);
+                }
                 let output = self
                     .git
                     .push(&self.config.repo.fork_remote, &branch.name, false)?;
@@ -280,9 +280,21 @@ impl SyncRunner {
                 }
             }
             PushStrategy::ForceWithLease => {
-                let output = self
-                    .git
-                    .push(&self.config.repo.fork_remote, &branch.name, true)?;
+                if let Some(report) =
+                    self.verify_remote_before_push(branch, remote_before.as_deref())?
+                {
+                    return Ok(report);
+                }
+                let output = if let Some(expected_remote_head) = remote_before.as_deref() {
+                    self.git.push_with_lease(
+                        &self.config.repo.fork_remote,
+                        &branch.name,
+                        expected_remote_head,
+                    )?
+                } else {
+                    self.git
+                        .push(&self.config.repo.fork_remote, &branch.name, false)?
+                };
                 if !output.success() {
                     return Ok(push_failed_report(branch, output.status, output.stderr));
                 }
@@ -304,7 +316,8 @@ impl SyncRunner {
         entry.push_detail(format!("target base: {base} @ {base_head}"));
         if let Some(remote_before) = &remote_before {
             entry.push_detail(format!(
-                "remote before push: {remote_branch} @ {remote_before}"
+                "remote before push: {remote_branch} @ {}",
+                short_head(remote_before)
             ));
         } else {
             entry.push_detail(format!("remote before push: {remote_branch} not found"));
@@ -329,6 +342,39 @@ impl SyncRunner {
             }
         }
         Ok(entry)
+    }
+
+    fn verify_remote_before_push(
+        &self,
+        branch: &BranchConfig,
+        expected_remote_head: Option<&str>,
+    ) -> Result<Option<BranchReport>> {
+        self.git
+            .fetch_branch(&self.config.repo.fork_remote, &branch.name)?;
+        let current_remote_head = self
+            .git
+            .remote_head(&self.config.repo.fork_remote, &branch.name)?;
+        if current_remote_head.as_deref() == expected_remote_head {
+            return Ok(None);
+        }
+
+        let remote_branch = format!("{}/{}", self.config.repo.fork_remote, branch.name);
+        Ok(Some(
+            BranchReport::new(&branch.name, branch.kind, BranchStatus::Failed)
+                .active()
+                .detail(branch_note_detail(branch))
+                .detail("push blocked: remote branch changed before push")
+                .detail(format!("remote branch: {remote_branch}"))
+                .detail(format!(
+                    "expected remote head: {}",
+                    display_remote_head(expected_remote_head)
+                ))
+                .detail(format!(
+                    "current remote head: {}",
+                    display_remote_head(current_remote_head.as_deref())
+                ))
+                .detail("rerun sync after fetching the latest remote branch"),
+        ))
     }
 
     fn conflict_report(
@@ -691,6 +737,15 @@ fn branch_note_detail(branch: &BranchConfig) -> String {
         .as_ref()
         .map(|note| format!("note: {note}"))
         .unwrap_or_else(|| "note: none".to_string())
+}
+
+fn display_remote_head(head: Option<&str>) -> String {
+    head.map(short_head)
+        .unwrap_or_else(|| "not found".to_string())
+}
+
+fn short_head(head: &str) -> String {
+    head.chars().take(8).collect()
 }
 
 fn push_commit_details(entry: &mut BranchReport, title: &str, commits: &[String]) {
