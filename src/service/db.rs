@@ -8,7 +8,9 @@ use uuid::Uuid;
 use crate::git::{ConflictSnapshot, Git};
 
 use super::state::ServiceState;
-use super::types::{ACTIVE_STATES, CleanupReport, ConversationMessage, JobView, ServiceEvent};
+use super::types::{
+    ACTIVE_STATES, CleanupReport, ConversationMessage, JobView, ServiceEvent, ServiceStats,
+};
 use super::util::timestamp;
 
 impl ServiceState {
@@ -200,6 +202,25 @@ impl ServiceState {
         Ok(id)
     }
 
+    pub(crate) fn ensure_no_active_sync(&self, branch: &str) -> Result<()> {
+        let connection = self.open_database()?;
+        let placeholders = ACTIVE_STATES
+            .iter()
+            .map(|state| format!("'{state}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql =
+            format!("SELECT id FROM jobs WHERE branch = ?1 AND state IN ({placeholders}) LIMIT 1");
+        if connection
+            .query_row(&sql, params![branch], |row| row.get::<_, String>(0))
+            .optional()?
+            .is_some()
+        {
+            bail!("该分支已有活动任务");
+        }
+        Ok(())
+    }
+
     pub(crate) fn emit(&self, job_id: Option<&str>, kind: &str, message: &str) -> Result<()> {
         let event = ServiceEvent {
             id: Uuid::new_v4().to_string(),
@@ -275,6 +296,52 @@ impl ServiceState {
             jobs.push(job);
         }
         Ok(jobs)
+    }
+
+    pub(crate) fn job_stats(&self) -> Result<ServiceStats> {
+        let connection = self.open_database()?;
+        let mut stats = ServiceStats {
+            sync_total: 0,
+            sync_completed: 0,
+            sync_failed: 0,
+            sync_conflict: 0,
+            sync_active: 0,
+            check_total: 0,
+            job_total: 0,
+        };
+
+        let mut statement =
+            connection.prepare("SELECT kind, state, COUNT(*) FROM jobs GROUP BY kind, state")?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, u32>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (kind, state, count) = row?;
+            stats.job_total += count;
+            if kind == "check" {
+                stats.check_total += count;
+            }
+            if kind != "sync" {
+                continue;
+            }
+            stats.sync_total += count;
+            if ACTIVE_STATES.contains(&state.as_str()) {
+                stats.sync_active += count;
+            }
+            match state.as_str() {
+                "completed" => stats.sync_completed += count,
+                "failed" => stats.sync_failed += count,
+                "waiting_guidance" | "test_failed" | "waiting_push" => {
+                    stats.sync_conflict += count;
+                }
+                _ => {}
+            }
+        }
+        Ok(stats)
     }
 }
 pub(crate) fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobView> {

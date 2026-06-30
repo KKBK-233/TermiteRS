@@ -3,7 +3,7 @@ use anyhow::Result;
 use crate::git::Git;
 
 use super::state::ServiceState;
-use super::types::{ACTIVE_STATES, BranchDashboard, Dashboard};
+use super::types::{ACTIVE_STATES, BranchDashboard, Dashboard, StatusView};
 use super::util::optional_short_ref;
 
 impl ServiceState {
@@ -55,6 +55,35 @@ impl ServiceState {
             upstream_url: config.repo.upstream.clone(),
             branches,
             jobs,
+            stats: self.job_stats()?,
         })
+    }
+
+    pub(crate) fn status_view(&self) -> Result<StatusView> {
+        let config = self.config()?;
+        let jobs = self.jobs()?;
+        let active_jobs = jobs
+            .iter()
+            .filter(|job| ACTIVE_STATES.contains(&job.state.as_str()))
+            .count();
+        Ok(StatusView {
+            repository: config.repo.path.display().to_string(),
+            upstream_url: config.repo.upstream,
+            fork_url: config.repo.fork,
+            branch_count: config.branches.len(),
+            active_jobs,
+            stats: self.job_stats()?,
+        })
+    }
+
+    pub(crate) fn branches_view(&self) -> Result<Vec<BranchDashboard>> {
+        Ok(self.dashboard()?.branches)
+    }
+
+    pub(crate) fn branch_view(&self, name: &str) -> Result<BranchDashboard> {
+        self.branches_view()?
+            .into_iter()
+            .find(|branch| branch.name == name)
+            .ok_or_else(|| anyhow::anyhow!("分支不在 TermiteRS 白名单中：{name}"))
     }
 }
