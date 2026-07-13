@@ -66,6 +66,8 @@ pub struct BranchConfig {
 pub struct AutoResolveConfig {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default = "default_auto_resolve_max_rounds")]
+    pub max_rounds: usize,
     #[serde(default = "default_auto_resolve_max_conflict_files")]
     pub max_conflict_files: usize,
     #[serde(default = "default_auto_resolve_max_file_bytes")]
@@ -315,12 +317,17 @@ impl Default for AutoResolveConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            max_rounds: default_auto_resolve_max_rounds(),
             max_conflict_files: default_auto_resolve_max_conflict_files(),
             max_file_bytes: default_auto_resolve_max_file_bytes(),
             require_tests: default_auto_resolve_require_tests(),
             allowed_paths: Vec::new(),
         }
     }
+}
+
+fn default_auto_resolve_max_rounds() -> usize {
+    5
 }
 
 fn default_auto_resolve_max_conflict_files() -> usize {

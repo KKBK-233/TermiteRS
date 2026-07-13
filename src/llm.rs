@@ -10,7 +10,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::config::{LlmConfig, LlmProvider};
-use crate::git::{ConflictFileContent, ConflictSnapshot};
+use crate::git::{ConflictFileContent, ConflictSnapshot, SyncPatchContext};
 use crate::report::SyncReport;
 use crate::text::truncate_to_char_boundary;
 
@@ -26,13 +26,15 @@ Git status:
 Combined diff:
 {combined_diff}
 "#;
-const DEFAULT_AUTO_RESOLVE_SYSTEM_PROMPT: &str = "你是一个谨慎的软件维护助手。你只能做低风险兼容性冲突修复。必须只输出 JSON，不要 Markdown，不要解释。风险不低、信息不足、功能语义不确定、需要新增设计时，risk 必须是 high 或 medium，并且 files 为空。";
+const DEFAULT_AUTO_RESOLVE_SYSTEM_PROMPT: &str = "你是一个谨慎的软件维护助手。你只能做低风险兼容性冲突修复。功能性冲突不等于高风险：如果当前补丁意图和上游新增逻辑能够在不猜测业务规则的前提下同时保留，应判定为 low 并给出兼容结果。rebase 时 HEAD 通常是新的上游基线，theirs 通常是正在重放的个人补丁；个人旧补丁中没有出现上游后来新增的条件，不代表个人补丁要删除该条件。必须只输出 JSON，不要 Markdown，不要解释。信息不足、语义互斥、需要选择业务规则或新增设计时，risk 必须是 high 或 medium，并且 files 为空。";
 const DEFAULT_AUTO_RESOLVE_USER_PROMPT: &str = r#"请分析下面的 Git 冲突，并仅在低风险时给出修复后的完整文件内容。
 
 低风险的定义：
 - 只是在上游新增逻辑和本地已有逻辑之间做兼容保留。
 - 不删除本地补丁的核心行为。
 - 不删除上游新增的功能入口。
+- 当前补丁与上游逻辑可以直接组合，不需要猜测用户未说明的业务取舍。
+- 冲突被称为“功能性”本身不是拒绝理由；只有两边语义互斥或信息不足时才提高风险。
 - 不重构，不改无关文件。
 
 必须输出 JSON，格式如下：
@@ -81,6 +83,8 @@ const DEFAULT_SYNC_SUMMARY_USER_PROMPT: &str = r#"请总结下面这次 TermiteR
 pub struct ConflictAnalysisRequest {
     pub branch: String,
     pub base: String,
+    pub branch_note: Option<String>,
+    pub patch_context: SyncPatchContext,
     pub snapshot: ConflictSnapshot,
 }
 
@@ -88,6 +92,8 @@ pub struct ConflictAnalysisRequest {
 pub struct AutoResolveConflictRequest {
     pub branch: String,
     pub base: String,
+    pub branch_note: Option<String>,
+    pub patch_context: SyncPatchContext,
     pub snapshot: ConflictSnapshot,
     pub files: Vec<ConflictFileContent>,
 }
@@ -504,29 +510,82 @@ fn build_sync_summary_prompt(report: &SyncReport, config: &LlmConfig) -> String 
 }
 
 fn conflict_template_values(request: &ConflictAnalysisRequest) -> Vec<(&'static str, String)> {
+    let sync_context = render_sync_context(request.branch_note.as_deref(), &request.patch_context);
+    let combined_diff =
+        render_combined_diff_with_context(&sync_context, &request.snapshot.combined_diff);
     vec![
         ("branch", request.branch.clone()),
         ("base", request.base.clone()),
+        (
+            "branch_note",
+            request
+                .branch_note
+                .clone()
+                .unwrap_or_else(|| "none".to_string()),
+        ),
+        ("sync_context", sync_context),
         ("conflict_files", request.snapshot.files.join("\n")),
         ("git_status", request.snapshot.status.clone()),
-        ("combined_diff", request.snapshot.combined_diff.clone()),
+        ("combined_diff", combined_diff),
     ]
 }
 
 fn auto_resolve_template_values(
     request: &AutoResolveConflictRequest,
 ) -> Vec<(&'static str, String)> {
+    let sync_context = render_sync_context(request.branch_note.as_deref(), &request.patch_context);
+    let combined_diff =
+        render_combined_diff_with_context(&sync_context, &request.snapshot.combined_diff);
     vec![
         ("branch", request.branch.clone()),
         ("base", request.base.clone()),
+        (
+            "branch_note",
+            request
+                .branch_note
+                .clone()
+                .unwrap_or_else(|| "none".to_string()),
+        ),
+        ("sync_context", sync_context),
         ("conflict_files", request.snapshot.files.join("\n")),
         ("git_status", request.snapshot.status.clone()),
-        ("combined_diff", request.snapshot.combined_diff.clone()),
+        ("combined_diff", combined_diff),
         (
             "file_contents",
             render_conflict_file_contents(&request.files),
         ),
     ]
+}
+
+fn render_sync_context(branch_note: Option<&str>, patch_context: &SyncPatchContext) -> String {
+    let mut context = String::new();
+    context.push_str("Branch maintenance note:\n");
+    context.push_str(branch_note.unwrap_or("none"));
+    context.push_str("\n\nConflict semantics:\n");
+    context.push_str(
+        "When mode is rebase, HEAD/ours usually means the new upstream-based state, \
+and theirs usually means the local patch currently being replayed. Do not invert them.\n",
+    );
+    context.push_str(
+        "Default branch policy: preserve new upstream behavior, then re-apply the \
+explicit intent of the local patch when both can coexist. Do not treat behavior that \
+only appears in the newer upstream base as something the older local patch intended to remove.\n",
+    );
+    context.push_str("\nSync mode: ");
+    if patch_context.mode.is_empty() {
+        context.push_str("unknown");
+    } else {
+        context.push_str(&patch_context.mode);
+    }
+    if !patch_context.current_patch.trim().is_empty() {
+        context.push_str("\n\nCurrent patch being applied:\n");
+        context.push_str(&patch_context.current_patch);
+    }
+    context
+}
+
+fn render_combined_diff_with_context(sync_context: &str, combined_diff: &str) -> String {
+    format!("{sync_context}\n\nCombined diff:\n{combined_diff}")
 }
 
 fn render_conflict_file_contents(files: &[ConflictFileContent]) -> String {
@@ -540,6 +599,32 @@ fn render_conflict_file_contents(files: &[ConflictFileContent]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sync_context_contains_rebase_direction_and_current_patch() {
+        let context = render_sync_context(
+            Some("个人维护分支"),
+            &SyncPatchContext {
+                mode: "rebase".to_string(),
+                current_patch: "commit abc\n\ndiff --git a/a.py b/a.py".to_string(),
+            },
+        );
+
+        assert!(context.contains("HEAD/ours usually means the new upstream-based state"));
+        assert!(context.contains("Sync mode: rebase"));
+        assert!(context.contains("diff --git a/a.py b/a.py"));
+    }
+
+    #[test]
+    fn auto_resolve_prompt_allows_compatible_functional_conflicts() {
+        assert!(DEFAULT_AUTO_RESOLVE_SYSTEM_PROMPT.contains("功能性冲突不等于高风险"));
+        assert!(DEFAULT_AUTO_RESOLVE_SYSTEM_PROMPT.contains("应判定为 low"));
+    }
 }
 
 fn sync_summary_template_values(report: &SyncReport) -> Vec<(&'static str, String)> {
