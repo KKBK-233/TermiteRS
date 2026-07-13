@@ -228,6 +228,7 @@ branches:
       - python -m py_compile src\task\BaseCombatTask.py src\task\AutoCombatTask.py src\char\Aemeath.py src\char\Linnai.py
     auto_resolve:
       enabled: false
+      max_rounds: 5
       max_conflict_files: 1
       max_file_bytes: 40960
       require_tests: true
@@ -462,6 +463,8 @@ termiters serve --config /etc/termiters/termite.yml
 ```
 
 服务使用 SQLite 保存任务、对话、候选修改、推送挑战和通知状态。每次正式同步都在独立 detached worktree 中执行。低风险冲突继续按原规则自动处理；功能性冲突会保留现场，等待后台多轮指导。
+
+同机同时运行 `serve` 与 `daemon` 时，两者职责不同：`daemon` 只负责定时调度，检测到 `service.socket_path` 后会通过内部 Unix Socket 创建任务并等待结果；`serve` 负责实际同步、测试、推送、冲突处理和 SQLite 记录。这样自动同步也会进入看板统计，并与后台手动任务共用仓库锁。没有服务 Socket 的旧部署仍由 `daemon` 直接同步。常驻调度即使没有发现更新也会留下已完成任务记录，但不会发送无更新邮件；主动执行 `daemon --once` 或后台手动同步仍会通知。
 
 推送行为分两类：
 

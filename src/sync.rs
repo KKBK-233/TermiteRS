@@ -17,6 +17,7 @@ const MAX_REMOTE_CHANGED_RETRIES: usize = 1;
 
 struct AutoResolveOutcome {
     applied: bool,
+    snapshot: crate::git::ConflictSnapshot,
     details: Vec<String>,
 }
 
@@ -194,24 +195,20 @@ impl SyncRunner {
         let mut auto_resolve_details = Vec::new();
         if !sync_output.success() {
             warn!("branch {} has conflicts", branch.name);
-            let snapshot = self.git.conflict_snapshot(80 * 1024)?;
+            let mut snapshot = self.git.conflict_snapshot(80 * 1024)?;
+            let mut sync_resolved = false;
             if snapshot.files.is_empty() {
                 match self.try_continue_autoresolved_sync(branch, &sync_output)? {
                     Some(AutoContinueOutcome::Applied(details)) => {
                         auto_resolve_details = details;
+                        sync_resolved = true;
                     }
-                    Some(AutoContinueOutcome::Stopped { snapshot, details }) => {
-                        self.git.abort_rebase_or_merge();
-                        return Ok(SyncBranchOutcome::Report(self.conflict_report(
-                            branch,
-                            &base,
-                            &base_head,
-                            &before_head,
-                            sync_output.status,
-                            snapshot,
-                            upstream_commits,
-                            details,
-                        )));
+                    Some(AutoContinueOutcome::Stopped {
+                        snapshot: next_snapshot,
+                        details,
+                    }) => {
+                        snapshot = next_snapshot;
+                        auto_resolve_details = details;
                     }
                     None => {
                         self.git.abort_rebase_or_merge();
@@ -227,25 +224,10 @@ impl SyncRunner {
                         )));
                     }
                 }
-            } else if let Some(outcome) =
-                self.try_auto_resolve_conflict(branch, &base, snapshot.clone())?
-            {
-                if outcome.applied {
-                    auto_resolve_details = outcome.details;
-                } else {
-                    self.git.abort_rebase_or_merge();
-                    return Ok(SyncBranchOutcome::Report(self.conflict_report(
-                        branch,
-                        &base,
-                        &base_head,
-                        &before_head,
-                        sync_output.status,
-                        snapshot,
-                        upstream_commits,
-                        outcome.details,
-                    )));
-                }
-            } else {
+            }
+
+            // rerere 只能解决当前一层；后续提交再次冲突时继续交给 LLM 逐层处理。
+            if !sync_resolved && snapshot.files.is_empty() {
                 self.git.abort_rebase_or_merge();
                 return Ok(SyncBranchOutcome::Report(self.conflict_report(
                     branch,
@@ -255,7 +237,39 @@ impl SyncRunner {
                     sync_output.status,
                     snapshot,
                     upstream_commits,
-                    Vec::new(),
+                    auto_resolve_details,
+                )));
+            }
+
+            if !sync_resolved
+                && let Some(outcome) =
+                    self.try_auto_resolve_conflict(branch, &base, snapshot.clone())?
+            {
+                auto_resolve_details.extend(outcome.details);
+                if !outcome.applied {
+                    self.git.abort_rebase_or_merge();
+                    return Ok(SyncBranchOutcome::Report(self.conflict_report(
+                        branch,
+                        &base,
+                        &base_head,
+                        &before_head,
+                        sync_output.status,
+                        outcome.snapshot,
+                        upstream_commits,
+                        auto_resolve_details,
+                    )));
+                }
+            } else if !sync_resolved {
+                self.git.abort_rebase_or_merge();
+                return Ok(SyncBranchOutcome::Report(self.conflict_report(
+                    branch,
+                    &base,
+                    &base_head,
+                    &before_head,
+                    sync_output.status,
+                    snapshot,
+                    upstream_commits,
+                    auto_resolve_details,
                 )));
             }
         }
@@ -473,6 +487,8 @@ impl SyncRunner {
         let analysis_request = ConflictAnalysisRequest {
             branch: branch.name.clone(),
             base: base.to_string(),
+            branch_note: branch.note.clone(),
+            patch_context: self.git.sync_patch_context(24 * 1024).unwrap_or_default(),
             snapshot,
         };
         match self.llm.analyze_conflict(&analysis_request) {
@@ -505,103 +521,177 @@ impl SyncRunner {
             details.push("auto resolve skipped: allowed_paths is empty".to_string());
             return Ok(Some(AutoResolveOutcome {
                 applied: false,
-                details,
-            }));
-        }
-        if snapshot.files.len() > config.max_conflict_files {
-            details.push(format!(
-                "auto resolve skipped: {} conflict files exceeds limit {}",
-                snapshot.files.len(),
-                config.max_conflict_files
-            ));
-            return Ok(Some(AutoResolveOutcome {
-                applied: false,
-                details,
-            }));
-        }
-        if let Some(path) = snapshot
-            .files
-            .iter()
-            .find(|path| !path_is_allowed(path, &config.allowed_paths))
-        {
-            details.push(format!("auto resolve skipped: path not allowed: {path}"));
-            return Ok(Some(AutoResolveOutcome {
-                applied: false,
+                snapshot,
                 details,
             }));
         }
 
-        let files = self
-            .git
-            .conflict_file_contents(&snapshot.files, config.max_file_bytes)?;
-        let request = AutoResolveConflictRequest {
-            branch: branch.name.clone(),
-            base: base.to_string(),
-            snapshot: snapshot.clone(),
-            files,
-        };
-        let decision = match self.llm.auto_resolve_conflict(&request) {
-            Ok(Some(decision)) => decision,
-            Ok(None) => {
-                details.push("auto resolve skipped: LLM disabled".to_string());
+        let max_rounds = config.max_rounds.max(1);
+        let mut snapshot = snapshot;
+        for round in 1..=max_rounds {
+            if snapshot.files.is_empty() {
+                let output = self.git.continue_sync(branch.sync)?;
+                if output.success() {
+                    details.push(format!(
+                        "auto resolve completed after {} round(s)",
+                        round.saturating_sub(1)
+                    ));
+                    return Ok(Some(AutoResolveOutcome {
+                        applied: true,
+                        snapshot,
+                        details,
+                    }));
+                }
+                if !output.stderr.trim().is_empty() {
+                    details.push(format!(
+                        "auto resolve round {round} continue stderr: {}",
+                        one_line(&output.stderr)
+                    ));
+                }
+                snapshot = self.git.conflict_snapshot(80 * 1024)?;
+                if snapshot.files.is_empty() {
+                    details.push(format!(
+                        "auto resolve round {round} stopped: continue failed without conflict files"
+                    ));
+                    return Ok(Some(AutoResolveOutcome {
+                        applied: false,
+                        snapshot,
+                        details,
+                    }));
+                }
+            }
+
+            details.push(format!(
+                "auto resolve round {round}: conflict files {}",
+                snapshot.files.join(", ")
+            ));
+            if snapshot.files.len() > config.max_conflict_files {
+                details.push(format!(
+                    "auto resolve skipped: {} conflict files exceeds limit {}",
+                    snapshot.files.len(),
+                    config.max_conflict_files
+                ));
                 return Ok(Some(AutoResolveOutcome {
                     applied: false,
+                    snapshot,
                     details,
                 }));
             }
-            Err(err) => {
-                details.push(format!("auto resolve failed: {err:#}"));
+            if let Some(path) = snapshot
+                .files
+                .iter()
+                .find(|path| !path_is_allowed(path, &config.allowed_paths))
+            {
+                details.push(format!("auto resolve skipped: path not allowed: {path}"));
                 return Ok(Some(AutoResolveOutcome {
                     applied: false,
+                    snapshot,
                     details,
                 }));
             }
-        };
 
-        details.push(format!("auto resolve risk: {}", decision.risk));
-        details.push(format!(
-            "auto resolve summary: {}",
-            one_line(&decision.summary)
-        ));
-        if !decision.risk.eq_ignore_ascii_case("low") {
-            return Ok(Some(AutoResolveOutcome {
-                applied: false,
-                details,
-            }));
-        }
-        if let Err(reason) = validate_auto_resolve_decision(&decision, &snapshot.files) {
-            details.push(format!("auto resolve rejected: {reason}"));
-            return Ok(Some(AutoResolveOutcome {
-                applied: false,
-                details,
-            }));
-        }
+            let files = self
+                .git
+                .conflict_file_contents(&snapshot.files, config.max_file_bytes)?;
+            let request = AutoResolveConflictRequest {
+                branch: branch.name.clone(),
+                base: base.to_string(),
+                branch_note: branch.note.clone(),
+                patch_context: self.git.sync_patch_context(24 * 1024)?,
+                snapshot: snapshot.clone(),
+                files,
+            };
+            let decision = match self.llm.auto_resolve_conflict(&request) {
+                Ok(Some(decision)) => decision,
+                Ok(None) => {
+                    details.push("auto resolve skipped: LLM disabled".to_string());
+                    return Ok(Some(AutoResolveOutcome {
+                        applied: false,
+                        snapshot,
+                        details,
+                    }));
+                }
+                Err(err) => {
+                    details.push(format!("auto resolve failed: {err:#}"));
+                    return Ok(Some(AutoResolveOutcome {
+                        applied: false,
+                        snapshot,
+                        details,
+                    }));
+                }
+            };
 
-        for file in &decision.files {
-            self.git.write_file(&file.path, &file.content)?;
-            self.git.add_file(&file.path)?;
-        }
-        let output = self.git.continue_sync(branch.sync)?;
-        if !output.success() {
             details.push(format!(
-                "auto resolve failed: continue sync exited {}",
-                output.status
+                "auto resolve round {round} risk: {}",
+                decision.risk
             ));
+            details.push(format!(
+                "auto resolve round {round} summary: {}",
+                one_line(&decision.summary)
+            ));
+            if !decision.risk.eq_ignore_ascii_case("low") {
+                return Ok(Some(AutoResolveOutcome {
+                    applied: false,
+                    snapshot,
+                    details,
+                }));
+            }
+            if let Err(reason) = validate_auto_resolve_decision(&decision, &snapshot.files) {
+                details.push(format!("auto resolve round {round} rejected: {reason}"));
+                return Ok(Some(AutoResolveOutcome {
+                    applied: false,
+                    snapshot,
+                    details,
+                }));
+            }
+
+            for file in &decision.files {
+                self.git.write_file(&file.path, &file.content)?;
+                self.git.add_file(&file.path)?;
+            }
+            details.push(format!(
+                "auto resolve round {round} applied files: {}",
+                decision.files.len()
+            ));
+
+            let output = self.git.continue_sync(branch.sync)?;
+            if output.success() {
+                details.push(format!("auto resolve completed after {round} round(s)"));
+                return Ok(Some(AutoResolveOutcome {
+                    applied: true,
+                    snapshot,
+                    details,
+                }));
+            }
             if !output.stderr.trim().is_empty() {
-                details.push(format!("continue stderr: {}", one_line(&output.stderr)));
+                details.push(format!(
+                    "auto resolve round {round} continue stderr: {}",
+                    one_line(&output.stderr)
+                ));
             }
-            return Ok(Some(AutoResolveOutcome {
-                applied: false,
-                details,
-            }));
+            snapshot = self.git.conflict_snapshot(80 * 1024)?;
+            if snapshot.files.is_empty() {
+                details.push(format!(
+                    "auto resolve round {round} stopped: continue failed without conflict files"
+                ));
+                return Ok(Some(AutoResolveOutcome {
+                    applied: false,
+                    snapshot,
+                    details,
+                }));
+            }
+            details.push(format!(
+                "auto resolve round {round} stopped on another conflict"
+            ));
         }
 
         details.push(format!(
-            "auto resolve applied files: {}",
-            decision.files.len()
+            "auto resolve stopped: exceeded max_rounds {}",
+            max_rounds
         ));
         Ok(Some(AutoResolveOutcome {
-            applied: true,
+            applied: false,
+            snapshot,
             details,
         }))
     }

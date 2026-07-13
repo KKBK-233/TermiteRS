@@ -26,6 +26,12 @@ pub struct ConflictFileContent {
     pub content: String,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SyncPatchContext {
+    pub mode: String,
+    pub current_patch: String,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct AheadBehind {
     pub ahead: u32,
@@ -302,6 +308,52 @@ impl Git {
                 })
             })
             .collect()
+    }
+
+    pub fn sync_patch_context(&self, max_patch_bytes: usize) -> Result<SyncPatchContext> {
+        if self.ref_exists("REBASE_HEAD")? {
+            let mut patch = self
+                .git(&[
+                    "show",
+                    "--format=fuller",
+                    "--no-ext-diff",
+                    "--find-renames",
+                    "--find-copies",
+                    "REBASE_HEAD",
+                ])?
+                .stdout;
+            if patch.len() > max_patch_bytes {
+                truncate_to_char_boundary(&mut patch, max_patch_bytes);
+                patch.push_str("\n... current patch truncated by TermiteRS ...\n");
+            }
+            return Ok(SyncPatchContext {
+                mode: "rebase".to_string(),
+                current_patch: patch,
+            });
+        }
+
+        if self.ref_exists("MERGE_HEAD")? {
+            let mut patch = self
+                .git(&[
+                    "show",
+                    "--format=fuller",
+                    "--no-ext-diff",
+                    "--find-renames",
+                    "--find-copies",
+                    "MERGE_HEAD",
+                ])?
+                .stdout;
+            if patch.len() > max_patch_bytes {
+                truncate_to_char_boundary(&mut patch, max_patch_bytes);
+                patch.push_str("\n... current patch truncated by TermiteRS ...\n");
+            }
+            return Ok(SyncPatchContext {
+                mode: "merge".to_string(),
+                current_patch: patch,
+            });
+        }
+
+        Ok(SyncPatchContext::default())
     }
 
     fn ensure_remote(&self, name: &str, url: &str) -> Result<()> {
