@@ -290,9 +290,18 @@ impl ServiceState {
             params![job.id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
+        let patch_context = if job.worktree_path.trim().is_empty() {
+            Default::default()
+        } else {
+            Git::new(&job.worktree_path)
+                .sync_patch_context(24 * 1024)
+                .unwrap_or_default()
+        };
         let request = AutoResolveConflictRequest {
             branch: job.branch.clone(),
             base: job.base_ref.clone(),
+            branch_note: branch.note.clone(),
+            patch_context,
             snapshot: serde_json::from_str(&snapshot_json)?,
             files: serde_json::from_str(&files_json)?,
         };

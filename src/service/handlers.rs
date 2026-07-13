@@ -11,6 +11,7 @@ use axum::{
     },
 };
 use futures_util::StreamExt;
+use serde::Deserialize;
 use tokio_stream::wrappers::BroadcastStream;
 
 use super::state::ServiceState;
@@ -107,10 +108,40 @@ pub(crate) async fn start_sync_all(State(state): State<ServiceState>) -> Respons
         Ok(config) => config,
         Err(err) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, err),
     };
+    match spawn_sync_all(&state, config, true) {
+        Ok(job_ids) => Json(serde_json::json!({ "job_ids": job_ids })).into_response(),
+        Err(err) => api_error(StatusCode::CONFLICT, err),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ScheduledSyncRequest {
+    #[serde(default)]
+    notify_on_noop: bool,
+}
+
+pub(crate) async fn start_scheduled_sync_all(
+    State(state): State<ServiceState>,
+    Json(request): Json<ScheduledSyncRequest>,
+) -> Response {
+    let config = match state.config() {
+        Ok(config) => config,
+        Err(err) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+    match spawn_sync_all(&state, config, request.notify_on_noop) {
+        Ok(job_ids) => Json(serde_json::json!({ "job_ids": job_ids })).into_response(),
+        Err(err) => api_error(StatusCode::CONFLICT, err),
+    }
+}
+
+/// 为全部维护分支创建受管同步任务，自动与手动入口共用同一套状态记录。
+fn spawn_sync_all(
+    state: &ServiceState,
+    config: crate::config::Config,
+    notify_on_noop: bool,
+) -> Result<Vec<String>> {
     for branch in &config.branches {
-        if let Err(err) = state.ensure_no_active_sync(&branch.name) {
-            return api_error(StatusCode::CONFLICT, err);
-        }
+        state.ensure_no_active_sync(&branch.name)?;
     }
     let mut job_ids = Vec::new();
     for branch in config.branches {
@@ -119,13 +150,15 @@ pub(crate) async fn start_sync_all(State(state): State<ServiceState>) -> Respons
                 let worker = state.clone();
                 let worker_job_id = job_id.clone();
                 let branch_name = branch.name;
-                thread::spawn(move || worker.execute_sync(&worker_job_id, &branch_name));
+                thread::spawn(move || {
+                    worker.execute_sync(&worker_job_id, &branch_name, notify_on_noop)
+                });
                 job_ids.push(job_id);
             }
-            Err(err) => return api_error(StatusCode::CONFLICT, err),
+            Err(err) => return Err(err),
         }
     }
-    Json(serde_json::json!({ "job_ids": job_ids })).into_response()
+    Ok(job_ids)
 }
 
 pub(crate) async fn start_sync(
@@ -151,7 +184,7 @@ pub(crate) async fn start_sync(
             let worker = state.clone();
             let worker_job_id = job_id.clone();
             let branch = request.branch;
-            thread::spawn(move || worker.execute_sync(&worker_job_id, &branch));
+            thread::spawn(move || worker.execute_sync(&worker_job_id, &branch, true));
             (StatusCode::ACCEPTED, Json(AcceptedResponse { job_id })).into_response()
         }
         Err(err) => api_error(StatusCode::CONFLICT, err),

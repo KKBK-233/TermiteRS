@@ -42,15 +42,20 @@ impl ServiceState {
         self.set_state(job_id, "completed", "仓库检查完成")
     }
 
-    pub(crate) fn execute_sync(&self, job_id: &str, branch_name: &str) {
-        if let Err(err) = self.execute_sync_inner(job_id, branch_name) {
+    pub(crate) fn execute_sync(&self, job_id: &str, branch_name: &str, notify_on_noop: bool) {
+        if let Err(err) = self.execute_sync_inner(job_id, branch_name, notify_on_noop) {
             error!("sync job {job_id} failed: {err:#}");
             let _ = self.cleanup_failed_worktree(job_id);
             let _ = self.set_state(job_id, "failed", &format!("{err:#}"));
         }
     }
 
-    pub(crate) fn execute_sync_inner(&self, job_id: &str, branch_name: &str) -> Result<()> {
+    pub(crate) fn execute_sync_inner(
+        &self,
+        job_id: &str,
+        branch_name: &str,
+        notify_on_noop: bool,
+    ) -> Result<()> {
         self.set_state(job_id, "running", "正在获取远端状态")?;
         let config = self.config()?;
         let branch = configured_branch(&config, branch_name)?.clone();
@@ -119,7 +124,7 @@ impl ServiceState {
             crate::config::SyncStrategy::Merge => git.merge(&base_ref)?,
         };
         if output.success() {
-            return self.finish_automatic_sync(job_id, &config, &branch, &git);
+            return self.finish_automatic_sync(job_id, &config, &branch, &git, notify_on_noop);
         }
 
         let (mut snapshot, mut files) = capture_conflict_files(&git, &branch)?;
@@ -131,7 +136,13 @@ impl ServiceState {
                 &output,
             )? {
                 AutoResolvedSync::Completed => {
-                    return self.finish_automatic_sync(job_id, &config, &branch, &git);
+                    return self.finish_automatic_sync(
+                        job_id,
+                        &config,
+                        &branch,
+                        &git,
+                        notify_on_noop,
+                    );
                 }
                 AutoResolvedSync::Conflict(next_snapshot, next_files) => {
                     snapshot = next_snapshot;
@@ -156,7 +167,13 @@ impl ServiceState {
         match self.try_low_risk_auto_resolve(&config, &branch, &git, &snapshot, &files) {
             Ok(Some(decision)) => {
                 if decision {
-                    return self.finish_automatic_sync(job_id, &config, &branch, &git);
+                    return self.finish_automatic_sync(
+                        job_id,
+                        &config,
+                        &branch,
+                        &git,
+                        notify_on_noop,
+                    );
                 }
                 (snapshot, files) = capture_conflict_files(&git, &branch)?;
                 if snapshot.files.is_empty() {
@@ -183,6 +200,8 @@ impl ServiceState {
         let request = AutoResolveConflictRequest {
             branch: branch.name.clone(),
             base: base_ref,
+            branch_note: branch.note.clone(),
+            patch_context: git.sync_patch_context(24 * 1024).unwrap_or_default(),
             snapshot: snapshot.clone(),
             files: files.clone(),
         };
@@ -217,6 +236,12 @@ impl ServiceState {
             ],
         )?;
         self.emit(Some(job_id), "conflict", "功能性冲突正在等待人工指导")?;
+        self.notify_once(
+            job_id,
+            "waiting_guidance",
+            &format!("{} 同步需要处理", branch.name),
+            "TermiteRS 检测到功能性冲突，请打开维护看板处理。",
+        )?;
         if let Some(message) = options_error {
             warn!("DeepSeek 方案生成失败，等待后台人工处理：{message}");
         }
@@ -241,30 +266,51 @@ impl ServiceState {
         {
             return Ok(None);
         }
-        let request = AutoResolveConflictRequest {
-            branch: branch.name.clone(),
-            base: format!(
-                "{}/{}",
-                config.repo.upstream_remote, config.repo.base_branch
-            ),
-            snapshot: snapshot.clone(),
-            files: files.to_vec(),
-        };
-        let Some(decision) = LlmService::new(config.llm.clone()).auto_resolve_conflict(&request)?
-        else {
-            return Ok(None);
-        };
-        if !decision.risk.eq_ignore_ascii_case("low")
-            || validate_files(&decision.files, &snapshot.files).is_err()
-        {
-            return Ok(Some(false));
+
+        let llm = LlmService::new(config.llm.clone());
+        let mut snapshot = snapshot.clone();
+        let mut files = files.to_vec();
+        for _ in 0..branch.auto_resolve.max_rounds.max(1) {
+            let request = AutoResolveConflictRequest {
+                branch: branch.name.clone(),
+                base: format!(
+                    "{}/{}",
+                    config.repo.upstream_remote, config.repo.base_branch
+                ),
+                branch_note: branch.note.clone(),
+                patch_context: git.sync_patch_context(24 * 1024).unwrap_or_default(),
+                snapshot: snapshot.clone(),
+                files: files.clone(),
+            };
+            let Some(decision) = llm.auto_resolve_conflict(&request)? else {
+                return Ok(None);
+            };
+            if !decision.risk.eq_ignore_ascii_case("low")
+                || validate_files(&decision.files, &snapshot.files).is_err()
+            {
+                return Ok(Some(false));
+            }
+            for file in &decision.files {
+                git.write_file(&file.path, &file.content)?;
+                git.add_file(&file.path)?;
+            }
+            let output = git.continue_sync(branch.sync)?;
+            if output.success() {
+                return Ok(Some(true));
+            }
+            (snapshot, files) = capture_conflict_files(git, branch)?;
+            if snapshot.files.is_empty()
+                || snapshot.files.len() > branch.auto_resolve.max_conflict_files
+                || snapshot
+                    .files
+                    .iter()
+                    .any(|path| !path_is_allowed(path, &branch.auto_resolve.allowed_paths))
+            {
+                return Ok(Some(false));
+            }
         }
-        for file in &decision.files {
-            git.write_file(&file.path, &file.content)?;
-            git.add_file(&file.path)?;
-        }
-        let output = git.continue_sync(branch.sync)?;
-        Ok(Some(output.success()))
+
+        Ok(Some(false))
     }
 
     pub(crate) fn finish_automatic_sync(
@@ -273,7 +319,15 @@ impl ServiceState {
         config: &Config,
         branch: &BranchConfig,
         git: &Git,
+        notify_on_noop: bool,
     ) -> Result<()> {
+        let job = self.job(job_id)?;
+        let after_head = git
+            .run_git(&["rev-parse", "HEAD"])?
+            .stdout
+            .trim()
+            .to_string();
+        let had_activity = job.before_head != after_head || job.remote_head != after_head;
         let test_output = run_tests(git, branch)?;
         self.open_database()?.execute(
             "UPDATE jobs SET test_output = ?2, updated_at = ?3 WHERE id = ?1",
@@ -281,13 +335,21 @@ impl ServiceState {
         )?;
         self.push_job(config, branch, git, job_id, false)?;
         self.remove_worktree(job_id)?;
-        self.set_state(job_id, "completed", "同步、测试和推送完成")?;
-        self.notify_once(
-            job_id,
-            "completed",
-            &format!("{} 同步完成", branch.name),
-            "TermiteRS 已完成同步、测试和推送。",
-        )
+        let summary = if had_activity {
+            "同步、测试和推送完成"
+        } else {
+            "检查完成，未发现更新"
+        };
+        self.set_state(job_id, "completed", summary)?;
+        if should_notify_completion(had_activity, notify_on_noop) {
+            self.notify_once(
+                job_id,
+                "completed",
+                &format!("{} 同步完成", branch.name),
+                summary,
+            )?;
+        }
+        Ok(())
     }
 
     pub(crate) fn save_conflict(
@@ -306,5 +368,21 @@ impl ServiceState {
             ],
         )?;
         Ok(())
+    }
+}
+
+fn should_notify_completion(had_activity: bool, notify_on_noop: bool) -> bool {
+    had_activity || notify_on_noop
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_notify_completion;
+
+    #[test]
+    fn scheduled_noop_does_not_notify() {
+        assert!(!should_notify_completion(false, false));
+        assert!(should_notify_completion(true, false));
+        assert!(should_notify_completion(false, true));
     }
 }
