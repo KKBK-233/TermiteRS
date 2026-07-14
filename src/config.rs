@@ -60,6 +60,17 @@ pub struct BranchConfig {
     pub tests: Vec<String>,
     #[serde(default)]
     pub auto_resolve: AutoResolveConfig,
+    #[serde(default)]
+    pub release: ReleaseConfig,
+}
+
+/// 分支同步成功后，以递增标签向下游启动器发布新版本。
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ReleaseConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub tag_prefix: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

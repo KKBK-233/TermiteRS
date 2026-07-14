@@ -15,6 +15,7 @@ use crate::{
     config::{BranchConfig, Config, PushStrategy},
     git::Git,
     notify::Notifier,
+    release::ensure_release_tag,
 };
 
 use super::state::ServiceState;
@@ -95,14 +96,18 @@ impl ServiceState {
             )?;
             bail!("远端 SHA 已变化，拒绝推送");
         }
-        self.push_job(&config, &branch, &git, &job.id, true)?;
+        let release_tag = self.push_job(&config, &branch, &git, &job.id, true)?;
         self.remove_worktree(&job.id)?;
-        self.set_state(&job.id, "completed", "人工确认的修改已推送")?;
+        let summary = match &release_tag {
+            Some(tag) => format!("人工确认的修改已推送，并发布标签 {tag}"),
+            None => "人工确认的修改已推送".to_string(),
+        };
+        self.set_state(&job.id, "completed", &summary)?;
         self.notify_once(
             &job.id,
             "pushed",
             &format!("{} 已推送", branch.name),
-            "人工确认的功能冲突修改已经成功推送。",
+            &summary,
         )
     }
 
@@ -113,9 +118,9 @@ impl ServiceState {
         git: &Git,
         job_id: &str,
         require_lease: bool,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         if matches!(branch.push, PushStrategy::None) {
-            return Ok(());
+            return Ok(None);
         }
         let job = self.job(job_id)?;
         git.fetch_branch(&config.repo.fork_remote, &branch.name)?;
@@ -143,7 +148,7 @@ impl ServiceState {
         if !output.success() {
             bail!("推送失败：{}", output.stderr.trim());
         }
-        Ok(())
+        ensure_release_tag(git, &config.repo.fork_remote, &branch.release)
     }
 
     pub(crate) fn abandon(&self, job_id: &str) -> Result<()> {
