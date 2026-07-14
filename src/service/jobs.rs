@@ -327,26 +327,29 @@ impl ServiceState {
             .stdout
             .trim()
             .to_string();
-        let had_activity = job.before_head != after_head || job.remote_head != after_head;
+        let mut had_activity = job.before_head != after_head || job.remote_head != after_head;
         let test_output = run_tests(git, branch)?;
         self.open_database()?.execute(
             "UPDATE jobs SET test_output = ?2, updated_at = ?3 WHERE id = ?1",
             params![job_id, test_output, timestamp()],
         )?;
-        self.push_job(config, branch, git, job_id, false)?;
+        let release_tag = self.push_job(config, branch, git, job_id, false)?;
+        had_activity |= release_tag.is_some();
         self.remove_worktree(job_id)?;
-        let summary = if had_activity {
-            "同步、测试和推送完成"
+        let summary = if let Some(tag) = release_tag {
+            format!("同步、测试和推送完成，并发布标签 {tag}")
+        } else if had_activity {
+            "同步、测试和推送完成".to_string()
         } else {
-            "检查完成，未发现更新"
+            "检查完成，未发现更新".to_string()
         };
-        self.set_state(job_id, "completed", summary)?;
+        self.set_state(job_id, "completed", &summary)?;
         if should_notify_completion(had_activity, notify_on_noop) {
             self.notify_once(
                 job_id,
                 "completed",
                 &format!("{} 同步完成", branch.name),
-                summary,
+                &summary,
             )?;
         }
         Ok(())

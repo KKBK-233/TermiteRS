@@ -25,6 +25,7 @@ TermiteRS 不是多人商业协作平台，也不是复杂 PR 队列管理器。
 
 - 本地测试：`push: none`
 - 远端历史：`push: force-with-lease`
+- 自动发布：仅在用户明确要求自动打标签时配置 `release.enabled: true` 和标签前缀；自动发布不能与 `push: none` 同时使用。
 
 如果用户没有明确回答“本地测试”或“远端历史”，不允许修改 `push` 策略。
 
