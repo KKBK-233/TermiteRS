@@ -226,6 +226,9 @@ branches:
     push: force-with-lease
     tests:
       - python -m py_compile src\task\BaseCombatTask.py src\task\AutoCombatTask.py src\char\Aemeath.py src\char\Linnai.py
+    release:
+      enabled: true
+      tag_prefix: v99.0.
     auto_resolve:
       enabled: false
       max_rounds: 5
@@ -247,6 +250,13 @@ daemon:
 - `kind: pr`：单功能 PR 分支，保持改动干净。
 - `kind: product`：自用总分支，可以包含多个功能。
 - `note`：用户备注，说明分支用途。AI 总结邮件和后续配置助理会参考这个字段。
+
+自动发布标签：
+
+- `release.enabled: true` 后，仅在同步、测试和分支推送成功后发布标签。
+- `tag_prefix: v99.0.` 会按远端已有标签递增，例如 `v99.0.0` 后发布 `v99.0.1`。
+- 当前提交已有同前缀标签时不会重复发布；标签只新增，不覆盖旧标签。
+- `push: none` 与自动发布互斥，`doctor` 会将这种配置判为失败。
 
 自动修冲突：
 

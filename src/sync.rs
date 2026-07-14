@@ -8,6 +8,7 @@ use crate::llm::{
     AutoResolveConflictRequest, AutoResolveDecision, ConflictAnalysisRequest, LlmService,
 };
 use crate::notify::Notifier;
+use crate::release::ensure_release_tag;
 use crate::report::{BranchReport, BranchStatus, SyncReport};
 use crate::text::truncate_to_char_boundary;
 
@@ -369,12 +370,30 @@ impl SyncRunner {
             }
         }
 
+        let release_tag = if matches!(branch.push, PushStrategy::None) {
+            None
+        } else {
+            match ensure_release_tag(&self.git, &self.config.repo.fork_remote, &branch.release) {
+                Ok(tag) => tag,
+                Err(err) => {
+                    let mut entry =
+                        BranchReport::new(&branch.name, branch.kind, BranchStatus::Failed)
+                            .active()
+                            .detail("branch push succeeded, release tag failed")
+                            .detail(format!("release error: {err:#}"));
+                    entry.head = Some(after_sync_head);
+                    return Ok(SyncBranchOutcome::Report(entry));
+                }
+            }
+        };
+
         let mut entry = BranchReport::new(&branch.name, branch.kind, BranchStatus::Success);
         entry.head = Some(after_sync_head.clone());
         if !upstream_commits.is_empty()
             || !commits_to_push.is_empty()
             || !files_to_push.is_empty()
             || before_head != after_sync_head
+            || release_tag.is_some()
         {
             entry.mark_active();
         }
@@ -393,6 +412,9 @@ impl SyncRunner {
         push_commit_details(&mut entry, "upstream commits included", &upstream_commits);
         push_commit_details(&mut entry, "commits pushed to remote", &commits_to_push);
         push_list_details(&mut entry, "files pushed to remote", &files_to_push);
+        if let Some(tag) = &release_tag {
+            entry.push_detail(format!("release tag pushed: {tag}"));
+        }
         for detail in auto_resolve_details {
             entry.push_detail(detail);
         }

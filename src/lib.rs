@@ -7,6 +7,7 @@ pub mod doctor;
 pub mod git;
 pub mod llm;
 pub mod notify;
+pub mod release;
 pub mod report;
 pub mod service;
 pub mod sync;

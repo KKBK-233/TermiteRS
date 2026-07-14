@@ -3,6 +3,7 @@ use std::path::Path;
 use crate::command::{CommandOutput, run};
 use crate::config::{Config, PushStrategy};
 use crate::git::Git;
+use crate::release::validate_tag_prefix;
 use crate::text::truncate_to_char_boundary;
 
 pub struct Doctor {
@@ -30,6 +31,7 @@ impl Doctor {
         self.check_remotes(&mut report);
         self.check_fetch(&mut report);
         self.check_branches(&mut report);
+        self.check_release_config(&mut report);
         self.check_push_permission(&mut report);
         report.finish()
     }
@@ -194,6 +196,29 @@ impl Doctor {
                     ));
                 }
                 Err(err) => report.fail(format!("fork 推送权限检查失败 {}：{err:#}", branch.name)),
+            }
+        }
+    }
+
+    fn check_release_config(&self, report: &mut DoctorReport) {
+        let git = Git::new(self.config.repo.path.clone());
+        for branch in &self.config.branches {
+            if !branch.release.enabled {
+                continue;
+            }
+            if matches!(branch.push, PushStrategy::None) {
+                report.fail(format!(
+                    "发布标签要求分支允许推送：{} 当前 push 为 none",
+                    branch.name
+                ));
+                continue;
+            }
+            match validate_tag_prefix(&git, branch.release.tag_prefix.trim()) {
+                Ok(()) => report.ok(format!(
+                    "发布标签配置有效：{} -> {}*",
+                    branch.name, branch.release.tag_prefix
+                )),
+                Err(err) => report.fail(format!("发布标签配置无效 {}：{err:#}", branch.name)),
             }
         }
     }

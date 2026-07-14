@@ -3,4 +3,5 @@
 .env.*
 !.env.example
 termite.yml
+!examples/termite.yml
 .ssh-not-configured
