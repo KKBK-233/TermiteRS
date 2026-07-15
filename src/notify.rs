@@ -55,10 +55,19 @@ impl Notifier {
     }
 
     pub fn send_sync_summary(&self, summary: &str, report: &str) -> Result<bool> {
+        self.send_named_sync_summary("同步总结", summary, report)
+    }
+
+    pub fn send_named_sync_summary(
+        &self,
+        subject: &str,
+        summary: &str,
+        report: &str,
+    ) -> Result<bool> {
         let summary = plain_email_text(summary);
         let report = plain_email_text(report);
         let body = format!("{summary}\n\n原始报告：\n{report}");
-        self.send("同步总结", &body)
+        self.send(subject, &body)
     }
 
     pub fn send(&self, subject: &str, body: &str) -> Result<bool> {
