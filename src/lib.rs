@@ -2,6 +2,7 @@ pub mod assistant;
 pub mod cli;
 pub mod command;
 pub mod config;
+pub mod conflict;
 pub mod daemon;
 pub mod doctor;
 pub mod git;
