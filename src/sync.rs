@@ -3,10 +3,9 @@ use tracing::{info, warn};
 
 use crate::command::CommandOutput;
 use crate::config::{BranchConfig, Config, PushStrategy, SyncStrategy};
+use crate::conflict::{extract_conflict_blocks, resolve_conflict_files};
 use crate::git::Git;
-use crate::llm::{
-    AutoResolveConflictRequest, AutoResolveDecision, ConflictAnalysisRequest, LlmService,
-};
+use crate::llm::{AutoResolveConflictRequest, ConflictAnalysisRequest, LlmService};
 use crate::notify::Notifier;
 use crate::release::ensure_release_tag;
 use crate::report::{BranchReport, BranchStatus, SyncReport};
@@ -615,6 +614,18 @@ impl SyncRunner {
             let files = self
                 .git
                 .conflict_file_contents(&snapshot.files, config.max_file_bytes)?;
+            let block_bytes = serde_json::to_vec(&extract_conflict_blocks(&files, 6)?)?.len();
+            if block_bytes > config.max_file_bytes {
+                details.push(format!(
+                    "auto resolve skipped: conflict block payload {} bytes exceeds limit {}",
+                    block_bytes, config.max_file_bytes
+                ));
+                return Ok(Some(AutoResolveOutcome {
+                    applied: false,
+                    snapshot,
+                    details,
+                }));
+            }
             let request = AutoResolveConflictRequest {
                 branch: branch.name.clone(),
                 base: base.to_string(),
@@ -658,22 +669,25 @@ impl SyncRunner {
                     details,
                 }));
             }
-            if let Err(reason) = validate_auto_resolve_decision(&decision, &snapshot.files) {
-                details.push(format!("auto resolve round {round} rejected: {reason}"));
-                return Ok(Some(AutoResolveOutcome {
-                    applied: false,
-                    snapshot,
-                    details,
-                }));
-            }
+            let resolved = match resolve_conflict_files(&request.files, &decision.resolutions) {
+                Ok(resolved) => resolved,
+                Err(err) => {
+                    details.push(format!("auto resolve round {round} rejected: {err:#}"));
+                    return Ok(Some(AutoResolveOutcome {
+                        applied: false,
+                        snapshot,
+                        details,
+                    }));
+                }
+            };
 
-            for file in &decision.files {
+            for file in &resolved {
                 self.git.write_file(&file.path, &file.content)?;
                 self.git.add_file(&file.path)?;
             }
             details.push(format!(
                 "auto resolve round {round} applied files: {}",
-                decision.files.len()
+                resolved.len()
             ));
 
             let output = self.git.continue_sync(branch.sync)?;
@@ -965,41 +979,6 @@ fn push_list_details(entry: &mut BranchReport, title: &str, items: &[String]) {
     }
 }
 
-fn validate_auto_resolve_decision(
-    decision: &AutoResolveDecision,
-    conflict_files: &[String],
-) -> std::result::Result<(), String> {
-    if decision.files.is_empty() {
-        return Err("no resolved files returned".to_string());
-    }
-
-    for file in &decision.files {
-        if !conflict_files.iter().any(|path| path == &file.path) {
-            return Err(format!(
-                "resolved file is not a conflict file: {}",
-                file.path
-            ));
-        }
-        if file.content.contains("<<<<<<<")
-            || file.content.contains("=======")
-            || file.content.contains(">>>>>>>")
-        {
-            return Err(format!(
-                "resolved file still contains conflict markers: {}",
-                file.path
-            ));
-        }
-        if file.content.contains("... file truncated by TermiteRS ...") {
-            return Err(format!(
-                "resolved file was based on truncated content: {}",
-                file.path
-            ));
-        }
-    }
-
-    Ok(())
-}
-
 fn has_staged_changes(git: &Git) -> Result<bool> {
     let output = git.run_git(&["diff", "--cached", "--quiet"])?;
     match output.status {
@@ -1030,7 +1009,6 @@ fn one_line(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::ResolvedFile;
 
     #[test]
     fn allowed_path_does_not_match_neighbor_prefix() {
@@ -1038,20 +1016,5 @@ mod tests {
 
         assert!(path_is_allowed("src/char/Linnai.py", &allowed));
         assert!(!path_is_allowed("src2/char/Linnai.py", &allowed));
-    }
-
-    #[test]
-    fn auto_resolve_rejects_conflict_markers() {
-        let decision = AutoResolveDecision {
-            risk: "low".to_string(),
-            summary: "test".to_string(),
-            files: vec![ResolvedFile {
-                path: "src/char/Linnai.py".to_string(),
-                content: "<<<<<<< HEAD\nx\n>>>>>>> upstream".to_string(),
-            }],
-        };
-        let conflict_files = vec!["src/char/Linnai.py".to_string()];
-
-        assert!(validate_auto_resolve_decision(&decision, &conflict_files).is_err());
     }
 }

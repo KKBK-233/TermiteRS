@@ -4,6 +4,7 @@ use tracing::{error, warn};
 
 use crate::{
     config::{BranchConfig, Config},
+    conflict::{extract_conflict_blocks, resolve_conflict_files},
     doctor::Doctor,
     git::{ConflictFileContent, ConflictSnapshot, Git},
     llm::{AutoResolveConflictRequest, LlmService},
@@ -273,6 +274,10 @@ impl ServiceState {
         let mut snapshot = snapshot.clone();
         let mut files = files.to_vec();
         for _ in 0..branch.auto_resolve.max_rounds.max(1) {
+            let block_bytes = serde_json::to_vec(&extract_conflict_blocks(&files, 6)?)?.len();
+            if block_bytes > branch.auto_resolve.max_file_bytes {
+                return Ok(Some(false));
+            }
             let request = AutoResolveConflictRequest {
                 branch: branch.name.clone(),
                 base: format!(
@@ -287,12 +292,14 @@ impl ServiceState {
             let Some(decision) = llm.auto_resolve_conflict(&request)? else {
                 return Ok(None);
             };
-            if !decision.risk.eq_ignore_ascii_case("low")
-                || validate_files(&decision.files, &snapshot.files).is_err()
-            {
+            if !decision.risk.eq_ignore_ascii_case("low") {
                 return Ok(Some(false));
             }
-            for file in &decision.files {
+            let resolved = match resolve_conflict_files(&files, &decision.resolutions) {
+                Ok(resolved) if validate_files(&resolved, &snapshot.files).is_ok() => resolved,
+                _ => return Ok(Some(false)),
+            };
+            for file in &resolved {
                 git.write_file(&file.path, &file.content)?;
                 git.add_file(&file.path)?;
             }

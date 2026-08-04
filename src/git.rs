@@ -291,17 +291,21 @@ impl Git {
         files: &[String],
         max_file_bytes: usize,
     ) -> Result<Vec<ConflictFileContent>> {
+        // 完整文件只在本地用于重建，发送给模型的内容由 conflict 模块裁成冲突块。
+        let local_read_limit = max_file_bytes.max(8 * 1024 * 1024);
         files
             .iter()
             .map(|path| {
                 ensure_relative_repo_path(path)?;
                 let full_path = self.root.join(path);
-                let mut content = fs::read_to_string(&full_path)
+                let content = fs::read_to_string(&full_path)
                     .with_context(|| format!("failed to read {}", full_path.display()))?;
-                if content.len() > max_file_bytes {
-                    truncate_to_char_boundary(&mut content, max_file_bytes);
-                    content.push_str("\n... file truncated by TermiteRS ...\n");
-                }
+                anyhow::ensure!(
+                    content.len() <= local_read_limit,
+                    "conflict file exceeds local safety limit {} bytes: {}",
+                    local_read_limit,
+                    path
+                );
                 Ok(ConflictFileContent {
                     path: path.clone(),
                     content,
