@@ -27,11 +27,11 @@ TermiteRS 的主场景是个人自用定制分支长期跟随上游，不是多�
 - 每个分支可配置独立测试命令。
 - 同步成功后推送到 fork。
 - 发生冲突时收集冲突文件、`git status`、`git diff --cc`。
-- 可调用 OpenAI-compatible 接口分析冲突，例如 DeepSeek。
+- 可调用 OpenAI-compatible 接口分析冲突，例如 DeepSeek；低风险冲突可自动生成局部候选并在测试后继续同步。
 - 可通过通知通道发送失败报告。
 - 支持 QQ SMTP 和 Cloudflare Email Service。
 
-当前版本只让 AI 做冲突分析和处理建议，不会自动应用 patch。
+功能性冲突会保留在隔离 worktree 中，等待用户在维护看板选择方案、检查候选 diff 并确认应用。
 
 ## 提交规则
 
@@ -260,8 +260,10 @@ daemon:
 
 自动修冲突：
 
-- `auto_resolve.enabled: true` 后，TermiteRS 会在 rebase/merge 冲突时把冲突文件交给 LLM 分析。
-- 只有 LLM 返回 `risk: low`，且返回文件都属于冲突文件、路径在 `allowed_paths` 内、内容不含冲突标记时，才会写回文件并继续同步。
+- `auto_resolve.enabled: true` 后，TermiteRS 会解析 rebase/merge 的冲突块，只把双方内容、少量相邻上下文和块哈希交给 LLM。
+- LLM 只返回每个冲突块的局部替换。TermiteRS 会校验路径、块编号和 SHA-256，再在本地重建完整文件，未冲突区域不会由模型重新生成。
+- 只有 LLM 返回 `risk: low`、完整解决全部冲突块且路径在 `allowed_paths` 内时，才会写回文件并继续同步。
+- `max_file_bytes` 现在限制发送给 LLM 的结构化冲突块总大小，不再按照整个源文件大小拒绝自动处理。
 - `require_tests: true` 时，自动修复后必须有测试命令并全部通过，否则不会推送。
 - 这个功能适合低风险兼容性修复，不适合语义复杂、重构型或多文件大冲突。
 
@@ -305,17 +307,22 @@ llm:
       冲突文件：
       {conflict_files}
 
+      结构化冲突块：
+      {conflict_blocks}
+
       Git 状态：
       {git_status}
 
       Combined diff：
       {combined_diff}
-    # 可用占位符：{branch}、{base}、{conflict_files}、{git_status}、{combined_diff}、{file_contents}
+    # 可用占位符：{branch}、{base}、{conflict_files}、{git_status}、{combined_diff}、{conflict_blocks}
+    # 旧 {file_contents} 仍可使用，但内容也会替换成结构化冲突块，不再提供完整文件。
     auto_resolve_system: |
       你是一个谨慎的软件维护助手。你只能做低风险兼容性冲突修复。必须只输出 JSON，不要 Markdown，不要解释。
     auto_resolve_user: |
-      请分析下面的 Git 冲突，并仅在低风险时返回修复后的完整文件内容。
-      如果风险不是 low，files 必须为空。
+      请分析下面的 Git 冲突，并仅在低风险时返回每个冲突块的 replacement。
+      必须原样返回 path、conflict_id 和 expected_sha256。
+      如果风险不是 low，resolutions 必须为空。
 
       分支：{branch}
       基线：{base}
@@ -327,9 +334,6 @@ llm:
 
       Combined diff：
       {combined_diff}
-
-      冲突文件内容：
-      {file_contents}
     # 可用占位符：{report}
     sync_summary_system: |
       你是一个严谨的软件分支维护助手。请只根据同步报告做中文总结。输出必须是纯文本，不要使用 Markdown、加粗、标题或代码块。
@@ -460,8 +464,8 @@ notify:
 
 ## 当前限制
 
-- AI 目前只分析冲突，不自动改代码。
-- 邮件只在同步失败或冲突时作为通知渠道使用。
+- AI 只能生成冲突块局部替换，不能直接修改非冲突文件；复杂修改仍需人工处理。
+- 模型暂时不能主动请求额外文件或指定行号范围的上下文。
 - Cloudflare 通道按 Email Service API 设计，不支持把 Email Routing 当 SMTP 发件人。
 
 ## 协作看板服务
@@ -504,8 +508,8 @@ printf '%s' '你的独立操作密码' | termiters hash-password
 
 ## 后续计划
 
-- 让 AI 生成 patch，但默认不自动应用。
-- 增加“只允许修改冲突文件”的安全限制。
+- 支持模型按需请求有限范围的只读上下文。
+- 增加更多语言的语法级候选校验。
 - 增加冲突报告落盘。
 - 增加 Webhook 通道，例如飞书、钉钉、企业微信。
 - 增加多仓库配置。

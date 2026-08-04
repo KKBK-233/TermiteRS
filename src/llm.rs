@@ -10,9 +10,12 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::config::{LlmConfig, LlmProvider};
+use crate::conflict::{ConflictResolution, extract_conflict_blocks};
 use crate::git::{ConflictFileContent, ConflictSnapshot, SyncPatchContext};
 use crate::report::SyncReport;
 use crate::text::truncate_to_char_boundary;
+
+pub use crate::conflict::ResolvedFile;
 
 const DEFAULT_CONFLICT_SYSTEM_PROMPT: &str = "You are a senior software maintainer. Analyze git rebase conflicts. Explain whether the conflict is mechanical or functional, recommend a safe resolution strategy, and call out when human review is required. Do not invent missing code.";
 const DEFAULT_CONFLICT_USER_PROMPT: &str = r#"Branch: {branch}
@@ -26,8 +29,8 @@ Git status:
 Combined diff:
 {combined_diff}
 "#;
-const DEFAULT_AUTO_RESOLVE_SYSTEM_PROMPT: &str = "你是一个谨慎的软件维护助手。你只能做低风险兼容性冲突修复。功能性冲突不等于高风险：如果当前补丁意图和上游新增逻辑能够在不猜测业务规则的前提下同时保留，应判定为 low 并给出兼容结果。rebase 时 HEAD 通常是新的上游基线，theirs 通常是正在重放的个人补丁；个人旧补丁中没有出现上游后来新增的条件，不代表个人补丁要删除该条件。必须只输出 JSON，不要 Markdown，不要解释。信息不足、语义互斥、需要选择业务规则或新增设计时，risk 必须是 high 或 medium，并且 files 为空。";
-const DEFAULT_AUTO_RESOLVE_USER_PROMPT: &str = r#"请分析下面的 Git 冲突，并仅在低风险时给出修复后的完整文件内容。
+const DEFAULT_AUTO_RESOLVE_SYSTEM_PROMPT: &str = "你是一个谨慎的软件维护助手。你只能做低风险兼容性冲突修复。功能性冲突不等于高风险：如果当前补丁意图和上游新增逻辑能够在不猜测业务规则的前提下同时保留，应判定为 low 并给出兼容结果。rebase 时 HEAD 通常是新的上游基线，theirs 通常是正在重放的个人补丁；个人旧补丁中没有出现上游后来新增的条件，不代表个人补丁要删除该条件。必须只输出 JSON，不要 Markdown，不要解释。只能返回给定冲突块的局部 replacement，不得生成完整文件。信息不足、语义互斥、需要选择业务规则或新增设计时，risk 必须是 high 或 medium，并且 resolutions 为空。";
+const DEFAULT_AUTO_RESOLVE_USER_PROMPT: &str = r#"请分析下面的 Git 冲突，并仅在低风险时给出每个冲突块的最终替换内容。
 
 低风险的定义：
 - 只是在上游新增逻辑和本地已有逻辑之间做兼容保留。
@@ -41,10 +44,12 @@ const DEFAULT_AUTO_RESOLVE_USER_PROMPT: &str = r#"请分析下面的 Git 冲突�
 {
   "risk": "low|medium|high",
   "summary": "一句中文说明",
-  "files": [
+  "resolutions": [
     {
       "path": "repo/relative/path",
-      "content": "修复后的完整文件内容"
+      "conflict_id": "conflict-1",
+      "expected_sha256": "原样复制输入中的 expected_sha256",
+      "replacement": "该冲突块最终替换内容"
     }
   ]
 }
@@ -54,14 +59,14 @@ const DEFAULT_AUTO_RESOLVE_USER_PROMPT: &str = r#"请分析下面的 Git 冲突�
 冲突文件：
 {conflict_files}
 
+结构化冲突块：
+{conflict_blocks}
+
 Git 状态：
 {git_status}
 
 Combined diff：
 {combined_diff}
-
-冲突文件内容：
-{file_contents}
 "#;
 const DEFAULT_SYNC_SUMMARY_SYSTEM_PROMPT: &str = "你是一个严谨的软件分支维护助手。请只根据用户提供的同步报告进行中文总结，不要编造不存在的提交、测试或冲突。输出必须是纯文本，不要使用 Markdown、加粗、标题或代码块。";
 const DEFAULT_SYNC_SUMMARY_USER_PROMPT: &str = r#"请总结下面这次 TermiteRS 同步报告。
@@ -103,7 +108,7 @@ pub struct AutoResolveDecision {
     pub risk: String,
     pub summary: String,
     #[serde(default)]
-    pub files: Vec<ResolvedFile>,
+    pub resolutions: Vec<ConflictResolution>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -128,9 +133,10 @@ pub struct ConflictProposal {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ResolvedFile {
-    pub path: String,
-    pub content: String,
+pub struct ConflictResolutionProposal {
+    pub summary: String,
+    #[serde(default)]
+    pub resolutions: Vec<ConflictResolution>,
 }
 
 pub struct LlmService {
@@ -180,7 +186,7 @@ impl LlmService {
                 .auto_resolve_system
                 .as_deref()
                 .unwrap_or(DEFAULT_AUTO_RESOLVE_SYSTEM_PROMPT),
-            &auto_resolve_template_values(request),
+            &auto_resolve_template_values(request)?,
             config.max_prompt_bytes,
         );
         let user_prompt = render_template(
@@ -189,9 +195,10 @@ impl LlmService {
                 .auto_resolve_user
                 .as_deref()
                 .unwrap_or(DEFAULT_AUTO_RESOLVE_USER_PROMPT),
-            &auto_resolve_template_values(request),
+            &auto_resolve_template_values(request)?,
             config.max_prompt_bytes,
         );
+        ensure_conflict_blocks_present(&user_prompt, request)?;
         let response = call_chat(config, &system_prompt, &user_prompt)?;
         let json = extract_json_object(&response)?;
         let decision = serde_json::from_str(json).context("failed to parse auto resolve JSON")?;
@@ -233,15 +240,16 @@ impl LlmService {
         }
 
         let system_prompt = "你是严谨的软件维护助手。当前冲突已被判定为不能自动处理。请给出 2 到 4 种明确且互不重复的修改方案，只输出 JSON。不要修改文件。";
-        let values = auto_resolve_template_values(request);
+        let values = auto_resolve_template_values(request)?;
         let context = render_template(
-            "分支：{branch}\n基线：{base}\n冲突文件：\n{conflict_files}\n\nGit 状态：\n{git_status}\n\nCombined diff：\n{combined_diff}\n\n文件内容：\n{file_contents}",
+            "分支：{branch}\n基线：{base}\n冲突文件：\n{conflict_files}\n\n结构化冲突块：\n{conflict_blocks}\n\nGit 状态：\n{git_status}\n\nCombined diff：\n{combined_diff}",
             &values,
             config.max_prompt_bytes,
         );
         let user_prompt = format!(
             "{context}\n\n对话与人工要求：\n{conversation}\n\n输出格式：\n{{\"classification\":\"functional|uncertain\",\"summary\":\"中文摘要\",\"options\":[{{\"id\":\"短标识\",\"title\":\"方案名\",\"description\":\"具体做法\",\"tradeoffs\":\"取舍\"}}]}}"
         );
+        ensure_conflict_blocks_present(&user_prompt, request)?;
         let response = call_chat(config, system_prompt, &user_prompt)?;
         let json = extract_json_object(&response)?;
         let decision: ConflictOptionsDecision =
@@ -258,7 +266,7 @@ impl LlmService {
         conversation: &str,
         selected_option: &str,
         requirements: &str,
-    ) -> Result<Option<ConflictProposal>> {
+    ) -> Result<Option<ConflictResolutionProposal>> {
         let Some(config) = &self.config else {
             return Ok(None);
         };
@@ -266,19 +274,20 @@ impl LlmService {
             return Ok(None);
         }
 
-        let system_prompt = "你是严谨的软件维护助手。请根据用户确认的方案生成候选修改，只输出 JSON。只能返回原冲突文件的完整内容，不得修改其他文件，不得保留 Git 冲突标记。";
-        let values = auto_resolve_template_values(request);
+        let system_prompt = "你是严谨的软件维护助手。请根据用户确认的方案生成候选修改，只输出 JSON。只能返回给定冲突块的局部 replacement，不得生成完整文件，不得修改其他文件，不得保留 Git 冲突标记。";
+        let values = auto_resolve_template_values(request)?;
         let context = render_template(
-            "分支：{branch}\n基线：{base}\n冲突文件：\n{conflict_files}\n\nGit 状态：\n{git_status}\n\nCombined diff：\n{combined_diff}\n\n文件内容：\n{file_contents}",
+            "分支：{branch}\n基线：{base}\n冲突文件：\n{conflict_files}\n\n结构化冲突块：\n{conflict_blocks}\n\nGit 状态：\n{git_status}\n\nCombined diff：\n{combined_diff}",
             &values,
             config.max_prompt_bytes,
         );
         let user_prompt = format!(
-            "{context}\n\n对话记录：\n{conversation}\n\n选定方案：\n{selected_option}\n\n补充要求：\n{requirements}\n\n输出格式：\n{{\"summary\":\"中文摘要\",\"files\":[{{\"path\":\"仓库相对路径\",\"content\":\"修改后的完整文件\"}}]}}"
+            "{context}\n\n对话记录：\n{conversation}\n\n选定方案：\n{selected_option}\n\n补充要求：\n{requirements}\n\n输出格式：\n{{\"summary\":\"中文摘要\",\"resolutions\":[{{\"path\":\"仓库相对路径\",\"conflict_id\":\"conflict-1\",\"expected_sha256\":\"原样复制输入哈希\",\"replacement\":\"冲突块最终内容\"}}]}}"
         );
+        ensure_conflict_blocks_present(&user_prompt, request)?;
         let response = call_chat(config, system_prompt, &user_prompt)?;
         let json = extract_json_object(&response)?;
-        serde_json::from_str(json)
+        serde_json::from_str::<ConflictResolutionProposal>(json)
             .context("failed to parse conflict proposal JSON")
             .map(Some)
     }
@@ -532,11 +541,12 @@ fn conflict_template_values(request: &ConflictAnalysisRequest) -> Vec<(&'static 
 
 fn auto_resolve_template_values(
     request: &AutoResolveConflictRequest,
-) -> Vec<(&'static str, String)> {
+) -> Result<Vec<(&'static str, String)>> {
     let sync_context = render_sync_context(request.branch_note.as_deref(), &request.patch_context);
     let combined_diff =
         render_combined_diff_with_context(&sync_context, &request.snapshot.combined_diff);
-    vec![
+    let blocks = serde_json::to_string_pretty(&extract_conflict_blocks(&request.files, 6)?)?;
+    Ok(vec![
         ("branch", request.branch.clone()),
         ("base", request.base.clone()),
         (
@@ -550,11 +560,26 @@ fn auto_resolve_template_values(
         ("conflict_files", request.snapshot.files.join("\n")),
         ("git_status", request.snapshot.status.clone()),
         ("combined_diff", combined_diff),
-        (
-            "file_contents",
-            render_conflict_file_contents(&request.files),
-        ),
-    ]
+        ("conflict_blocks", blocks.clone()),
+        // 兼容用户已有提示词中的旧占位符，但不再提供完整文件。
+        ("file_contents", blocks),
+    ])
+}
+
+fn ensure_conflict_blocks_present(
+    prompt: &str,
+    request: &AutoResolveConflictRequest,
+) -> Result<()> {
+    for block in extract_conflict_blocks(&request.files, 0)? {
+        if !prompt.contains(&block.expected_sha256) {
+            bail!(
+                "conflict block was truncated from LLM prompt: {} {}",
+                block.path,
+                block.id
+            );
+        }
+    }
+    Ok(())
 }
 
 fn render_sync_context(branch_note: Option<&str>, patch_context: &SyncPatchContext) -> String {
@@ -588,22 +613,10 @@ fn render_combined_diff_with_context(sync_context: &str, combined_diff: &str) ->
     format!("{sync_context}\n\nCombined diff:\n{combined_diff}")
 }
 
-fn render_conflict_file_contents(files: &[ConflictFileContent]) -> String {
-    files
-        .iter()
-        .map(|file| {
-            format!(
-                "===== FILE: {} =====\n{}\n===== END FILE: {} =====",
-                file.path, file.content, file.path
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::ConflictFileContent;
 
     #[test]
     fn sync_context_contains_rebase_direction_and_current_patch() {
@@ -624,6 +637,46 @@ mod tests {
     fn auto_resolve_prompt_allows_compatible_functional_conflicts() {
         assert!(DEFAULT_AUTO_RESOLVE_SYSTEM_PROMPT.contains("功能性冲突不等于高风险"));
         assert!(DEFAULT_AUTO_RESOLVE_SYSTEM_PROMPT.contains("应判定为 low"));
+    }
+
+    #[test]
+    fn auto_resolve_prompt_only_contains_conflict_blocks() {
+        let mut content = "PRIVATE_WHOLE_FILE_PREFIX\n".to_string();
+        content.push_str(&"filler\n".repeat(20));
+        content.push_str("<<<<<<< HEAD\nupstream()\n=======\npatch()\n>>>>>>> patch\n");
+        content.push_str(&"tail\n".repeat(20));
+        content.push_str("PRIVATE_WHOLE_FILE_SUFFIX\n");
+        let request = AutoResolveConflictRequest {
+            branch: "my/project".to_string(),
+            base: "origin/main".to_string(),
+            branch_note: None,
+            patch_context: SyncPatchContext::default(),
+            snapshot: ConflictSnapshot {
+                status: "UU src/example.py".to_string(),
+                files: vec!["src/example.py".to_string()],
+                combined_diff: "large diff line\n".repeat(10_000),
+            },
+            files: vec![ConflictFileContent {
+                path: "src/example.py".to_string(),
+                content,
+            }],
+        };
+
+        let values = auto_resolve_template_values(&request).unwrap();
+        let blocks = values
+            .iter()
+            .find(|(name, _)| *name == "conflict_blocks")
+            .unwrap()
+            .1
+            .as_str();
+        assert!(blocks.contains("upstream()"));
+        assert!(blocks.contains("patch()"));
+        assert!(!blocks.contains("PRIVATE_WHOLE_FILE_PREFIX"));
+        assert!(!blocks.contains("PRIVATE_WHOLE_FILE_SUFFIX"));
+
+        let prompt = render_template(DEFAULT_AUTO_RESOLVE_USER_PROMPT, &values, 4096);
+        assert!(prompt.contains("prompt truncated by TermiteRS"));
+        ensure_conflict_blocks_present(&prompt, &request).unwrap();
     }
 }
 

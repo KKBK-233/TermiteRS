@@ -4,8 +4,9 @@ use tracing::error;
 
 use crate::{
     config::{BranchConfig, Config},
+    conflict::resolve_conflict_files,
     git::Git,
-    llm::{AutoResolveConflictRequest, LlmService},
+    llm::{AutoResolveConflictRequest, ConflictProposal, LlmService},
 };
 
 use super::state::ServiceState;
@@ -123,9 +124,15 @@ impl ServiceState {
         let selected = serde_json::to_string(option)?;
         let proposal = match deterministic_proposal(&request.files, option_id, branch.sync)? {
             Some(proposal) => proposal,
-            None => LlmService::new(config.llm.clone())
-                .conflict_proposal(&request, &conversation, &selected, requirements)?
-                .context("DeepSeek 未启用")?,
+            None => {
+                let decision = LlmService::new(config.llm.clone())
+                    .conflict_proposal(&request, &conversation, &selected, requirements)?
+                    .context("DeepSeek 未启用")?;
+                ConflictProposal {
+                    summary: decision.summary,
+                    files: resolve_conflict_files(&request.files, &decision.resolutions)?,
+                }
+            }
         };
         validate_files(&proposal.files, &request.snapshot.files).map_err(anyhow::Error::msg)?;
         let diff = proposal_diff(&request.files, &proposal)?;
