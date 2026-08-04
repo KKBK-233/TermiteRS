@@ -30,7 +30,7 @@ daemon:
 llm:
   enabled: false
   provider: deep-seek
-  model: deepseek-v4-pro
+  model: deepseek-v4-flash
   api_key_env: DEEPSEEK_API_KEY
   temperature: 0.1
   max_prompt_bytes: 81920

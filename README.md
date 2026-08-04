@@ -289,7 +289,7 @@ LLM 使用 OpenAI-compatible Chat Completions 协议。DeepSeek 只是一个内�
 llm:
   enabled: true
   provider: deep-seek
-  model: deepseek-v4-pro
+  model: deepseek-v4-flash
   api_key_env: DEEPSEEK_API_KEY
   temperature: 0.1
   max_prompt_bytes: 81920
@@ -341,7 +341,7 @@ llm:
       {report}
 ```
 
-DeepSeek V4 Pro 的 API 模型 ID 是 `deepseek-v4-pro`。如果后续模型名变化，只需要改 `model` 字段。
+DeepSeek V4 Flash 的 API 模型 ID 是 `deepseek-v4-flash`。如果后续模型名变化，只需要改 `model` 字段。
 
 如果使用自定义兼容接口：
 

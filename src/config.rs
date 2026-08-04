@@ -391,7 +391,7 @@ impl Default for LlmProvider {
 }
 
 fn default_llm_model() -> String {
-    "deepseek-v4-pro".to_string()
+    "deepseek-v4-flash".to_string()
 }
 
 fn default_llm_api_key_env() -> String {
