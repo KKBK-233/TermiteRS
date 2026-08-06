@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use reqwest::blocking::Client;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use tracing::warn;
 
@@ -199,9 +199,12 @@ impl LlmService {
             config.max_prompt_bytes,
         );
         ensure_conflict_blocks_present(&user_prompt, request)?;
-        let response = call_chat(config, &system_prompt, &user_prompt)?;
-        let json = extract_json_object(&response)?;
-        let decision = serde_json::from_str(json).context("failed to parse auto resolve JSON")?;
+        let decision = call_json_with_repair(
+            config,
+            &system_prompt,
+            &user_prompt,
+            "auto resolve decision",
+        )?;
         Ok(Some(decision))
     }
 
@@ -250,10 +253,8 @@ impl LlmService {
             "{context}\n\n对话与人工要求：\n{conversation}\n\n输出格式：\n{{\"classification\":\"functional|uncertain\",\"summary\":\"中文摘要\",\"options\":[{{\"id\":\"短标识\",\"title\":\"方案名\",\"description\":\"具体做法\",\"tradeoffs\":\"取舍\"}}]}}"
         );
         ensure_conflict_blocks_present(&user_prompt, request)?;
-        let response = call_chat(config, system_prompt, &user_prompt)?;
-        let json = extract_json_object(&response)?;
         let decision: ConflictOptionsDecision =
-            serde_json::from_str(json).context("failed to parse conflict options JSON")?;
+            call_json_with_repair(config, system_prompt, &user_prompt, "conflict options")?;
         if !(2..=4).contains(&decision.options.len()) {
             bail!("conflict options must contain 2 to 4 items");
         }
@@ -285,11 +286,7 @@ impl LlmService {
             "{context}\n\n对话记录：\n{conversation}\n\n选定方案：\n{selected_option}\n\n补充要求：\n{requirements}\n\n输出格式：\n{{\"summary\":\"中文摘要\",\"resolutions\":[{{\"path\":\"仓库相对路径\",\"conflict_id\":\"conflict-1\",\"expected_sha256\":\"原样复制输入哈希\",\"replacement\":\"冲突块最终内容\"}}]}}"
         );
         ensure_conflict_blocks_present(&user_prompt, request)?;
-        let response = call_chat(config, system_prompt, &user_prompt)?;
-        let json = extract_json_object(&response)?;
-        serde_json::from_str::<ConflictResolutionProposal>(json)
-            .context("failed to parse conflict proposal JSON")
-            .map(Some)
+        call_json_with_repair(config, system_prompt, &user_prompt, "conflict proposal").map(Some)
     }
 
     pub fn assistant_reply_streaming<F>(
@@ -678,6 +675,23 @@ mod tests {
         assert!(prompt.contains("prompt truncated by TermiteRS"));
         ensure_conflict_blocks_present(&prompt, &request).unwrap();
     }
+
+    #[test]
+    fn json_repair_prompt_preserves_original_conflict_request() {
+        let original = "结构化冲突块：\nconflict-1 expected_sha256=abc\n双方实现";
+        let prompt = build_json_repair_prompt(original);
+
+        assert!(prompt.contains("只输出一个严格有效的 JSON 对象"));
+        assert!(prompt.ends_with(original));
+    }
+
+    #[test]
+    fn json_response_accepts_wrapped_object() {
+        let parsed: serde_json::Value =
+            parse_json_response("分析如下：\n```json\n{\"risk\":\"low\"}\n```", "test").unwrap();
+
+        assert_eq!(parsed["risk"], "low");
+    }
 }
 
 fn sync_summary_template_values(report: &SyncReport) -> Vec<(&'static str, String)> {
@@ -694,6 +708,43 @@ fn render_template(template: &str, values: &[(&'static str, String)], max_bytes:
         prompt.push_str("\n... prompt truncated by TermiteRS ...\n");
     }
     prompt
+}
+
+/// JSON 协议错误时自动纠正一次，避免模型偶发输出说明文字后直接降级人工。
+fn call_json_with_repair<T: DeserializeOwned>(
+    config: &LlmConfig,
+    system_prompt: &str,
+    user_prompt: &str,
+    purpose: &str,
+) -> Result<T> {
+    let response = call_chat(config, system_prompt, user_prompt)?;
+    match parse_json_response(&response, purpose) {
+        Ok(value) => Ok(value),
+        Err(first_error) => {
+            warn!(
+                "LLM {purpose} response violated JSON protocol ({} bytes), retrying once: {first_error:#}",
+                response.len()
+            );
+            let repair_prompt = build_json_repair_prompt(user_prompt);
+            let repaired = call_chat(config, system_prompt, &repair_prompt)?;
+            parse_json_response(&repaired, purpose).with_context(|| {
+                format!(
+                    "LLM {purpose} JSON repair failed after first response error: {first_error:#}"
+                )
+            })
+        }
+    }
+}
+
+fn parse_json_response<T: DeserializeOwned>(response: &str, purpose: &str) -> Result<T> {
+    let json = extract_json_object(response)?;
+    serde_json::from_str(json).with_context(|| format!("failed to parse {purpose} JSON"))
+}
+
+fn build_json_repair_prompt(user_prompt: &str) -> String {
+    format!(
+        "上一次响应不符合 JSON 协议。请重新完成同一个任务，只输出一个严格有效的 JSON 对象；不要输出 Markdown、代码围栏、分析过程或额外说明。\n\n{user_prompt}"
+    )
 }
 
 fn extract_json_object(text: &str) -> Result<&str> {
