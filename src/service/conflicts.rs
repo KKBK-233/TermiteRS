@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use rusqlite::params;
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::{
     config::{BranchConfig, Config},
@@ -198,16 +198,16 @@ impl ServiceState {
                     )? {
                         AutoResolvedSync::Completed => {}
                         AutoResolvedSync::Conflict(next_snapshot, next_files) => {
-                            self.save_conflict(job_id, &next_snapshot, &next_files)?;
-                            self.open_database()?.execute(
-                                "UPDATE jobs SET state = 'waiting_guidance', proposal_json = NULL, options_json = NULL, summary = '继续同步时出现新的冲突', updated_at = ?2 WHERE id = ?1",
-                                params![job_id, timestamp()],
-                            )?;
-                            self.add_message_and_refresh_options(
+                            if !self.try_auto_resolve_followup(
                                 job_id,
-                                "继续同步时出现了下一组冲突，请重新分析。",
-                            )?;
-                            return Ok(());
+                                &config,
+                                &branch,
+                                &git,
+                                &next_snapshot,
+                                &next_files,
+                            )? {
+                                return Ok(());
+                            }
                         }
                         AutoResolvedSync::Failed(details) => {
                             self.open_database()?.execute(
@@ -233,16 +233,11 @@ impl ServiceState {
                         }
                     }
                 } else {
-                    self.save_conflict(job_id, &snapshot, &files)?;
-                    self.open_database()?.execute(
-                        "UPDATE jobs SET state = 'waiting_guidance', proposal_json = NULL, options_json = NULL, summary = '继续同步时出现新的冲突', updated_at = ?2 WHERE id = ?1",
-                        params![job_id, timestamp()],
-                    )?;
-                    self.add_message_and_refresh_options(
-                        job_id,
-                        "继续同步时出现了下一组冲突，请重新分析。",
-                    )?;
-                    return Ok(());
+                    if !self.try_auto_resolve_followup(
+                        job_id, &config, &branch, &git, &snapshot, &files,
+                    )? {
+                        return Ok(());
+                    }
                 }
             }
         } else {
@@ -283,6 +278,45 @@ impl ServiceState {
                 )
             }
         }
+    }
+
+    /// 人工候选应用后如果又遇到下一层冲突，优先继续低风险自动处理。
+    fn try_auto_resolve_followup(
+        &self,
+        job_id: &str,
+        config: &Config,
+        branch: &BranchConfig,
+        git: &Git,
+        snapshot: &crate::git::ConflictSnapshot,
+        files: &[crate::git::ConflictFileContent],
+    ) -> Result<bool> {
+        match self.try_low_risk_auto_resolve(config, branch, git, snapshot, files) {
+            Ok(Some(true)) => {
+                self.emit(Some(job_id), "conflict", "后续冲突已由 DeepSeek 自动解决")?;
+                return Ok(true);
+            }
+            Ok(_) => {}
+            Err(err) => {
+                warn!("后续冲突自动处理失败，保留现场等待人工指导：{err:#}");
+            }
+        }
+
+        // 自动流程可能已经推进到更后面的提交，保存前必须重新抓取最新冲突现场。
+        let (latest_snapshot, latest_files) = capture_conflict_files(git, branch)?;
+        anyhow::ensure!(
+            !latest_snapshot.files.is_empty(),
+            "后续自动处理未完成，但没有检测到剩余冲突文件"
+        );
+        self.save_conflict(job_id, &latest_snapshot, &latest_files)?;
+        self.open_database()?.execute(
+            "UPDATE jobs SET state = 'waiting_guidance', proposal_json = NULL, options_json = NULL, summary = '后续冲突自动处理未完成，等待人工指导', updated_at = ?2 WHERE id = ?1",
+            params![job_id, timestamp()],
+        )?;
+        self.add_message_and_refresh_options(
+            job_id,
+            "继续同步时出现了下一组冲突，低风险自动处理未能完成，请重新分析。",
+        )?;
+        Ok(false)
     }
 
     pub(crate) fn conflict_request(
