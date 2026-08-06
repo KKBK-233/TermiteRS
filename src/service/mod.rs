@@ -18,7 +18,6 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use argon2::PasswordHash;
 #[cfg(unix)]
 use axum::{
     Router,
@@ -60,7 +59,6 @@ pub fn cleanup_old_jobs(config_path: PathBuf, days: u32) -> Result<CleanupReport
         database_path,
         events: event_sender,
         repository_lock: Arc::new(Mutex::new(())),
-        password_attempts: Arc::new(Mutex::new(Vec::new())),
     };
     state.initialize_database()?;
     state.cleanup_old_jobs(days)
@@ -91,7 +89,6 @@ async fn run_unix(config_path: PathBuf) -> Result<()> {
         database_path,
         events: event_sender,
         repository_lock: Arc::new(Mutex::new(())),
-        password_attempts: Arc::new(Mutex::new(Vec::new())),
     };
     state.initialize_database()?;
     state.recover_interrupted_jobs()?;
@@ -122,11 +119,7 @@ async fn run_unix(config_path: PathBuf) -> Result<()> {
         )
         .route("/v1/conflicts/:id/apply", post(handlers::apply_proposal))
         .route("/v1/conflicts/:id/abandon", post(handlers::abandon_job))
-        .route(
-            "/v1/conflicts/:id/challenge",
-            post(handlers::create_challenge),
-        )
-        .route("/v1/push/confirm", post(handlers::confirm_push))
+        .route("/v1/conflicts/:id/push", post(handlers::retry_push))
         .route("/v1/events", get(handlers::events))
         .with_state(state.clone());
 
@@ -148,11 +141,6 @@ async fn run_unix(config_path: PathBuf) -> Result<()> {
 }
 
 fn validate_service_config(config: &Config) -> Result<()> {
-    if config.service.operation_password_hash.trim().is_empty() {
-        bail!("service.operation_password_hash 未配置");
-    }
-    PasswordHash::new(&config.service.operation_password_hash)
-        .map_err(|err| anyhow::anyhow!("service.operation_password_hash 无效：{err}"))?;
     if config.branches.is_empty() {
         bail!("TermiteRS 至少需要一个维护分支");
     }

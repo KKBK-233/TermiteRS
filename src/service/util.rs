@@ -358,7 +358,6 @@ mod tests {
             database_path,
             events: event_sender,
             repository_lock: Arc::new(Mutex::new(())),
-            password_attempts: Arc::new(Mutex::new(Vec::new())),
         };
         state.initialize_database().unwrap();
 
