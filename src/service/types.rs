@@ -1,5 +1,4 @@
 ﻿use std::path::PathBuf;
-use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -17,8 +16,6 @@ pub(crate) const ACTIVE_STATES: &[&str] = &[
     "waiting_push",
     "pushing",
 ];
-
-pub(crate) const CHALLENGE_TTL_SECONDS: i64 = 300;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceEvent {
@@ -155,21 +152,9 @@ pub(crate) enum AutoResolvedSync {
     Failed(String),
 }
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct PushConfirmRequest {
-    pub(crate) challenge_id: String,
-    pub(crate) password: String,
-}
-
 #[derive(Debug, Serialize)]
 pub(crate) struct AcceptedResponse {
     pub(crate) job_id: String,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct ChallengeResponse {
-    pub(crate) challenge_id: String,
-    pub(crate) expires_at: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -186,5 +171,4 @@ pub(crate) struct ServicePaths {
 pub(crate) struct ServiceRuntime {
     pub(crate) events: broadcast::Sender<ServiceEvent>,
     pub(crate) repository_lock: std::sync::Arc<std::sync::Mutex<()>>,
-    pub(crate) password_attempts: std::sync::Arc<std::sync::Mutex<Vec<Instant>>>,
 }

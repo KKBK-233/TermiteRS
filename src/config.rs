@@ -28,8 +28,6 @@ pub struct ServiceConfig {
     pub data_dir: PathBuf,
     #[serde(default)]
     pub public_dashboard_url: String,
-    #[serde(default)]
-    pub operation_password_hash: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -371,7 +369,6 @@ impl Default for ServiceConfig {
             socket_path: default_service_socket_path(),
             data_dir: default_service_data_dir(),
             public_dashboard_url: String::new(),
-            operation_password_hash: String::new(),
         }
     }
 }

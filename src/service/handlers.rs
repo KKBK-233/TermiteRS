@@ -16,8 +16,7 @@ use tokio_stream::wrappers::BroadcastStream;
 
 use super::state::ServiceState;
 use super::types::{
-    AcceptedResponse, ApiMessage, CleanupRequest, MessageRequest, ProposalRequest,
-    PushConfirmRequest, SyncRequest,
+    AcceptedResponse, ApiMessage, CleanupRequest, MessageRequest, ProposalRequest, SyncRequest,
 };
 
 pub(crate) async fn status(State(state): State<ServiceState>) -> Response {
@@ -309,26 +308,16 @@ pub(crate) async fn abandon_job(
     }
 }
 
-pub(crate) async fn create_challenge(
+pub(crate) async fn retry_push(
     State(state): State<ServiceState>,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    match state.create_push_challenge(&id) {
-        Ok(challenge) => Json(challenge).into_response(),
-        Err(err) => api_error(StatusCode::CONFLICT, err),
-    }
-}
-
-pub(crate) async fn confirm_push(
-    State(state): State<ServiceState>,
-    Json(request): Json<PushConfirmRequest>,
-) -> Response {
-    match state.confirm_push(&request.challenge_id, &request.password) {
+    match state.push_reviewed_job(&id) {
         Ok(()) => Json(ApiMessage {
             message: "推送成功".to_string(),
         })
         .into_response(),
-        Err(err) => api_error(StatusCode::UNAUTHORIZED, err),
+        Err(err) => api_error(StatusCode::CONFLICT, err),
     }
 }
 

@@ -250,19 +250,24 @@ impl ServiceState {
         match run_tests(&git, &branch) {
             Ok(output) => {
                 self.open_database()?.execute(
-                    "UPDATE jobs SET state = 'waiting_push', test_output = ?2, summary = '修改已应用且测试通过，等待推送确认', updated_at = ?3 WHERE id = ?1",
+                    "UPDATE jobs SET state = 'waiting_push', test_output = ?2, summary = '修改已应用且测试通过，正在自动推送', updated_at = ?3 WHERE id = ?1",
                     params![job_id, output, timestamp()],
                 )?;
-                self.emit(Some(job_id), "state", "测试通过，等待独立密码确认推送")?;
-                self.notify_once(
-                    job_id,
-                    "waiting_push",
-                    &format!("{} 等待推送确认", branch.name),
-                    &format!(
-                        "候选修改已经应用并通过测试，需要在后台输入 TermiteRS 独立操作密码确认推送。\n\n{}",
-                        dashboard_link(&config, job_id)
-                    ),
-                )
+                self.emit(Some(job_id), "state", "测试通过，开始自动推送")?;
+                if let Err(err) = self.push_reviewed_job(job_id) {
+                    self.emit(
+                        Some(job_id),
+                        "push",
+                        &format!("自动推送失败，等待管理员重试：{err:#}"),
+                    )?;
+                    self.notify_once(
+                        job_id,
+                        "waiting_push",
+                        &format!("{} 自动推送失败", branch.name),
+                        &format!("{err:#}\n\n{}", dashboard_link(&config, job_id)),
+                    )?;
+                }
+                Ok(())
             }
             Err(err) => {
                 self.open_database()?.execute(

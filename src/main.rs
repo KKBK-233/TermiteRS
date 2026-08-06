@@ -1,11 +1,5 @@
 use anyhow::Result;
-use argon2::{
-    Argon2,
-    password_hash::{PasswordHasher, SaltString},
-};
 use clap::Parser;
-use rand_core::OsRng;
-use std::io::Read;
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
@@ -91,17 +85,6 @@ fn main() -> Result<()> {
         }
         Commands::Serve { config } => {
             service::run(config)?;
-        }
-        Commands::HashPassword => {
-            let mut password = String::new();
-            std::io::stdin().read_to_string(&mut password)?;
-            let password = password.trim_end_matches(['\r', '\n']);
-            anyhow::ensure!(!password.is_empty(), "标准输入中的密码不能为空");
-            let salt = SaltString::generate(&mut OsRng);
-            let hash = Argon2::default()
-                .hash_password(password.as_bytes(), &salt)
-                .map_err(|err| anyhow::anyhow!("生成密码哈希失败：{err}"))?;
-            println!("{hash}");
         }
     }
 

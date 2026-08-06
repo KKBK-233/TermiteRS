@@ -1,6 +1,5 @@
 ﻿use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
@@ -17,7 +16,6 @@ pub(crate) struct ServiceState {
     pub(crate) database_path: PathBuf,
     pub(crate) events: broadcast::Sender<ServiceEvent>,
     pub(crate) repository_lock: Arc<Mutex<()>>,
-    pub(crate) password_attempts: Arc<Mutex<Vec<Instant>>>,
 }
 
 impl ServiceState {
