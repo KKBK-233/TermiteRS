@@ -94,7 +94,4 @@ pub enum Commands {
         #[arg(short, long, default_value = "termite.yml")]
         config: PathBuf,
     },
-
-    /// 从标准输入读取密码并生成 Argon2id 哈希。
-    HashPassword,
 }

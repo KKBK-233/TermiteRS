@@ -1,15 +1,8 @@
-use std::{
-    fs,
-    path::Path,
-    time::{Duration, Instant},
-};
+use std::{fs, path::Path};
 
-use anyhow::{Context, Result, bail};
-use argon2::{Argon2, PasswordHash, PasswordVerifier};
-use chrono::Utc;
+use anyhow::{Result, bail};
 use rusqlite::{OptionalExtension, params};
 use tracing::warn;
-use uuid::Uuid;
 
 use crate::{
     config::{BranchConfig, Config, PushStrategy},
@@ -19,89 +12,36 @@ use crate::{
 };
 
 use super::state::ServiceState;
-use super::types::{CHALLENGE_TTL_SECONDS, ChallengeResponse};
-use super::util::{configured_branch, dashboard_link, ensure_state, timestamp};
+use super::util::{configured_branch, ensure_state, timestamp};
 
 impl ServiceState {
-    pub(crate) fn create_push_challenge(&self, job_id: &str) -> Result<ChallengeResponse> {
+    /// 将已通过测试的候选修改直接推送；远端 SHA 变化时仍拒绝覆盖。
+    pub(crate) fn push_reviewed_job(&self, job_id: &str) -> Result<()> {
         let job = self.job(job_id)?;
         ensure_state(&job, &["waiting_push"])?;
-        let id = Uuid::new_v4().to_string();
-        let expires = Utc::now().timestamp() + CHALLENGE_TTL_SECONDS;
-        self.open_database()?.execute(
-            "INSERT INTO challenges (id, job_id, expected_remote_head, expires_at) VALUES (?1, ?2, ?3, ?4)",
-            params![id, job_id, job.remote_head, expires],
-        )?;
-        Ok(ChallengeResponse {
-            challenge_id: id,
-            expires_at: chrono::DateTime::from_timestamp(expires, 0)
-                .context("invalid challenge expiry")?
-                .to_rfc3339(),
-        })
-    }
-
-    pub(crate) fn confirm_push(&self, challenge_id: &str, password: &str) -> Result<()> {
-        self.enforce_password_rate_limit()?;
         let config = self.config()?;
-        let hash = PasswordHash::new(&config.service.operation_password_hash)
-            .map_err(|err| anyhow::anyhow!("操作密码哈希无效：{err}"))?;
-        if Argon2::default()
-            .verify_password(password.as_bytes(), &hash)
-            .is_err()
-        {
-            bail!("操作密码错误");
-        }
-
-        let connection = self.open_database()?;
-        let challenge = connection
-            .query_row(
-                "SELECT job_id, expected_remote_head, expires_at, used FROM challenges WHERE id = ?1",
-                params![challenge_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, i64>(3)?,
-                    ))
-                },
-            )
-            .optional()?
-            .context("推送挑战不存在")?;
-        if challenge.3 != 0 {
-            bail!("推送挑战已经使用");
-        }
-        if challenge.2 < Utc::now().timestamp() {
-            bail!("推送挑战已经过期");
-        }
-        connection.execute(
-            "UPDATE challenges SET used = 1 WHERE id = ?1 AND used = 0",
-            params![challenge_id],
-        )?;
-
-        let job = self.job(&challenge.0)?;
-        ensure_state(&job, &["waiting_push"])?;
-        self.set_state(&job.id, "pushing", "正在校验远端并推送")?;
+        self.set_state(&job.id, "pushing", "正在校验远端并自动推送")?;
         let branch = configured_branch(&config, &job.branch)?.clone();
         let git = Git::new(&job.worktree_path);
-        git.fetch_branch(&config.repo.fork_remote, &job.branch)?;
-        let current_remote = git
-            .remote_head(&config.repo.fork_remote, &job.branch)?
-            .unwrap_or_default();
-        if current_remote != challenge.1 {
-            self.set_state(
-                &job.id,
-                "waiting_push",
-                "远端分支已经变化，需要重新检查后再推送",
-            )?;
-            bail!("远端 SHA 已变化，拒绝推送");
-        }
-        let release_tag = self.push_job(&config, &branch, &git, &job.id, true)?;
-        self.remove_worktree(&job.id)?;
-        let summary = match &release_tag {
-            Some(tag) => format!("人工确认的修改已推送，并发布标签 {tag}"),
-            None => "人工确认的修改已推送".to_string(),
+        let release_tag = match self.push_job(&config, &branch, &git, &job.id, true) {
+            Ok(tag) => tag,
+            Err(err) => {
+                self.set_state(
+                    &job.id,
+                    "waiting_push",
+                    &format!("自动推送失败，等待重试：{err:#}"),
+                )?;
+                return Err(err);
+            }
         };
+        let cleanup_error = self.remove_worktree(&job.id).err();
+        let mut summary = match &release_tag {
+            Some(tag) => format!("候选修改已自动推送，并发布标签 {tag}"),
+            None => "候选修改已自动推送".to_string(),
+        };
+        if let Some(err) = cleanup_error {
+            summary.push_str(&format!("；清理 worktree 失败：{err:#}"));
+        }
         self.set_state(&job.id, "completed", &summary)?;
         self.notify_once(
             &job.id,
@@ -223,20 +163,6 @@ impl ServiceState {
                 warn!("failed to send {event} notification: {err:#}");
             }
         }
-        Ok(())
-    }
-
-    pub(crate) fn enforce_password_rate_limit(&self) -> Result<()> {
-        let now = Instant::now();
-        let mut attempts = self
-            .password_attempts
-            .lock()
-            .map_err(|_| anyhow::anyhow!("password rate limiter poisoned"))?;
-        attempts.retain(|attempt| now.duration_since(*attempt) < Duration::from_secs(60));
-        if attempts.len() >= 5 {
-            bail!("操作密码尝试过于频繁，请稍后再试");
-        }
-        attempts.push(now);
         Ok(())
     }
 }
