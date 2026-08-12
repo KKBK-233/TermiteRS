@@ -226,6 +226,8 @@ branches:
     push: force-with-lease
     tests:
       - python -m py_compile src\task\BaseCombatTask.py src\task\AutoCombatTask.py src\char\Aemeath.py src\char\Linnai.py
+    # 发布分支应至少包含一个 unittest/pytest 或项目自定义行为测试命令。
+    require_behavioral_tests: true
     release:
       enabled: true
       tag_prefix: v99.0.
@@ -265,6 +267,7 @@ daemon:
 - 只有 LLM 返回 `risk: low`、完整解决全部冲突块且路径在 `allowed_paths` 内时，才会写回文件并继续同步。
 - `max_file_bytes` 现在限制发送给 LLM 的结构化冲突块总大小，不再按照整个源文件大小拒绝自动处理。
 - `require_tests: true` 时，自动修复后必须有测试命令并全部通过，否则不会推送。
+- `require_behavioral_tests: true` 时，仅配置 `py_compile`/`compileall` 会阻止同步和发布；至少还要配置一个单元测试、集成测试或自定义冒烟测试命令。
 - 这个功能适合低风险兼容性修复，不适合语义复杂、重构型或多文件大冲突。
 
 ## AI 助理

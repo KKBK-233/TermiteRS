@@ -20,6 +20,8 @@ branches:
     sync: rebase
     push: force-with-lease
     tests: []
+    # true 时，只有 py_compile/compileall 不会被视为足够的发布前测试。
+    require_behavioral_tests: true
     release:
       enabled: true
       tag_prefix: v99.0.

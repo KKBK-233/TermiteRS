@@ -57,6 +57,8 @@ pub struct BranchConfig {
     #[serde(default)]
     pub tests: Vec<String>,
     #[serde(default)]
+    pub require_behavioral_tests: bool,
+    #[serde(default)]
     pub auto_resolve: AutoResolveConfig,
     #[serde(default)]
     pub release: ReleaseConfig,
@@ -287,6 +289,39 @@ impl Config {
     }
 }
 
+impl BranchConfig {
+    /// 判断分支是否配置了会执行代码行为的测试，而不只是语法编译检查。
+    pub fn has_behavioral_tests(&self) -> bool {
+        self.tests
+            .iter()
+            .any(|command| !is_compile_only_check(command))
+    }
+}
+
+fn is_compile_only_check(command: &str) -> bool {
+    let command = command.to_ascii_lowercase();
+    let compile_only = command.contains("py_compile") || command.contains("compileall");
+    let known_test_runner = [
+        "unittest",
+        "pytest",
+        "cargo test",
+        "go test",
+        "dotnet test",
+        "npm test",
+        "npm run test",
+        "pnpm test",
+        "pnpm run test",
+        "yarn test",
+        "mvn test",
+        "gradle test",
+        "gradlew test",
+    ]
+    .iter()
+    .any(|marker| command.contains(marker));
+
+    compile_only && !known_test_runner
+}
+
 fn default_base_branch() -> String {
     "master".to_string()
 }
@@ -430,6 +465,26 @@ impl Default for NotifyPolicyConfig {
 impl Default for NotifyPolicyMode {
     fn default() -> Self {
         Self::PrimaryWithFallback
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_compile_only_check;
+
+    #[test]
+    fn compile_only_python_commands_are_not_behavioral_tests() {
+        assert!(is_compile_only_check("python3 -m py_compile src/main.py"));
+        assert!(is_compile_only_check("python -m compileall src"));
+    }
+
+    #[test]
+    fn real_and_combined_test_commands_count_as_behavioral_tests() {
+        assert!(!is_compile_only_check("python3 -m unittest tests.TestChar"));
+        assert!(!is_compile_only_check(
+            "python3 -m py_compile src/main.py && python3 -m pytest"
+        ));
+        assert!(!is_compile_only_check("./scripts/smoke-test.sh"));
     }
 }
 
