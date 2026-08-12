@@ -274,6 +274,16 @@ impl SyncRunner {
             }
         }
 
+        if branch.require_behavioral_tests && !branch.has_behavioral_tests() {
+            return Ok(SyncBranchOutcome::Report(
+                BranchReport::new(&branch.name, branch.kind, BranchStatus::Failed)
+                    .active()
+                    .detail(
+                        "test policy failed: behavioral tests required, but only py_compile/compileall checks are configured",
+                    ),
+            ));
+        }
+
         for test in &branch.tests {
             let output = self.git.run_test(test)?;
             if !output.success() {

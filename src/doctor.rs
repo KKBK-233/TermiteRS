@@ -31,6 +31,7 @@ impl Doctor {
         self.check_remotes(&mut report);
         self.check_fetch(&mut report);
         self.check_branches(&mut report);
+        self.check_test_policy(&mut report);
         self.check_release_config(&mut report);
         self.check_push_permission(&mut report);
         report.finish()
@@ -196,6 +197,19 @@ impl Doctor {
                     ));
                 }
                 Err(err) => report.fail(format!("fork 推送权限检查失败 {}：{err:#}", branch.name)),
+            }
+        }
+    }
+
+    fn check_test_policy(&self, report: &mut DoctorReport) {
+        for branch in &self.config.branches {
+            if branch.require_behavioral_tests && !branch.has_behavioral_tests() {
+                report.fail(format!(
+                    "分支 {} 要求行为测试，但当前只有 py_compile/compileall 语法检查",
+                    branch.name
+                ));
+            } else if branch.require_behavioral_tests {
+                report.ok(format!("分支行为测试策略有效：{}", branch.name));
             }
         }
     }

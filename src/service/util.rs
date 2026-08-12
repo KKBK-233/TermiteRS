@@ -101,6 +101,9 @@ pub(super) fn run_tests(git: &Git, branch: &BranchConfig) -> Result<String> {
     if branch.tests.is_empty() && branch.auto_resolve.require_tests {
         bail!("该分支要求测试，但未配置测试命令");
     }
+    if branch.require_behavioral_tests && !branch.has_behavioral_tests() {
+        bail!("该分支要求行为测试，但当前只有 py_compile/compileall 语法检查");
+    }
     let mut output_text = String::new();
     for test in &branch.tests {
         let output = git.run_test(test)?;
