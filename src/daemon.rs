@@ -1,9 +1,9 @@
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
 #[cfg(unix)]
-use anyhow::{Context, bail};
+use anyhow::Context;
+use anyhow::{Result, bail};
 #[cfg(unix)]
 use serde::Deserialize;
 use tracing::{error, info, warn};
@@ -31,9 +31,13 @@ impl Daemon {
 
         if self.config.daemon.run_on_start {
             failures = self.run_tick(failures)?;
-            if self.once || self.should_stop(failures) {
+            if self.once {
                 return Ok(());
             }
+            ensure_failure_limit_not_reached(
+                failures,
+                self.config.daemon.max_consecutive_failures,
+            )?;
         }
 
         loop {
@@ -43,9 +47,13 @@ impl Daemon {
             thread::sleep(Duration::from_secs(sleep_seconds));
 
             failures = self.run_tick(failures)?;
-            if self.once || self.should_stop(failures) {
+            if self.once {
                 return Ok(());
             }
+            ensure_failure_limit_not_reached(
+                failures,
+                self.config.daemon.max_consecutive_failures,
+            )?;
         }
     }
 
@@ -176,18 +184,18 @@ impl Daemon {
             thread::sleep(Duration::from_secs(2));
         }
     }
+}
 
-    fn should_stop(&self, failures: u32) -> bool {
-        if failures < self.config.daemon.max_consecutive_failures {
-            return false;
-        }
-
-        warn!(
-            "daemon stopped after {} consecutive failure(s)",
-            self.config.daemon.max_consecutive_failures
-        );
-        true
+/// 达到连续失败上限时返回错误，让 systemd 等进程管理器能够识别异常并自动重启。
+fn ensure_failure_limit_not_reached(failures: u32, max_failures: u32) -> Result<()> {
+    if failures < max_failures {
+        return Ok(());
     }
+
+    warn!("daemon reached {max_failures} consecutive failure(s); requesting supervisor restart");
+    bail!(
+        "daemon reached {max_failures} consecutive failure(s); exiting so the process supervisor can restart it"
+    )
 }
 
 #[cfg(unix)]
@@ -223,10 +231,13 @@ fn jitter(max_seconds: u64) -> u64 {
     duration.as_secs() % (max_seconds + 1)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
+    use super::ensure_failure_limit_not_reached;
+    #[cfg(unix)]
     use super::is_terminal_state;
 
+    #[cfg(unix)]
     #[test]
     fn managed_sync_waits_only_for_active_states() {
         assert!(!is_terminal_state("queued"));
@@ -234,5 +245,13 @@ mod tests {
         assert!(is_terminal_state("completed"));
         assert!(is_terminal_state("waiting_guidance"));
         assert!(is_terminal_state("failed"));
+    }
+
+    #[test]
+    fn failure_limit_exits_with_error_for_supervisor_restart() {
+        assert!(ensure_failure_limit_not_reached(2, 3).is_ok());
+
+        let error = ensure_failure_limit_not_reached(3, 3).unwrap_err();
+        assert!(error.to_string().contains("process supervisor can restart"));
     }
 }
