@@ -197,7 +197,7 @@ cargo run -- notify-test --config termite.yml --subject "test" --body "hello"
 ```
 
 部署到服务器时，建议用 cron 或 systemd timer 定时执行 `sync`，不要一开始就做常驻服务。这样在 512MB 小机器上更稳。
-如果需要实时常驻，可以使用 `daemon` 子命令；它会按配置间隔执行同步，连续失败达到阈值后停止。
+如果需要实时常驻，可以使用 `daemon` 子命令；它会按配置间隔执行同步。连续失败达到阈值后会以失败状态退出，由配置了 `Restart=on-failure` 的 systemd 等进程管理器自动重启，避免调度器静默永久停止。
 
 ## 配置示例
 
