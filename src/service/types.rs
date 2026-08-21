@@ -140,6 +140,25 @@ pub(crate) struct CleanupRequest {
     pub(crate) days: Option<u32>,
 }
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct ProtectionInvestigationRequest {
+    pub(crate) summary: String,
+    pub(crate) reference: Option<String>,
+    pub(crate) content: String,
+    pub(crate) branch: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct IssuePublishRequest {
+    pub(crate) approve: bool,
+    #[serde(default = "default_github_token_env")]
+    pub(crate) token_env: String,
+}
+
+fn default_github_token_env() -> String {
+    "GITHUB_TOKEN".to_string()
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ConflictSide {
     Ours,
