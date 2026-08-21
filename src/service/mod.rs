@@ -5,6 +5,7 @@ mod dashboard;
 mod db;
 mod handlers;
 mod jobs;
+mod protection;
 mod security;
 mod state;
 mod types;
@@ -105,6 +106,14 @@ async fn run_unix(config_path: PathBuf) -> Result<()> {
         .route("/v1/jobs/check", post(handlers::start_check))
         .route("/v1/jobs/sync-all", post(handlers::start_sync_all))
         .route("/v1/jobs/sync", post(handlers::start_sync))
+        .route(
+            "/v1/protection/investigate",
+            post(handlers::start_protection_investigation),
+        )
+        .route(
+            "/v1/protection/issues/:id/publish",
+            post(handlers::publish_protection_issue),
+        )
         .route(
             "/v1/internal/scheduled-sync-all",
             post(handlers::start_scheduled_sync_all),

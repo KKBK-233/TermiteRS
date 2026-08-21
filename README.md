@@ -314,6 +314,24 @@ cargo run -- protect issue-publish --config termite.yml \
 
 缺少 `--approve` 时不会发出网络写请求。发布正文带稳定的不可见草稿标记；TermiteRS 会先查询远端标记，再发布并保存本地回执，因此常规重试不会重复创建 Issue。Token 只从指定环境变量读取，不会写入 YAML 或交给 DS。自动发布仍不开放，Issue 是独立的人工批准门。
 
+常驻服务提供等价的 Unix Socket 入口，便于已有的手机控制面或受认证反向代理提交安全消息；任务立即返回 ID，长时间 DS 调查在后台运行：
+
+```bash
+curl --unix-socket /run/termiters.sock \
+  -H 'content-type: application/json' \
+  -d '{"summary":"某依赖严重漏洞","reference":"https://example.com/advisory","content":"已保存的公告正文","branch":"my/project"}' \
+  http://localhost/v1/protection/investigate
+```
+
+服务仍只接受正文，不抓取 `reference`。查询 `/v1/jobs/{id}` 可获得完整结构化结果。确认草稿后，控制面必须再次显式提交批准：
+
+```bash
+curl --unix-socket /run/termiters.sock \
+  -H 'content-type: application/json' \
+  -d '{"approve":true,"token_env":"GITHUB_TOKEN"}' \
+  http://localhost/v1/protection/issues/draft-xxxxxxxx/publish
+```
+
 分支类型建议：
 
 - `kind: pr`：单功能 PR 分支，保持改动干净。
