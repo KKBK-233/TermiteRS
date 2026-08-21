@@ -7,6 +7,7 @@ use crate::conflict::{extract_conflict_blocks, resolve_conflict_files};
 use crate::git::Git;
 use crate::llm::{AutoResolveConflictRequest, ConflictAnalysisRequest, LlmService};
 use crate::notify::Notifier;
+use crate::protection::enforce_prebuild_gate;
 use crate::release::ensure_release_tag;
 use crate::report::{BranchReport, BranchStatus, SyncReport};
 use crate::text::truncate_to_char_boundary;
@@ -282,6 +283,18 @@ impl SyncRunner {
                         "test policy failed: behavioral tests required, but only py_compile/compileall checks are configured",
                     ),
             ));
+        }
+
+        if let Err(err) = enforce_prebuild_gate(&self.config, self.git.root()) {
+            let mut entry = BranchReport::new(&branch.name, branch.kind, BranchStatus::Failed)
+                .active()
+                .detail(format!(
+                    "project protection gate blocked execution: {err:#}"
+                ));
+            for detail in auto_resolve_details {
+                entry.push_detail(detail);
+            }
+            return Ok(SyncBranchOutcome::Report(entry));
         }
 
         for test in &branch.tests {

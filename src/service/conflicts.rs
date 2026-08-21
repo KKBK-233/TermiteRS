@@ -247,7 +247,7 @@ impl ServiceState {
             }
         }
 
-        match run_tests(&git, &branch) {
+        match run_tests(&config, &git, &branch) {
             Ok(output) => {
                 self.open_database()?.execute(
                     "UPDATE jobs SET state = 'waiting_push', test_output = ?2, summary = '修改已应用且测试通过，正在自动推送', updated_at = ?3 WHERE id = ?1",

@@ -7,6 +7,7 @@ use crate::{
     config::{BranchConfig, Config, SyncStrategy},
     git::{ConflictFileContent, ConflictSnapshot, Git},
     llm::{ConflictProposal, ResolvedFile},
+    protection::enforce_prebuild_gate,
 };
 
 use super::types::{AutoResolvedSync, ConflictSide, JobView, StoredProposal};
@@ -97,7 +98,9 @@ pub(super) fn continue_autoresolved_sync(
     Ok(AutoResolvedSync::Failed(details))
 }
 
-pub(super) fn run_tests(git: &Git, branch: &BranchConfig) -> Result<String> {
+/// 测试入口同时承担构建前安全门禁，确保任何配置命令执行前先完成只读静态扫描。
+pub(super) fn run_tests(config: &Config, git: &Git, branch: &BranchConfig) -> Result<String> {
+    enforce_prebuild_gate(config, git.root())?;
     if branch.tests.is_empty() && branch.auto_resolve.require_tests {
         bail!("该分支要求测试，但未配置测试命令");
     }
@@ -283,6 +286,7 @@ pub(super) fn timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
     use rusqlite::params;
@@ -293,6 +297,62 @@ mod tests {
     use crate::git::ConflictFileContent;
     use crate::llm::{ConflictProposal, ResolvedFile};
     use crate::service::state::ServiceState;
+
+    #[test]
+    fn protection_gate_blocks_before_test_command_executes() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/supply_chain/arrayref-0.3.10");
+        let root = std::env::temp_dir().join(format!("termiters-prebuild-{}", Uuid::new_v4()));
+        let project = root.join("project");
+        let data_dir = root.join("data");
+        fs::create_dir_all(&project).unwrap();
+        for name in ["Cargo.toml", "Cargo.lock"] {
+            fs::copy(fixture.join(name), project.join(name)).unwrap();
+        }
+
+        let mut config: Config = serde_yaml::from_str(
+            r#"
+repo:
+  path: .
+  upstream: unused
+  fork: https://github.com/owner/protected-project.git
+protection:
+  enabled: true
+  project:
+    name: malicious-fixture
+branches:
+  - name: main
+    tests: []
+"#,
+        )
+        .unwrap();
+        config.repo.path = project.clone();
+        config.service.data_dir = data_dir.clone();
+        let command = if cfg!(windows) {
+            "Set-Content -Path executed.txt -Value executed"
+        } else {
+            "printf executed > executed.txt"
+        };
+        config.branches[0].tests = vec![command.into()];
+
+        let git = Git::new(&project);
+        let error = run_tests(&config, &git, &config.branches[0]).unwrap_err();
+        assert!(format!("{error:#}").contains("项目保护门禁"));
+        assert!(!project.join("executed.txt").exists());
+        let connection = rusqlite::Connection::open(data_dir.join("termite.db")).unwrap();
+        let (destination, approval_required): (String, i64) = connection
+            .query_row(
+                "SELECT destination, approval_required FROM delivery_drafts",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(destination, "owner/protected-project");
+        assert_eq!(approval_required, 1);
+        drop(connection);
+
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn proposal_validation_rejects_non_conflict_file() {
