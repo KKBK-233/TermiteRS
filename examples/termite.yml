@@ -6,6 +6,19 @@ repo:
   upstream_remote: origin
   fork_remote: fork
 
+# 项目保护只需要规则包、自然语言意图和自动化预设。
+protection:
+  enabled: false
+  project:
+    name: your-project
+    description: |
+      这是一个公开运行的项目。
+      RCE、认证绕过、任意文件读写和供应链恶意代码必须立即阻止。
+  profiles:
+    - baseline
+    - rust
+  automation: candidate
+
 branches:
   - name: fix/sample-change
     kind: pr

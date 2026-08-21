@@ -1,6 +1,6 @@
 # TermiteRS
 
-TermiteRS 是一个用于维护长期 fork 分支的自动化工具。
+TermiteRS 是一个面向长期自定义分支和实际运行项目的自动化维护工具。
 
 它的目标不是简单地“自动 rebase”，而是帮助你维护一条自己的产品线：
 
@@ -19,6 +19,8 @@ TermiteRS 是一个用于维护长期 fork 分支的自动化工具。
 
 TermiteRS 的主场景是个人自用定制分支长期跟随上游，不是多人商业协作平台，也不是复杂 PR 队列管理器。`product` 分支是主要维护对象；`pr` 分支更多是测试同步流程，或偶尔拆出单功能补丁投稿上游。
 
+项目保护功能以实际项目为最小单元，统一接收依赖公告、上游提交、用户转发文章和生产异常等安全信号。第一阶段已经提供不会执行项目代码的 Cargo 构建前静态门禁、结构化 Finding、SQLite 去重和 GitHub Issue 草稿；自动发送、候选修复和部署仍保持关闭。
+
 ## 当前能力
 
 - 拉取上游和 fork 远端。
@@ -30,6 +32,8 @@ TermiteRS 的主场景是个人自用定制分支长期跟随上游，不是多�
 - 可调用 OpenAI-compatible 接口分析冲突，例如 DeepSeek；低风险冲突可自动生成局部候选并在测试后继续同步。
 - 可通过通知通道发送失败报告。
 - 支持 QQ SMTP 和 Cloudflare Email Service。
+- 可在构建前只读检查 Cargo 锁文件、清单和 `build.rs`，命中供应链阻断项时拒绝继续构建。
+- 可为阻断项生成需要人工批准的 GitHub Issue 草稿，不会自动发送。
 
 功能性冲突会保留在隔离 worktree 中，等待用户在维护看板选择方案、检查候选 diff 并确认应用。
 
@@ -210,6 +214,16 @@ repo:
   upstream_remote: origin
   fork_remote: fork
 
+protection:
+  enabled: true
+  project:
+    name: your-project
+    description: |
+      这是一个公开运行的项目。
+      RCE、认证绕过、任意文件读写和供应链恶意代码必须立即阻止。
+  profiles: [baseline, rust]
+  automation: candidate
+
 branches:
   - name: fix/dead-character-switch
     kind: pr
@@ -246,6 +260,29 @@ daemon:
   run_on_start: true
   max_consecutive_failures: 3
 ```
+
+项目保护配置只描述人的意图：
+
+- `profiles` 引用程序维护的安全基线，项目无需展开一长串规则。
+- `description` 使用自然语言说明业务、关键资产和不可接受的风险。
+- `automation: candidate` 允许准备隔离候选，但不授权推送、合并、发布或部署。
+- 仓库源码、依赖和提交信息都属于不可信证据，不能借此修改安全基线或自动化权限。
+
+构建前静态扫描：
+
+```bash
+cargo run -- protect scan --config termite.yml
+```
+
+扫描指定的离线依赖展开目录，并准备 Issue 草稿：
+
+```bash
+cargo run -- protect scan --config termite.yml \
+  --path ./dependency-snapshot \
+  --issue-repository owner/project
+```
+
+输出是结构化 JSON。发现阻断项时命令返回退出码 `2`，并且不会运行 `cargo build`、`cargo test`、`build.rs` 或任何项目脚本。配置 `protection.enabled: true` 时，信号、Finding 和 Issue 草稿会幂等保存到 `service.data_dir/termite.db`；重复扫描不会重复创建草稿。
 
 分支类型建议：
 
@@ -470,6 +507,8 @@ notify:
 - AI 只能生成冲突块局部替换，不能直接修改非冲突文件；复杂修改仍需人工处理。
 - 模型暂时不能主动请求额外文件或指定行号范围的上下文。
 - Cloudflare 通道按 Email Service API 设计，不支持把 Email Routing 当 SMTP 发件人。
+- 项目保护当前只实现 Cargo 静态门禁；还没有自动获取并无执行解包全部传递依赖，也没有接入 LLM 安全分类。
+- GitHub 功能当前只准备结构化 Issue 草稿，不调用 GitHub 写接口。
 
 ## 协作看板服务
 

@@ -6,6 +6,7 @@ use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use uuid::Uuid;
 
 use crate::git::{ConflictSnapshot, Git};
+use crate::protection::initialize_protection_schema;
 
 use super::state::ServiceState;
 use super::types::{
@@ -74,6 +75,7 @@ impl ServiceState {
             );
             "#,
         )?;
+        initialize_protection_schema(&connection)?;
         Ok(())
     }
 

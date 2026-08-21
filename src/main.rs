@@ -4,11 +4,12 @@ use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
 use TermiteRS::assistant::Assistant;
-use TermiteRS::cli::{Cli, Commands};
+use TermiteRS::cli::{Cli, Commands, ProtectionCommands};
 use TermiteRS::config::Config;
 use TermiteRS::daemon::Daemon;
 use TermiteRS::doctor::Doctor;
 use TermiteRS::notify::Notifier;
+use TermiteRS::protection::run_protection_scan;
 use TermiteRS::service;
 use TermiteRS::sync::{SyncOptions, SyncRunner};
 
@@ -58,6 +59,21 @@ fn main() -> Result<()> {
                 report.worktrees
             );
         }
+        Commands::Protect { action } => match action {
+            ProtectionCommands::Scan {
+                config,
+                path,
+                issue_repository,
+            } => {
+                let config = Config::read_from(config)?;
+                let scan_path = path.unwrap_or_else(|| config.repo.path.clone());
+                let output = run_protection_scan(&config, scan_path, issue_repository.as_deref())?;
+                println!("{}", serde_json::to_string_pretty(&output)?);
+                if !output.report.build_allowed {
+                    std::process::exit(2);
+                }
+            }
+        },
         Commands::Status { config } => {
             let config = Config::read_from(config)?;
             let report = SyncRunner::new(config, SyncOptions::status_only()).status()?;
