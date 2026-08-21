@@ -6,9 +6,11 @@ use serde::Serialize;
 
 use crate::config::Config;
 
+use super::supply_chain::merge_static_reports;
 use super::{
     DeliveryDraft, FindingState, ProtectionFinding, ProtectionStore, SecuritySignal,
-    SecuritySignalSource, StaticScanReport, prepare_issue_draft, scan_supply_chain_tree,
+    SecuritySignalSource, StaticScanReport, prepare_issue_draft, scan_locked_cargo_dependencies,
+    scan_supply_chain_tree,
 };
 
 #[derive(Debug, Serialize)]
@@ -58,7 +60,29 @@ pub fn run_protection_scan(
     issue_repository: Option<&str>,
 ) -> Result<ProtectionScanOutput> {
     let project = configured_project_name(config);
-    let report = scan_supply_chain_tree(&project, scan_root)?;
+    let scan_root = scan_root.as_ref();
+    let project_report = scan_supply_chain_tree(&project, scan_root)?;
+    let report = if config.protection.enabled
+        && project_report.build_allowed
+        && config
+            .protection
+            .profiles
+            .iter()
+            .any(|profile| profile == "rust")
+    {
+        let dependency_report = scan_locked_cargo_dependencies(
+            &project,
+            scan_root,
+            config.service.data_dir.join("protection/crates"),
+        )?;
+        merge_static_reports(
+            &project,
+            scan_root.display().to_string(),
+            [project_report, dependency_report],
+        )
+    } else {
+        project_report
+    };
     let now = Utc::now().to_rfc3339();
     let stable_suffix = &report.dedupe_key[..32];
     let signal = SecuritySignal {

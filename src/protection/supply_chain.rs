@@ -38,26 +38,13 @@ pub fn scan_supply_chain_tree(project: &str, root: impl AsRef<Path>) -> Result<S
             _ => {}
         }
     }
-    deduplicate_indicators(&mut blockers);
-    deduplicate_indicators(&mut warnings);
-
-    let dedupe_source = blockers
-        .iter()
-        .chain(&warnings)
-        .map(|item| format!("{}:{}:{}", item.rule_id, item.path, item.evidence))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let dedupe_key = hex_digest(dedupe_source.as_bytes());
-
-    Ok(StaticScanReport {
-        project: project.to_string(),
-        root: root.display().to_string(),
-        scanned_files: files.len(),
-        build_allowed: blockers.is_empty(),
+    Ok(finalize_static_report(
+        project,
+        root.display().to_string(),
+        files.len(),
         blockers,
         warnings,
-        dedupe_key,
-    })
+    ))
 }
 
 fn collect_static_files(current: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
@@ -136,7 +123,7 @@ fn inspect_cargo_lock(path: &str, raw: &str, blockers: &mut Vec<StaticIndicator>
     Ok(())
 }
 
-fn inspect_cargo_manifest(
+pub(super) fn inspect_cargo_manifest(
     path: &str,
     raw: &str,
     blockers: &mut Vec<StaticIndicator>,
@@ -200,7 +187,7 @@ fn inspect_known_malicious_package(
     }
 }
 
-fn inspect_build_script(
+pub(super) fn inspect_build_script(
     path: &str,
     raw: &str,
     blockers: &mut Vec<StaticIndicator>,
@@ -208,12 +195,14 @@ fn inspect_build_script(
 ) {
     let lower = raw.to_ascii_lowercase();
     let network_markers = [
-        "reqwest",
-        "ureq",
-        "tcpstream",
-        "https://",
-        "http://",
-        "rustls",
+        "reqwest::blocking",
+        "reqwest::client",
+        "ureq::get",
+        "ureq::post",
+        "tcpstream::connect",
+        "udpsocket::connect",
+        "command::new(\"curl\")",
+        "command::new(\"wget\")",
     ];
     let execution_markers = [
         "command::new",
@@ -313,6 +302,49 @@ fn deduplicate_indicators(indicators: &mut Vec<StaticIndicator>) {
     let mut seen = HashSet::new();
     indicators
         .retain(|item| seen.insert(format!("{}:{}:{}", item.rule_id, item.path, item.evidence)));
+}
+
+pub(super) fn finalize_static_report(
+    project: &str,
+    root: String,
+    scanned_files: usize,
+    mut blockers: Vec<StaticIndicator>,
+    mut warnings: Vec<StaticIndicator>,
+) -> StaticScanReport {
+    deduplicate_indicators(&mut blockers);
+    deduplicate_indicators(&mut warnings);
+    let dedupe_source = blockers
+        .iter()
+        .chain(&warnings)
+        .map(|item| format!("{}:{}:{}", item.rule_id, item.path, item.evidence))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let dedupe_key = hex_digest(dedupe_source.as_bytes());
+    StaticScanReport {
+        project: project.to_string(),
+        root,
+        scanned_files,
+        build_allowed: blockers.is_empty(),
+        blockers,
+        warnings,
+        dedupe_key,
+    }
+}
+
+pub(super) fn merge_static_reports(
+    project: &str,
+    root: String,
+    reports: impl IntoIterator<Item = StaticScanReport>,
+) -> StaticScanReport {
+    let mut scanned_files = 0;
+    let mut blockers = Vec::new();
+    let mut warnings = Vec::new();
+    for report in reports {
+        scanned_files += report.scanned_files;
+        blockers.extend(report.blockers);
+        warnings.extend(report.warnings);
+    }
+    finalize_static_report(project, root, scanned_files, blockers, warnings)
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
