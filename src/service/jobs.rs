@@ -47,9 +47,18 @@ impl ServiceState {
 
     pub(crate) fn execute_sync(&self, job_id: &str, branch_name: &str, notify_on_noop: bool) {
         if let Err(err) = self.execute_sync_inner(job_id, branch_name, notify_on_noop) {
-            error!("sync job {job_id} failed: {err:#}");
+            let details = format!("{err:#}");
+            error!("sync job {job_id} failed: {details}");
             let _ = self.cleanup_failed_worktree(job_id);
-            let _ = self.set_state(job_id, "failed", &format!("{err:#}"));
+            let _ = self.set_state(job_id, "failed", &details);
+            if details.contains("项目保护门禁") {
+                let _ = self.notify_once(
+                    job_id,
+                    "protection_blocked",
+                    &format!("{branch_name} 项目保护门禁告警"),
+                    &format!("{details}\n\n测试、构建和推送均未执行。"),
+                );
+            }
         }
     }
 
@@ -337,7 +346,7 @@ impl ServiceState {
             .trim()
             .to_string();
         let mut had_activity = job.before_head != after_head || job.remote_head != after_head;
-        let test_output = run_tests(git, branch)?;
+        let test_output = run_tests(config, git, branch)?;
         self.open_database()?.execute(
             "UPDATE jobs SET test_output = ?2, updated_at = ?3 WHERE id = ?1",
             params![job_id, test_output, timestamp()],

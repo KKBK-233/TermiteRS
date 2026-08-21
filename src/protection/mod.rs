@@ -10,7 +10,7 @@ pub use model::{
     RemediationAction, RemediationPlan, SecuritySignal, SecuritySignalSource, StaticIndicator,
     StaticScanReport, VerificationResult,
 };
-pub use runner::{ProtectionScanOutput, run_protection_scan};
+pub use runner::{ProtectionScanOutput, enforce_prebuild_gate, run_protection_scan};
 pub use store::ProtectionStore;
 pub(crate) use store::initialize_protection_schema;
 pub use supply_chain::scan_supply_chain_tree;

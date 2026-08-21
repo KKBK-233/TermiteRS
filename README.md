@@ -32,8 +32,8 @@ TermiteRS 的主场景是个人自用定制分支长期跟随上游，不是多�
 - 可调用 OpenAI-compatible 接口分析冲突，例如 DeepSeek；低风险冲突可自动生成局部候选并在测试后继续同步。
 - 可通过通知通道发送失败报告。
 - 支持 QQ SMTP 和 Cloudflare Email Service。
-- 可在构建前只读检查 Cargo 锁文件、清单和 `build.rs`，命中供应链阻断项时拒绝继续构建。
-- 可为阻断项生成需要人工批准的 GitHub Issue 草稿，不会自动发送。
+- 同步命令和后台 worktree 会在测试、构建、推送前只读检查 Cargo 锁文件、清单和 `build.rs`；扫描失败或命中阻断项都会关闭后续执行。
+- 可从 GitHub fork 远端自动推导投送目标，为阻断项生成需要人工批准的 Issue 草稿，不会自动发送。
 
 功能性冲突会保留在隔离 worktree 中，等待用户在维护看板选择方案、检查候选 diff 并确认应用。
 
@@ -282,7 +282,7 @@ cargo run -- protect scan --config termite.yml \
   --issue-repository owner/project
 ```
 
-输出是结构化 JSON。发现阻断项时命令返回退出码 `2`，并且不会运行 `cargo build`、`cargo test`、`build.rs` 或任何项目脚本。配置 `protection.enabled: true` 时，信号、Finding 和 Issue 草稿会幂等保存到 `service.data_dir/termite.db`；重复扫描不会重复创建草稿。
+输出是结构化 JSON。发现阻断项时命令返回退出码 `2`，并且不会运行 `cargo build`、`cargo test`、`build.rs` 或任何项目脚本。配置 `protection.enabled: true` 时，正常同步和后台服务也会在首个测试命令前执行同一门禁；信号、Finding 和 Issue 草稿会幂等保存到 `service.data_dir/termite.db`，重复扫描不会重复创建草稿。GitHub 远端会从 `repo.fork` 自动识别，也可以在手动扫描时用 `--issue-repository` 明确指定。
 
 分支类型建议：
 
