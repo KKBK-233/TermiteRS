@@ -12,7 +12,7 @@ use TermiteRS::git::Git;
 use TermiteRS::notify::Notifier;
 use TermiteRS::protection::{
     SecurityDisposition, investigate_security_signal, publish_github_issue,
-    run_commit_security_reviews, run_protection_scan,
+    run_commit_security_reviews, run_protection_scan, scan_osv_advisories,
 };
 use TermiteRS::service;
 use TermiteRS::sync::{SyncOptions, SyncRunner};
@@ -142,6 +142,30 @@ fn main() -> Result<()> {
                 let receipt =
                     publish_github_issue(&config.service.data_dir, &draft_id, &token_env, approve)?;
                 println!("{}", serde_json::to_string_pretty(&receipt)?);
+            }
+            ProtectionCommands::Advisories {
+                config,
+                path,
+                data_dir,
+            } => {
+                let mut config = Config::read_from(config)?;
+                config.protection.enabled = true;
+                if !config
+                    .protection
+                    .profiles
+                    .iter()
+                    .any(|profile| profile == "osv")
+                {
+                    config.protection.profiles.push("osv".to_string());
+                }
+                if let Some(path) = path {
+                    config.repo.path = path;
+                }
+                if let Some(data_dir) = data_dir {
+                    config.service.data_dir = data_dir;
+                }
+                let advisories = scan_osv_advisories(&config)?;
+                println!("{}", serde_json::to_string_pretty(&advisories)?);
             }
         },
         Commands::Status { config } => {

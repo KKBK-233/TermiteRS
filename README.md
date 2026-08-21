@@ -223,7 +223,7 @@ protection:
     description: |
       这是一个公开运行的项目。
       RCE、认证绕过、任意文件读写和供应链恶意代码必须立即阻止。
-  profiles: [baseline, rust]
+  profiles: [baseline, rust, osv]
   automation: candidate
 
 branches:
@@ -272,6 +272,7 @@ daemon:
 - 仓库源码、依赖和提交信息都属于不可信证据，不能借此修改安全基线或自动化权限。
 - `rust` 规则包无法无执行取证的私有注册表或 Git 外部依赖会失败关闭；需要先增加对应的受限证据适配器，不能自动跳过。
 - `rust` 规则包还会直接解析 `Cargo.lock`，从工作区本地根包计算保守依赖闭包并把精确包版本交给调查器；它能证明某 crate 是否进入构建依赖图，但不会把“依赖存在”误写成“生产运行时一定可达”。
+- `osv` 规则包让 daemon 每轮先用固定的 OSV `/v1/querybatch` 查询可达 crate 的锁定版本，按公告 ID、modified 和 aliases 去重；新公告先完成项目调查，之后才继续普通分支同步。OSV 返回的引用地址仍只作为文本证据，不会被跟随访问。
 - DS 会同时判断“隐藏安全修复”和“新引入风险”；隐藏修复必须给出 FixContract，沙箱测试通过后还会由独立提示检查最终候选差异、安全属性、脆弱行为和回归证据，任一项缺失都不会推送。
 - 项目保护启用后，配置中的测试命令只会在 Linux Bubblewrap 沙箱执行：网络、宿主环境变量、SSH/邮件/DS 凭证和宿主根目录均不可见；沙箱缺失时失败关闭。
 
@@ -279,6 +280,12 @@ daemon:
 
 ```bash
 cargo run -- protect scan --config termite.yml
+```
+
+只查询当前锁文件的新 OSV 公告，不运行 DS 或项目代码：
+
+```bash
+cargo run -- protect advisories --config termite.yml
 ```
 
 扫描指定的离线依赖展开目录，并准备 Issue 草稿：

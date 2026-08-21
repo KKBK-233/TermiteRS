@@ -191,4 +191,19 @@ pub enum ProtectionCommands {
         #[arg(long)]
         approve: bool,
     },
+
+    /// 从固定 OSV 官方 API 查询 Cargo.lock 可达版本的已知公告。
+    Advisories {
+        /// YAML 配置文件路径。
+        #[arg(short, long, default_value = "termite.yml")]
+        config: PathBuf,
+
+        /// 临时覆盖受保护仓库目录。
+        #[arg(long)]
+        path: Option<PathBuf>,
+
+        /// 临时覆盖公告去重数据库目录。
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
 }

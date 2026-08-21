@@ -122,6 +122,23 @@ pub struct CargoReachabilitySnapshot {
     pub ambiguous_edges: Vec<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct OsvAdvisorySignal {
+    pub id: String,
+    pub modified: String,
+    #[serde(default)]
+    pub related_ids: Vec<OsvAdvisoryCursor>,
+    pub summary: String,
+    pub reference: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct OsvAdvisoryCursor {
+    pub id: String,
+    pub modified: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CandidateArtifact {
     pub id: String,

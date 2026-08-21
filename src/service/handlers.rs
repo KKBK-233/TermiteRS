@@ -134,6 +134,35 @@ pub(crate) async fn start_scheduled_sync_all(
     }
 }
 
+pub(crate) async fn start_scheduled_advisories(State(state): State<ServiceState>) -> Response {
+    let config = match state.config() {
+        Ok(config) => config,
+        Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+    };
+    let advisories = match crate::protection::scan_osv_advisories(&config) {
+        Ok(advisories) => advisories,
+        Err(error) => return api_error(StatusCode::BAD_GATEWAY, error),
+    };
+    if advisories.is_empty() {
+        return Json(serde_json::json!({ "job_ids": [] })).into_response();
+    }
+    let Some(branch) = config.branches.first().map(|branch| branch.name.clone()) else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            anyhow::anyhow!("没有可用于 OSV 候选测试的分支"),
+        );
+    };
+    match state.create_job("protection-osv", &branch) {
+        Ok(job_id) => {
+            let worker = state.clone();
+            let worker_id = job_id.clone();
+            thread::spawn(move || worker.execute_osv_advisories(&worker_id, advisories, branch));
+            Json(serde_json::json!({ "job_ids": [job_id] })).into_response()
+        }
+        Err(error) => api_error(StatusCode::CONFLICT, error),
+    }
+}
+
 /// 为全部维护分支创建受管同步任务，自动与手动入口共用同一套状态记录。
 fn spawn_sync_all(
     state: &ServiceState,

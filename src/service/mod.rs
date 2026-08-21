@@ -118,6 +118,10 @@ async fn run_unix(config_path: PathBuf) -> Result<()> {
             "/v1/internal/scheduled-sync-all",
             post(handlers::start_scheduled_sync_all),
         )
+        .route(
+            "/v1/internal/scheduled-advisories",
+            post(handlers::start_scheduled_advisories),
+        )
         .route("/v1/jobs/:id/cancel", post(handlers::cancel_job))
         .route("/v1/jobs/:id/retry", post(handlers::retry_job))
         .route("/v1/jobs/cleanup", post(handlers::cleanup_jobs))
