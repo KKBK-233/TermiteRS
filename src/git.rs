@@ -156,6 +156,10 @@ impl Git {
         crate::command::run_shell(command, &self.root)
     }
 
+    pub fn run_test_sandboxed(&self, command: &str) -> Result<CommandOutput> {
+        crate::sandbox::run_sandboxed(command, &self.root)
+    }
+
     pub fn add_file(&self, path: &str) -> Result<()> {
         self.git_checked(&["add", path])?;
         Ok(())
