@@ -271,7 +271,7 @@ daemon:
 - `automation: candidate` 允许准备隔离候选，但不授权推送、合并、发布或部署。
 - 仓库源码、依赖和提交信息都属于不可信证据，不能借此修改安全基线或自动化权限。
 - `rust` 规则包无法无执行取证的私有注册表或 Git 外部依赖会失败关闭；需要先增加对应的受限证据适配器，不能自动跳过。
-- DS 会同时判断“隐藏安全修复”和“新引入风险”；隐藏修复必须给出 FixContract，目前会停在独立验证门而不是直接推送。
+- DS 会同时判断“隐藏安全修复”和“新引入风险”；隐藏修复必须给出 FixContract，沙箱测试通过后还会由独立提示检查最终候选差异、安全属性、脆弱行为和回归证据，任一项缺失都不会推送。
 - 项目保护启用后，配置中的测试命令只会在 Linux Bubblewrap 沙箱执行：网络、宿主环境变量、SSH/邮件/DS 凭证和宿主根目录均不可见；沙箱缺失时失败关闭。
 
 构建前静态扫描：
@@ -289,6 +289,18 @@ cargo run -- protect scan --config termite.yml \
 ```
 
 输出是结构化 JSON。发现阻断项时命令返回退出码 `2`，并且不会运行 `cargo build`、`cargo test`、`build.rs` 或任何项目脚本。配置 `protection.enabled: true` 时，正常同步和后台服务也会在首个测试命令前执行同一门禁；信号、Finding 和 Issue 草稿会幂等保存到 `service.data_dir/termite.db`，重复扫描不会重复创建草稿。GitHub 远端会从 `repo.fork` 自动识别，也可以在手动扫描时用 `--issue-repository` 明确指定。
+
+调查人工保存的安全公告或社交媒体消息：
+
+```bash
+cargo run -- protect investigate --config termite.yml \
+  --summary "某依赖出现严重漏洞" \
+  --reference "https://example.com/advisory" \
+  --content-file ./advisory.txt \
+  --branch my/project
+```
+
+`--reference` 只作为证据保存，TermiteRS 不会访问该地址，避免公告内容把程序诱导到内网或恶意下载地址。DS 第一阶段只能从受控 Git 文件索引中选择最多三个普通文件；第二阶段只能基于这些文件给出判断和完整文件候选。`automation: observe` 只调查和告警；`candidate` 才会在隔离 worktree 写候选，并依次经过静态门禁、无网络 Bubblewrap 行为测试、候选提交安全审计和独立 FixContract 验证。即使全部通过，也不会自动推送、创建 PR、发布或部署。
 
 分支类型建议：
 

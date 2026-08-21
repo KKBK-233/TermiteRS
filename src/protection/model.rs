@@ -23,7 +23,7 @@ pub struct SecuritySignal {
     pub received_at: String,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum FindingState {
     Discovered,
@@ -55,7 +55,7 @@ pub struct ProtectionFinding {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum RemediationAction {
     KeepCurrent,
@@ -75,6 +75,31 @@ pub struct RemediationPlan {
     pub summary: String,
     pub requirements: Vec<String>,
     pub created_at: String,
+}
+
+/// DS 只能从程序给出的受控文件索引中选择审计证据，不能自行访问网络或主机路径。
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SignalFileSelection {
+    #[serde(default)]
+    pub paths: Vec<String>,
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CandidateFileChange {
+    pub path: String,
+    pub content: String,
+    pub reason: String,
+}
+
+/// 外部安全消息的判断和候选修改仍是模型建议，程序门禁决定是否保留候选。
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SignalInvestigationDecision {
+    pub review: SecurityReviewDecision,
+    pub recommended_action: RemediationAction,
+    pub candidate_summary: String,
+    #[serde(default)]
+    pub changes: Vec<CandidateFileChange>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

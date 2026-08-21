@@ -145,4 +145,31 @@ pub enum ProtectionCommands {
         #[arg(long)]
         project_description: Option<String>,
     },
+
+    /// 调查人工提供的安全消息，并按策略在隔离 worktree 中准备候选补丁。
+    Investigate {
+        /// YAML 配置文件路径。
+        #[arg(short, long, default_value = "termite.yml")]
+        config: PathBuf,
+
+        /// 公告或社交媒体消息的简短标题。
+        #[arg(long)]
+        summary: String,
+
+        /// 仅作为证据保存的引用地址；TermiteRS 不会主动访问。
+        #[arg(long)]
+        reference: Option<String>,
+
+        /// 已由操作者保存的消息正文，避免任意 URL 抓取带来的 SSRF。
+        #[arg(long)]
+        content_file: PathBuf,
+
+        /// 选择该配置分支的沙箱测试命令；默认使用首个分支。
+        #[arg(long)]
+        branch: Option<String>,
+
+        /// 临时覆盖保护数据库与候选 worktree 目录。
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
 }
