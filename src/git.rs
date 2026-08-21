@@ -243,6 +243,48 @@ impl Git {
             .collect())
     }
 
+    /// 返回范围内每个提交的完整 SHA，超过上限时失败关闭而不是静默截断。
+    pub fn commits_in_range(&self, from: &str, to: &str, limit: usize) -> Result<Vec<String>> {
+        let range = format!("{from}..{to}");
+        let output = self.git_checked(&["rev-list", "--reverse", &range])?;
+        let commits = output
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            commits.len() <= limit,
+            "安全审计提交数超过上限：{} > {}",
+            commits.len(),
+            limit
+        );
+        Ok(commits)
+    }
+
+    /// 获取单提交完整补丁；安全审计不允许截断证据后继续放行。
+    pub fn security_commit_patch(&self, commit: &str, max_bytes: usize) -> Result<String> {
+        let output = self.git_checked(&[
+            "show",
+            "--first-parent",
+            "--format=fuller",
+            "--no-ext-diff",
+            "--find-renames",
+            "--find-copies",
+            "--patch",
+            commit,
+        ])?;
+        anyhow::ensure!(
+            output.stdout.len() <= max_bytes,
+            "提交 {} 的安全审计补丁超过上限：{} > {} bytes",
+            commit,
+            output.stdout.len(),
+            max_bytes
+        );
+        Ok(output.stdout)
+    }
+
     pub fn changed_files(&self, range: &str, limit: usize) -> Result<Vec<String>> {
         let mut files = self
             .git_checked(&["diff", "--name-status", range])?

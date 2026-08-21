@@ -1,17 +1,25 @@
+mod catalog;
 mod dependency;
 mod issue;
 mod model;
+mod review;
 mod runner;
 mod store;
 mod supply_chain;
 
+pub use catalog::{CATALOG_VERSION, evaluate_security_review, policy_fingerprint};
 pub use dependency::scan_locked_cargo_dependencies;
-pub use issue::prepare_issue_draft;
-pub use model::{
-    CandidateArtifact, DeliveryDraft, DeliveryKind, FindingState, ProtectionFinding,
-    RemediationAction, RemediationPlan, SecuritySignal, SecuritySignalSource, StaticIndicator,
-    StaticScanReport, VerificationResult,
+pub use issue::{
+    github_repository_from_remote, prepare_issue_draft, prepare_security_review_issue_draft,
 };
+pub use model::{
+    CandidateArtifact, CommitSecurityReviewBatch, DeliveryDraft, DeliveryKind,
+    EvaluatedSecurityReview, FindingState, FixContract, ProtectionFinding, RemediationAction,
+    RemediationPlan, SecurityCategory, SecurityConfidence, SecurityDisposition,
+    SecurityReviewDecision, SecuritySeverity, SecuritySignal, SecuritySignalSource,
+    StaticIndicator, StaticScanReport, VerificationResult,
+};
+pub use review::{ensure_reviews_can_proceed, run_commit_security_reviews};
 pub use runner::{ProtectionScanOutput, enforce_prebuild_gate, run_protection_scan};
 pub use store::ProtectionStore;
 pub(crate) use store::initialize_protection_schema;

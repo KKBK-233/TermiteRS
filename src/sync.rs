@@ -7,7 +7,9 @@ use crate::conflict::{extract_conflict_blocks, resolve_conflict_files};
 use crate::git::Git;
 use crate::llm::{AutoResolveConflictRequest, ConflictAnalysisRequest, LlmService};
 use crate::notify::Notifier;
-use crate::protection::enforce_prebuild_gate;
+use crate::protection::{
+    enforce_prebuild_gate, ensure_reviews_can_proceed, run_commit_security_reviews,
+};
 use crate::release::ensure_release_tag;
 use crate::report::{BranchReport, BranchStatus, SyncReport};
 use crate::text::truncate_to_char_boundary;
@@ -295,6 +297,36 @@ impl SyncRunner {
                 entry.push_detail(detail);
             }
             return Ok(SyncBranchOutcome::Report(entry));
+        }
+
+        match run_commit_security_reviews(&self.config, &self.git, &before_head, "HEAD") {
+            Ok(Some(batch)) => {
+                if let Err(err) = ensure_reviews_can_proceed(&batch) {
+                    let mut entry =
+                        BranchReport::new(&branch.name, branch.kind, BranchStatus::Failed)
+                            .active()
+                            .detail(format!(
+                                "project security review blocked execution: {err:#}"
+                            ));
+                    for review in batch.reviews.iter().filter(|review| {
+                        review.disposition != crate::protection::SecurityDisposition::Allow
+                    }) {
+                        entry.push_detail(format!(
+                            "{} {:?}: {}",
+                            review.commit, review.disposition, review.decision.summary
+                        ));
+                    }
+                    return Ok(SyncBranchOutcome::Report(entry));
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                return Ok(SyncBranchOutcome::Report(
+                    BranchReport::new(&branch.name, branch.kind, BranchStatus::Failed)
+                        .active()
+                        .detail(format!("project security review failed closed: {err:#}")),
+                ));
+            }
         }
 
         for test in &branch.tests {

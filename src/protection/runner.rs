@@ -9,8 +9,8 @@ use crate::config::Config;
 use super::supply_chain::merge_static_reports;
 use super::{
     DeliveryDraft, FindingState, ProtectionFinding, ProtectionStore, SecuritySignal,
-    SecuritySignalSource, StaticScanReport, prepare_issue_draft, scan_locked_cargo_dependencies,
-    scan_supply_chain_tree,
+    SecuritySignalSource, StaticScanReport, github_repository_from_remote, prepare_issue_draft,
+    scan_locked_cargo_dependencies, scan_supply_chain_tree,
 };
 
 #[derive(Debug, Serialize)]
@@ -181,22 +181,6 @@ fn configured_project_name(config: &Config) -> String {
         .filter(|name| !name.is_empty())
         .unwrap_or("protected-project")
         .to_string()
-}
-
-/// 从常见 GitHub 远端地址提取 Issue 目标，无法可靠识别时不生成自动投送草稿。
-fn github_repository_from_remote(remote: &str) -> Option<String> {
-    let path = remote
-        .strip_prefix("git@github.com:")
-        .or_else(|| remote.strip_prefix("https://github.com/"))
-        .or_else(|| remote.strip_prefix("ssh://git@github.com/"))?;
-    let path = path.trim_end_matches('/').trim_end_matches(".git");
-    let mut parts = path.split('/');
-    let owner = parts.next()?;
-    let repository = parts.next()?;
-    if owner.is_empty() || repository.is_empty() || parts.next().is_some() {
-        return None;
-    }
-    Some(format!("{owner}/{repository}"))
 }
 
 #[cfg(test)]
