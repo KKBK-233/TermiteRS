@@ -6,6 +6,7 @@ mod review;
 mod runner;
 mod store;
 mod supply_chain;
+mod verify;
 
 pub use catalog::{CATALOG_VERSION, evaluate_security_review, policy_fingerprint};
 pub use dependency::scan_locked_cargo_dependencies;
@@ -14,13 +15,15 @@ pub use issue::{
 };
 pub use model::{
     CandidateArtifact, CommitSecurityReviewBatch, DeliveryDraft, DeliveryKind,
-    EvaluatedSecurityReview, FindingState, FixContract, ProtectionFinding, RemediationAction,
-    RemediationPlan, SecurityCategory, SecurityConfidence, SecurityDisposition,
-    SecurityReviewDecision, SecuritySeverity, SecuritySignal, SecuritySignalSource,
-    StaticIndicator, StaticScanReport, VerificationResult,
+    EvaluatedContractVerification, EvaluatedSecurityReview, FindingState, FixContract,
+    ProtectionFinding, RemediationAction, RemediationPlan, SecurityCategory, SecurityConfidence,
+    SecurityContractVerificationDecision, SecurityDisposition, SecurityReviewDecision,
+    SecuritySeverity, SecuritySignal, SecuritySignalSource, StaticIndicator, StaticScanReport,
+    VerificationResult,
 };
 pub use review::{ensure_reviews_can_proceed, run_commit_security_reviews};
 pub use runner::{ProtectionScanOutput, enforce_prebuild_gate, run_protection_scan};
 pub use store::ProtectionStore;
 pub(crate) use store::initialize_protection_schema;
 pub use supply_chain::scan_supply_chain_tree;
+pub use verify::verify_required_contracts;

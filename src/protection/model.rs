@@ -243,3 +243,25 @@ pub struct CommitSecurityReviewBatch {
     pub disposition: SecurityDisposition,
     pub cache_hits: usize,
 }
+
+/// 独立验证器只报告 FixContract 的三类证据，最终 passed 由程序重新计算。
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SecurityContractVerificationDecision {
+    pub security_property_present: bool,
+    pub vulnerable_behavior_removed: bool,
+    pub regression_evidence_present: bool,
+    pub confidence: SecurityConfidence,
+    pub summary: String,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+    #[serde(default)]
+    pub missing_regressions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct EvaluatedContractVerification {
+    pub commit: String,
+    pub passed: bool,
+    pub decision: SecurityContractVerificationDecision,
+    pub dedupe_key: String,
+}

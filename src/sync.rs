@@ -9,6 +9,7 @@ use crate::llm::{AutoResolveConflictRequest, ConflictAnalysisRequest, LlmService
 use crate::notify::Notifier;
 use crate::protection::{
     enforce_prebuild_gate, ensure_reviews_can_proceed, run_commit_security_reviews,
+    verify_required_contracts,
 };
 use crate::release::ensure_release_tag;
 use crate::report::{BranchReport, BranchStatus, SyncReport};
@@ -299,42 +300,46 @@ impl SyncRunner {
             return Ok(SyncBranchOutcome::Report(entry));
         }
 
-        match run_commit_security_reviews(&self.config, &self.git, &before_head, "HEAD") {
-            Ok(Some(batch)) => {
-                if let Err(err) = ensure_reviews_can_proceed(&batch) {
-                    let mut entry =
+        let security_batch =
+            match run_commit_security_reviews(&self.config, &self.git, &before_head, "HEAD") {
+                Ok(Some(batch)) => {
+                    if let Err(err) = ensure_reviews_can_proceed(&batch) {
+                        let mut entry =
+                            BranchReport::new(&branch.name, branch.kind, BranchStatus::Failed)
+                                .active()
+                                .detail(format!(
+                                    "project security review blocked execution: {err:#}"
+                                ));
+                        for review in batch.reviews.iter().filter(|review| {
+                            review.disposition != crate::protection::SecurityDisposition::Allow
+                        }) {
+                            entry.push_detail(format!(
+                                "{} {:?}: {}",
+                                review.commit, review.disposition, review.decision.summary
+                            ));
+                        }
+                        return Ok(SyncBranchOutcome::Report(entry));
+                    }
+                    Some(batch)
+                }
+                Ok(None) => None,
+                Err(err) => {
+                    return Ok(SyncBranchOutcome::Report(
                         BranchReport::new(&branch.name, branch.kind, BranchStatus::Failed)
                             .active()
-                            .detail(format!(
-                                "project security review blocked execution: {err:#}"
-                            ));
-                    for review in batch.reviews.iter().filter(|review| {
-                        review.disposition != crate::protection::SecurityDisposition::Allow
-                    }) {
-                        entry.push_detail(format!(
-                            "{} {:?}: {}",
-                            review.commit, review.disposition, review.decision.summary
-                        ));
-                    }
-                    return Ok(SyncBranchOutcome::Report(entry));
+                            .detail(format!("project security review failed closed: {err:#}")),
+                    ));
                 }
-            }
-            Ok(None) => {}
-            Err(err) => {
-                return Ok(SyncBranchOutcome::Report(
-                    BranchReport::new(&branch.name, branch.kind, BranchStatus::Failed)
-                        .active()
-                        .detail(format!("project security review failed closed: {err:#}")),
-                ));
-            }
-        }
+            };
 
+        let mut test_output = String::new();
         for test in &branch.tests {
             let output = if self.config.protection.enabled {
                 self.git.run_test_sandboxed(test)?
             } else {
                 self.git.run_test(test)?
             };
+            test_output.push_str(&format!("$ {test}\n{}\n{}\n", output.stdout, output.stderr));
             if !output.success() {
                 let mut entry = BranchReport::new(&branch.name, branch.kind, BranchStatus::Failed)
                     .active()
@@ -350,6 +355,24 @@ impl SyncRunner {
                 }
                 return Ok(SyncBranchOutcome::Report(entry));
             }
+        }
+
+        if let Some(batch) = &security_batch
+            && let Err(err) = verify_required_contracts(
+                &self.config,
+                &self.git,
+                batch,
+                &branch.tests,
+                &test_output,
+            )
+        {
+            return Ok(SyncBranchOutcome::Report(
+                BranchReport::new(&branch.name, branch.kind, BranchStatus::Failed)
+                    .active()
+                    .detail(format!(
+                        "project FixContract verification failed closed: {err:#}"
+                    )),
+            ));
         }
 
         if branch.tests.is_empty()
