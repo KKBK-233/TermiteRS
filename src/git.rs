@@ -289,6 +289,25 @@ impl Git {
         Ok(output.stdout)
     }
 
+    /// 获取候选范围合并后的最终差异，供契约验证器检查后续提交是否撤回安全属性。
+    pub fn security_range_patch(&self, from: &str, to: &str, max_bytes: usize) -> Result<String> {
+        let output = self.git_checked(&[
+            "diff",
+            "--no-ext-diff",
+            "--find-renames",
+            "--find-copies",
+            "--patch",
+            &format!("{from}..{to}"),
+        ])?;
+        anyhow::ensure!(
+            output.stdout.len() <= max_bytes,
+            "最终安全验证补丁超过上限：{} > {} bytes",
+            output.stdout.len(),
+            max_bytes
+        );
+        Ok(output.stdout)
+    }
+
     pub fn changed_files(&self, range: &str, limit: usize) -> Result<Vec<String>> {
         let mut files = self
             .git_checked(&["diff", "--name-status", range])?
