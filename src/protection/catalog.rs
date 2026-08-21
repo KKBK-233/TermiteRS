@@ -7,7 +7,7 @@ use super::{
     SecurityReviewDecision, SecuritySeverity,
 };
 
-pub const CATALOG_VERSION: &str = "security-catalog-v1";
+pub const CATALOG_VERSION: &str = "security-catalog-v2";
 
 /// 根据程序内置安全目录和企业预设计算门禁结论，LLM 无权覆盖本函数。
 pub fn evaluate_security_review(
@@ -25,8 +25,20 @@ pub fn evaluate_security_review(
     let universal = decision.categories.iter().any(is_universal_category);
     let mut reasons = Vec::new();
 
-    let disposition = if !applicable {
-        reasons.push("审计证据明确表明当前项目不受影响或生产路径不可达".to_string());
+    let disposition = if !applicable
+        && (universal
+            || matches!(
+                decision.severity,
+                SecuritySeverity::P0 | SecuritySeverity::P1
+            ))
+        && (decision.introduced_risk || decision.security_fix_detected)
+    {
+        reasons.push(
+            "只有模型声称当前不可达，缺少程序化依赖或运行时可达性证明，不能自动放行".to_string(),
+        );
+        SecurityDisposition::NeedsReview
+    } else if !applicable {
+        reasons.push("低等级问题的审计证据表明当前项目不受影响或生产路径不可达".to_string());
         SecurityDisposition::Allow
     } else if decision.introduced_risk
         && (universal
@@ -152,12 +164,12 @@ mod tests {
     }
 
     #[test]
-    fn unreachable_dependency_vulnerability_is_recorded_but_allowed() {
+    fn model_only_unreachable_claim_cannot_allow_universal_vulnerability() {
         let mut input = decision();
         input.affected = Some(false);
         input.production_reachable = Some(false);
         let review = evaluate_security_review("abc", input, &ProtectionConfig::default());
-        assert_eq!(review.disposition, SecurityDisposition::Allow);
+        assert_eq!(review.disposition, SecurityDisposition::NeedsReview);
     }
 
     #[test]
