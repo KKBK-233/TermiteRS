@@ -96,10 +96,30 @@ pub struct CandidateFileChange {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SignalInvestigationDecision {
     pub review: SecurityReviewDecision,
+    #[serde(default)]
+    pub affected_packages: Vec<String>,
     pub recommended_action: RemediationAction,
     pub candidate_summary: String,
     #[serde(default)]
     pub changes: Vec<CandidateFileChange>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CargoPackageCoordinate {
+    pub name: String,
+    pub version: String,
+    pub source: String,
+}
+
+/// Cargo.lock 的程序化闭包只证明依赖是否进入构建图，不声称功能路径在生产运行时可达。
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+pub struct CargoReachabilitySnapshot {
+    #[serde(default)]
+    pub roots: Vec<String>,
+    #[serde(default)]
+    pub reachable_packages: Vec<CargoPackageCoordinate>,
+    #[serde(default)]
+    pub ambiguous_edges: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
