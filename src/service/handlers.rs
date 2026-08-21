@@ -16,7 +16,8 @@ use tokio_stream::wrappers::BroadcastStream;
 
 use super::state::ServiceState;
 use super::types::{
-    AcceptedResponse, ApiMessage, CleanupRequest, MessageRequest, ProposalRequest, SyncRequest,
+    AcceptedResponse, ApiMessage, CleanupRequest, IssuePublishRequest, MessageRequest,
+    ProposalRequest, ProtectionInvestigationRequest, SyncRequest,
 };
 
 pub(crate) async fn status(State(state): State<ServiceState>) -> Response {
@@ -187,6 +188,80 @@ pub(crate) async fn start_sync(
             (StatusCode::ACCEPTED, Json(AcceptedResponse { job_id })).into_response()
         }
         Err(err) => api_error(StatusCode::CONFLICT, err),
+    }
+}
+
+pub(crate) async fn start_protection_investigation(
+    State(state): State<ServiceState>,
+    Json(request): Json<ProtectionInvestigationRequest>,
+) -> Response {
+    if request.summary.trim().is_empty()
+        || request.summary.chars().count() > 500
+        || request.content.trim().is_empty()
+        || request.content.len() > 64 * 1024
+        || request
+            .reference
+            .as_ref()
+            .is_some_and(|value| value.len() > 2048)
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            anyhow::anyhow!("安全消息要求 1-500 字摘要、1-65536 字节正文和最多 2048 字节引用"),
+        );
+    }
+    let config = match state.config() {
+        Ok(config) => config,
+        Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+    };
+    if let Some(branch) = &request.branch
+        && config
+            .branches
+            .iter()
+            .all(|configured| configured.name != *branch)
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            anyhow::anyhow!("测试分支不在白名单中"),
+        );
+    }
+    let job_branch = request.branch.as_deref().unwrap_or("*").to_string();
+    match state.create_job("protection", &job_branch) {
+        Ok(job_id) => {
+            let worker = state.clone();
+            let worker_id = job_id.clone();
+            thread::spawn(move || worker.execute_protection_investigation(&worker_id, request));
+            (StatusCode::ACCEPTED, Json(AcceptedResponse { job_id })).into_response()
+        }
+        Err(error) => api_error(StatusCode::CONFLICT, error),
+    }
+}
+
+pub(crate) async fn publish_protection_issue(
+    State(state): State<ServiceState>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<IssuePublishRequest>,
+) -> Response {
+    if !request.approve {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            anyhow::anyhow!("必须显式 approve=true"),
+        );
+    }
+    if request.token_env.is_empty()
+        || request.token_env.len() > 128
+        || !request
+            .token_env
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            anyhow::anyhow!("Token 环境变量名非法"),
+        );
+    }
+    match crate::protection::publish_github_issue(&state.data_dir, &id, &request.token_env, true) {
+        Ok(receipt) => Json(receipt).into_response(),
+        Err(error) => api_error(StatusCode::CONFLICT, error),
     }
 }
 
