@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
@@ -11,7 +11,8 @@ use TermiteRS::doctor::Doctor;
 use TermiteRS::git::Git;
 use TermiteRS::notify::Notifier;
 use TermiteRS::protection::{
-    SecurityDisposition, run_commit_security_reviews, run_protection_scan,
+    SecurityDisposition, investigate_security_signal, run_commit_security_reviews,
+    run_protection_scan,
 };
 use TermiteRS::service;
 use TermiteRS::sync::{SyncOptions, SyncRunner};
@@ -102,6 +103,32 @@ fn main() -> Result<()> {
                     .as_ref()
                     .is_some_and(|batch| batch.disposition != SecurityDisposition::Allow)
                 {
+                    std::process::exit(2);
+                }
+            }
+            ProtectionCommands::Investigate {
+                config,
+                summary,
+                reference,
+                content_file,
+                branch,
+                data_dir,
+            } => {
+                let mut config = Config::read_from(config)?;
+                if let Some(data_dir) = data_dir {
+                    config.service.data_dir = data_dir;
+                }
+                let content = std::fs::read_to_string(&content_file)
+                    .with_context(|| format!("无法读取安全消息正文：{}", content_file.display()))?;
+                let output = investigate_security_signal(
+                    &config,
+                    &summary,
+                    reference.as_deref(),
+                    &content,
+                    branch.as_deref(),
+                )?;
+                println!("{}", serde_json::to_string_pretty(&output)?);
+                if !output.finding.build_allowed {
                     std::process::exit(2);
                 }
             }
