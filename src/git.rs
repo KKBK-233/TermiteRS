@@ -43,6 +43,10 @@ impl Git {
         Self { root: root.into() }
     }
 
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub fn ensure_repo(&self) -> Result<()> {
         let output = self.git(&["rev-parse", "--show-toplevel"])?;
         if !output.success() {

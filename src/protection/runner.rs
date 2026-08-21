@@ -1,6 +1,6 @@
 use std::{fs, path::Path};
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use serde::Serialize;
 
@@ -18,6 +18,37 @@ pub struct ProtectionScanOutput {
     pub report: StaticScanReport,
     pub issue_draft: Option<DeliveryDraft>,
     pub recorded: bool,
+}
+
+/// 在任何项目代码执行前完成静态审计；扫描失败或命中阻断规则时一律关闭后续执行。
+pub fn enforce_prebuild_gate(
+    config: &Config,
+    scan_root: impl AsRef<Path>,
+) -> Result<Option<ProtectionScanOutput>> {
+    if !config.protection.enabled {
+        return Ok(None);
+    }
+
+    let issue_repository = github_repository_from_remote(&config.repo.fork);
+    let output = run_protection_scan(config, scan_root, issue_repository.as_deref())
+        .context("项目保护门禁未能完成静态扫描，已拒绝执行项目代码")?;
+    if !output.report.build_allowed {
+        let evidence = output
+            .report
+            .blockers
+            .iter()
+            .take(8)
+            .map(|item| format!("{} {}: {}", item.rule_id, item.path, item.evidence))
+            .collect::<Vec<_>>()
+            .join("\n");
+        bail!(
+            "项目保护门禁发现 {} 个供应链阻断项，已拒绝测试、构建和推送：\n{}",
+            output.report.blockers.len(),
+            evidence
+        );
+    }
+
+    Ok(Some(output))
 }
 
 /// 完成一次构建前静态审计，并在启用保护模式时幂等保存 Finding 和投送草稿。
@@ -128,12 +159,41 @@ fn configured_project_name(config: &Config) -> String {
         .to_string()
 }
 
+/// 从常见 GitHub 远端地址提取 Issue 目标，无法可靠识别时不生成自动投送草稿。
+fn github_repository_from_remote(remote: &str) -> Option<String> {
+    let path = remote
+        .strip_prefix("git@github.com:")
+        .or_else(|| remote.strip_prefix("https://github.com/"))
+        .or_else(|| remote.strip_prefix("ssh://git@github.com/"))?;
+    let path = path.trim_end_matches('/').trim_end_matches(".git");
+    let mut parts = path.split('/');
+    let owner = parts.next()?;
+    let repository = parts.next()?;
+    if owner.is_empty() || repository.is_empty() || parts.next().is_some() {
+        return None;
+    }
+    Some(format!("{owner}/{repository}"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
     use uuid::Uuid;
 
     use super::*;
+
+    #[test]
+    fn github_repository_is_inferred_without_extra_delivery_config() {
+        assert_eq!(
+            github_repository_from_remote("git@github.com:KKBK-233/TermiteRS.git").as_deref(),
+            Some("KKBK-233/TermiteRS")
+        );
+        assert_eq!(
+            github_repository_from_remote("https://github.com/KKBK-233/TermiteRS").as_deref(),
+            Some("KKBK-233/TermiteRS")
+        );
+        assert_eq!(github_repository_from_remote("unused"), None);
+    }
 
     #[test]
     fn repeated_scan_reuses_finding_and_issue_draft() {
