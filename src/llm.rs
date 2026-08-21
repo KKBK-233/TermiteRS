@@ -430,12 +430,20 @@ impl LlmService {
             prompt.len() <= config.max_prompt_bytes,
             "安全消息调查证据过大"
         );
-        let decision: SignalInvestigationDecision = call_json_with_repair(
+        let mut decision: SignalInvestigationDecision = call_json_with_repair(
             config,
             SIGNAL_INVESTIGATION_SYSTEM_PROMPT,
             &prompt,
             "security signal investigation",
         )?;
+        // 外部公告不是“提交”，模型常把 security_fix_detected 理解成上游隐藏提交；
+        // 只有同时确认受影响、给出候选和契约时，程序才将其规范化为待验证安全修复。
+        if decision.review.affected == Some(true)
+            && !decision.changes.is_empty()
+            && decision.review.fix_contract.is_some()
+        {
+            decision.review.security_fix_detected = true;
+        }
         validate_security_review_decision(&decision.review)?;
         anyhow::ensure!(decision.changes.len() <= 12, "DS 返回的候选文件超过 12 个");
         Ok(Some(decision))
