@@ -7,7 +7,10 @@ use crate::{
     config::{BranchConfig, Config, SyncStrategy},
     git::{ConflictFileContent, ConflictSnapshot, Git},
     llm::{ConflictProposal, ResolvedFile},
-    protection::{enforce_prebuild_gate, ensure_reviews_can_proceed, run_commit_security_reviews},
+    protection::{
+        enforce_prebuild_gate, ensure_reviews_can_proceed, run_commit_security_reviews,
+        verify_required_contracts,
+    },
 };
 
 use super::types::{AutoResolvedSync, ConflictSide, JobView, StoredProposal};
@@ -106,10 +109,13 @@ pub(super) fn run_tests(
     before_ref: Option<&str>,
 ) -> Result<String> {
     enforce_prebuild_gate(config, git.root())?;
-    if let Some(before_ref) = before_ref
-        && let Some(batch) = run_commit_security_reviews(config, git, before_ref, "HEAD")?
-    {
-        ensure_reviews_can_proceed(&batch)?;
+    let security_batch = if let Some(before_ref) = before_ref {
+        run_commit_security_reviews(config, git, before_ref, "HEAD")?
+    } else {
+        None
+    };
+    if let Some(batch) = &security_batch {
+        ensure_reviews_can_proceed(batch)?;
     }
     if branch.tests.is_empty() && branch.auto_resolve.require_tests {
         bail!("该分支要求测试，但未配置测试命令");
@@ -127,6 +133,16 @@ pub(super) fn run_tests(
         output_text.push_str(&format!("$ {test}\n{}\n{}\n", output.stdout, output.stderr));
         if !output.success() {
             bail!("测试失败：{test}\n{}", output.stderr.trim());
+        }
+    }
+    if let Some(batch) = &security_batch {
+        let verifications =
+            verify_required_contracts(config, git, batch, &branch.tests, &output_text)?;
+        for verification in verifications {
+            output_text.push_str(&format!(
+                "FixContract {}: {}\n",
+                verification.commit, verification.decision.summary
+            ));
         }
     }
     Ok(output_text)

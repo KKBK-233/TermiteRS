@@ -5,8 +5,8 @@ use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::{
-    CandidateArtifact, DeliveryDraft, EvaluatedSecurityReview, ProtectionFinding, RemediationPlan,
-    SecuritySignal, VerificationResult,
+    CandidateArtifact, DeliveryDraft, EvaluatedContractVerification, EvaluatedSecurityReview,
+    ProtectionFinding, RemediationPlan, SecuritySignal, VerificationResult,
 };
 
 /// 安全保护数据独立于同步任务保存，便于后续重新评估和投送去重。
@@ -209,6 +209,42 @@ impl ProtectionStore {
         )?;
         Ok(())
     }
+
+    pub fn contract_verification(
+        &self,
+        dedupe_key: &str,
+    ) -> Result<Option<EvaluatedContractVerification>> {
+        self.connection
+            .query_row(
+                "SELECT verification_json FROM security_contract_verifications WHERE dedupe_key = ?1",
+                params![dedupe_key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|raw| serde_json::from_str(&raw).map_err(Into::into))
+            .transpose()
+    }
+
+    pub fn upsert_contract_verification(
+        &self,
+        verification: &EvaluatedContractVerification,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO security_contract_verifications
+             (dedupe_key, commit_sha, passed, verification_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(dedupe_key) DO UPDATE SET passed = excluded.passed,
+              verification_json = excluded.verification_json",
+            params![
+                verification.dedupe_key,
+                verification.commit,
+                i64::from(verification.passed),
+                serde_json::to_string(verification)?,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
 }
 
 fn enum_text(value: &impl serde::Serialize) -> Result<String> {
@@ -297,6 +333,14 @@ pub(crate) fn initialize_protection_schema(connection: &Connection) -> Result<()
             dedupe_key TEXT PRIMARY KEY,
             commit_sha TEXT NOT NULL,
             review_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS security_contract_verifications (
+            dedupe_key TEXT PRIMARY KEY,
+            commit_sha TEXT NOT NULL,
+            passed INTEGER NOT NULL,
+            verification_json TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
         "#,
