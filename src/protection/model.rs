@@ -149,6 +149,15 @@ pub struct DeliveryDraft {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DeliveryReceipt {
+    pub draft_id: String,
+    pub destination: String,
+    pub remote_id: String,
+    pub remote_url: String,
+    pub delivered_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct StaticIndicator {
     pub rule_id: String,
     pub severity: String,

@@ -302,6 +302,17 @@ cargo run -- protect investigate --config termite.yml \
 
 `--reference` 只作为证据保存，TermiteRS 不会访问该地址，避免公告内容把程序诱导到内网或恶意下载地址。DS 第一阶段只能从受控 Git 文件索引中选择最多三个普通文件；第二阶段只能基于这些文件给出判断和完整文件候选。`automation: observe` 只调查和告警；`candidate` 才会在隔离 worktree 写候选，并依次经过静态门禁、无网络 Bubblewrap 行为测试、候选提交安全审计和独立 FixContract 验证。即使全部通过，也不会自动推送、创建 PR、发布或部署。
 
+查看草稿内容并确认披露范围后，可以显式发布 GitHub Issue：
+
+```bash
+export GITHUB_TOKEN='fine-grained token with Issues: write on the target repository'
+cargo run -- protect issue-publish --config termite.yml \
+  --draft-id draft-xxxxxxxx \
+  --approve
+```
+
+缺少 `--approve` 时不会发出网络写请求。发布正文带稳定的不可见草稿标记；TermiteRS 会先查询远端标记，再发布并保存本地回执，因此常规重试不会重复创建 Issue。Token 只从指定环境变量读取，不会写入 YAML 或交给 DS。自动发布仍不开放，Issue 是独立的人工批准门。
+
 分支类型建议：
 
 - `kind: pr`：单功能 PR 分支，保持改动干净。

@@ -11,8 +11,8 @@ use TermiteRS::doctor::Doctor;
 use TermiteRS::git::Git;
 use TermiteRS::notify::Notifier;
 use TermiteRS::protection::{
-    SecurityDisposition, investigate_security_signal, run_commit_security_reviews,
-    run_protection_scan,
+    SecurityDisposition, investigate_security_signal, publish_github_issue,
+    run_commit_security_reviews, run_protection_scan,
 };
 use TermiteRS::service;
 use TermiteRS::sync::{SyncOptions, SyncRunner};
@@ -131,6 +131,17 @@ fn main() -> Result<()> {
                 if !output.finding.build_allowed {
                     std::process::exit(2);
                 }
+            }
+            ProtectionCommands::IssuePublish {
+                config,
+                draft_id,
+                token_env,
+                approve,
+            } => {
+                let config = Config::read_from(config)?;
+                let receipt =
+                    publish_github_issue(&config.service.data_dir, &draft_id, &token_env, approve)?;
+                println!("{}", serde_json::to_string_pretty(&receipt)?);
             }
         },
         Commands::Status { config } => {
