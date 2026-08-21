@@ -17,6 +17,8 @@ protection:
   profiles:
     - baseline
     - rust
+    # 启用后 daemon 会从固定 OSV 官方 API 查询锁定依赖版本。
+    - osv
   automation: candidate
 
 branches:

@@ -1,14 +1,13 @@
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-#[cfg(unix)]
-use anyhow::Context;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 #[cfg(unix)]
 use serde::Deserialize;
 use tracing::{error, info, warn};
 
 use crate::config::Config;
+use crate::protection::{ProtectionStore, investigate_security_signal, scan_osv_advisories};
 use crate::sync::{SyncOptions, SyncRunner};
 
 pub struct Daemon {
@@ -93,6 +92,11 @@ impl Daemon {
             dry_run: false,
             notify_on_noop: self.notify_on_noop,
         };
+        if let Err(error) = self.run_direct_advisory_tick() {
+            let next_failures = failures + 1;
+            error!("daemon advisory tick failed ({next_failures}): {error:#}");
+            return Ok(next_failures);
+        }
         match SyncRunner::new(self.config.clone(), options).run() {
             Ok(report) => {
                 println!("{}", report.render_text());
@@ -105,6 +109,66 @@ impl Daemon {
                 Ok(next_failures)
             }
         }
+    }
+
+    /// 未启用常驻服务时仍执行同一 OSV 流程，完成前不会进入普通分支同步。
+    fn run_direct_advisory_tick(&self) -> Result<()> {
+        let advisories = scan_osv_advisories(&self.config)?;
+        if advisories.is_empty() {
+            return Ok(());
+        }
+        let branch = self
+            .config
+            .branches
+            .first()
+            .context("OSV 调查没有可用测试分支")?;
+        let store = ProtectionStore::open(self.config.service.data_dir.join("termite.db"))?;
+        for advisory in advisories {
+            for cursor in &advisory.related_ids {
+                store.mark_osv_advisory(&cursor.id, &cursor.modified, "running", None)?;
+            }
+            let result = investigate_security_signal(
+                &self.config,
+                &advisory.summary,
+                Some(&advisory.reference),
+                &advisory.content,
+                Some(&branch.name),
+            );
+            match result {
+                Ok(output) if output.candidate_error.is_none() => {
+                    for cursor in &advisory.related_ids {
+                        store.mark_osv_advisory(&cursor.id, &cursor.modified, "completed", None)?;
+                    }
+                }
+                Ok(output) => {
+                    let error = output
+                        .candidate_error
+                        .unwrap_or_else(|| "未知候选错误".to_string());
+                    for cursor in &advisory.related_ids {
+                        store.mark_osv_advisory(
+                            &cursor.id,
+                            &cursor.modified,
+                            "failed",
+                            Some(&error),
+                        )?;
+                    }
+                    bail!("OSV {} 候选失败关闭：{}", advisory.id, error);
+                }
+                Err(error) => {
+                    let details = format!("{error:#}");
+                    for cursor in &advisory.related_ids {
+                        store.mark_osv_advisory(
+                            &cursor.id,
+                            &cursor.modified,
+                            "failed",
+                            Some(&details),
+                        )?;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// systemd 的服务启动顺序不保证 Unix Socket 已完成绑定，短暂等待可避免首轮退回旧路径。
@@ -124,9 +188,23 @@ impl Daemon {
     fn run_service_tick(&self) -> Result<()> {
         let client = reqwest::blocking::Client::builder()
             .unix_socket(self.config.service.socket_path.clone())
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(120))
             .build()
             .context("failed to build TermiteRS daemon service client")?;
+        let advisory_response = client
+            .post("http://localhost/v1/internal/scheduled-advisories")
+            .send()
+            .context("failed to schedule managed advisory scan")?;
+        let advisory_status = advisory_response.status();
+        if !advisory_status.is_success() {
+            let body = advisory_response.text().unwrap_or_default();
+            bail!("managed advisory scheduling returned {advisory_status}: {body}");
+        }
+        let advisory_jobs: ScheduledSyncResponse = advisory_response
+            .json()
+            .context("failed to decode managed advisory response")?;
+        wait_managed_jobs(&client, &advisory_jobs.job_ids, "advisory")?;
+
         let response = client
             .post("http://localhost/v1/internal/scheduled-sync-all")
             .json(&serde_json::json!({
@@ -147,42 +225,57 @@ impl Daemon {
             return Ok(());
         }
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(60 * 60);
-        loop {
-            let mut jobs = Vec::with_capacity(accepted.job_ids.len());
-            for job_id in &accepted.job_ids {
-                let response = client
-                    .get(format!("http://localhost/v1/jobs/{job_id}"))
-                    .send()
-                    .with_context(|| format!("failed to query managed sync job {job_id}"))?;
-                let status = response.status();
-                if !status.is_success() {
-                    let body = response.text().unwrap_or_default();
-                    bail!("managed sync job {job_id} returned {status}: {body}");
-                }
-                jobs.push(
-                    response
-                        .json::<ManagedSyncJob>()
-                        .with_context(|| format!("failed to decode managed sync job {job_id}"))?,
+        wait_managed_jobs(&client, &accepted.job_ids, "sync")
+    }
+}
+
+#[cfg(unix)]
+fn wait_managed_jobs(
+    client: &reqwest::blocking::Client,
+    job_ids: &[String],
+    purpose: &str,
+) -> Result<()> {
+    if job_ids.is_empty() {
+        return Ok(());
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(60 * 60);
+    loop {
+        let mut jobs = Vec::with_capacity(job_ids.len());
+        for job_id in job_ids {
+            let response = client
+                .get(format!("http://localhost/v1/jobs/{job_id}"))
+                .send()
+                .with_context(|| format!("failed to query managed {purpose} job {job_id}"))?;
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().unwrap_or_default();
+                bail!("managed {purpose} job {job_id} returned {status}: {body}");
+            }
+            jobs.push(
+                response
+                    .json::<ManagedSyncJob>()
+                    .with_context(|| format!("failed to decode managed {purpose} job {job_id}"))?,
+            );
+        }
+
+        if jobs.iter().all(|job| is_terminal_state(&job.state)) {
+            let failures = jobs
+                .iter()
+                .filter(|job| job.state != "completed")
+                .map(|job| format!("{} [{}]: {}", job.branch, job.state, job.summary))
+                .collect::<Vec<_>>();
+            if !failures.is_empty() {
+                bail!(
+                    "managed {purpose} requires attention: {}",
+                    failures.join(" | ")
                 );
             }
-
-            if jobs.iter().all(|job| is_terminal_state(&job.state)) {
-                let failures = jobs
-                    .iter()
-                    .filter(|job| job.state != "completed")
-                    .map(|job| format!("{} [{}]: {}", job.branch, job.state, job.summary))
-                    .collect::<Vec<_>>();
-                if !failures.is_empty() {
-                    bail!("managed sync requires attention: {}", failures.join(" | "));
-                }
-                return Ok(());
-            }
-            if std::time::Instant::now() >= deadline {
-                bail!("managed sync did not finish within 3600 seconds");
-            }
-            thread::sleep(Duration::from_secs(2));
+            return Ok(());
         }
+        if std::time::Instant::now() >= deadline {
+            bail!("managed {purpose} did not finish within 3600 seconds");
+        }
+        thread::sleep(Duration::from_secs(2));
     }
 }
 

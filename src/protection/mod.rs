@@ -3,6 +3,7 @@ mod dependency;
 mod investigate;
 mod issue;
 mod model;
+mod osv;
 mod review;
 mod runner;
 mod store;
@@ -20,11 +21,13 @@ pub use model::{
     CandidateArtifact, CandidateFileChange, CargoPackageCoordinate, CargoReachabilitySnapshot,
     CommitSecurityReviewBatch, DeliveryDraft, DeliveryKind, DeliveryReceipt,
     EvaluatedContractVerification, EvaluatedSecurityReview, FindingState, FixContract,
-    ProtectionFinding, RemediationAction, RemediationPlan, SecurityCategory, SecurityConfidence,
-    SecurityContractVerificationDecision, SecurityDisposition, SecurityReviewDecision,
-    SecuritySeverity, SecuritySignal, SecuritySignalSource, SignalFileSelection,
-    SignalInvestigationDecision, StaticIndicator, StaticScanReport, VerificationResult,
+    OsvAdvisoryCursor, OsvAdvisorySignal, ProtectionFinding, RemediationAction, RemediationPlan,
+    SecurityCategory, SecurityConfidence, SecurityContractVerificationDecision,
+    SecurityDisposition, SecurityReviewDecision, SecuritySeverity, SecuritySignal,
+    SecuritySignalSource, SignalFileSelection, SignalInvestigationDecision, StaticIndicator,
+    StaticScanReport, VerificationResult,
 };
+pub use osv::scan_osv_advisories;
 pub use review::{ensure_reviews_can_proceed, run_commit_security_reviews};
 pub use runner::{ProtectionScanOutput, enforce_prebuild_gate, run_protection_scan};
 pub use store::ProtectionStore;
