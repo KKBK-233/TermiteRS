@@ -2,7 +2,9 @@ use std::path::Path;
 
 #[cfg(unix)]
 use std::{
+    env,
     ffi::OsString,
+    fs,
     io::Read,
     process::{Command, Stdio},
     thread,
@@ -30,7 +32,7 @@ pub fn run_sandboxed(command: &str, worktree: impl AsRef<Path>) -> Result<Comman
         worktree.display()
     );
     ensure_bubblewrap_available()?;
-    let args = bubblewrap_args(worktree, command);
+    let args = bubblewrap_args(worktree, command)?;
     let mut child = Command::new("bwrap")
         .args(&args)
         .current_dir(worktree)
@@ -115,7 +117,7 @@ fn ensure_bubblewrap_available() -> Result<()> {
 }
 
 #[cfg(unix)]
-fn bubblewrap_args(worktree: &Path, command: &str) -> Vec<OsString> {
+fn bubblewrap_args(worktree: &Path, command: &str) -> Result<Vec<OsString>> {
     let mut args = [
         "--unshare-all",
         "--die-with-parent",
@@ -131,6 +133,8 @@ fn bubblewrap_args(worktree: &Path, command: &str) -> Vec<OsString> {
         "/tmp",
         "--dir",
         "/home",
+        "--dir",
+        "/sandbox-bin",
         "--ro-bind",
         "/usr",
         "/usr",
@@ -148,18 +152,19 @@ fn bubblewrap_args(worktree: &Path, command: &str) -> Vec<OsString> {
         "/etc/ld.so.cache",
         "--setenv",
         "PATH",
-        "/usr/local/bin:/usr/bin:/bin",
+        "/sandbox-bin:/usr/local/bin:/usr/bin:/bin",
         "--setenv",
         "HOME",
         "/tmp",
         "--setenv",
         "TERM",
         "dumb",
-        "--bind",
     ]
     .into_iter()
     .map(OsString::from)
     .collect::<Vec<_>>();
+    append_rust_toolchain_mounts(&mut args)?;
+    args.push(OsString::from("--bind"));
     args.push(worktree.as_os_str().to_os_string());
     args.push(OsString::from("/workspace"));
     args.extend(
@@ -168,7 +173,97 @@ fn bubblewrap_args(worktree: &Path, command: &str) -> Vec<OsString> {
             .map(OsString::from),
     );
     args.push(OsString::from(command));
-    args
+    Ok(args)
+}
+
+/// Rustup 工具链和 registry 代码只读进入沙箱；Cargo 凭证与全局 config 永不挂载。
+#[cfg(unix)]
+fn append_rust_toolchain_mounts(args: &mut Vec<OsString>) -> Result<()> {
+    let Some(rustup_proxy) = find_executable("rustup") else {
+        return Ok(());
+    };
+    let rustup_proxy = rustup_proxy.canonicalize()?;
+    anyhow::ensure!(rustup_proxy.is_file(), "rustup 代理不是普通文件");
+    let rustup_home = env::var_os("RUSTUP_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".rustup")));
+    let Some(rustup_home) = rustup_home.filter(|path| path.is_dir()) else {
+        return Ok(());
+    };
+    let rustup_home = rustup_home.canonicalize()?;
+    let metadata = fs::symlink_metadata(&rustup_home)?;
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "RUSTUP_HOME 不能是符号链接"
+    );
+    push_args(args, &["--ro-bind"]);
+    args.push(rustup_proxy.into_os_string());
+    args.push(OsString::from("/sandbox-bin/rustup"));
+    for tool in ["cargo", "rustc", "rustdoc", "rustfmt", "clippy-driver"] {
+        push_args(args, &["--symlink", "rustup"]);
+        args.push(OsString::from(format!("/sandbox-bin/{tool}")));
+    }
+    if Path::new("/usr/bin/gcc").is_file() {
+        push_args(args, &["--symlink", "/usr/bin/gcc", "/sandbox-bin/cc"]);
+    }
+    push_args(args, &["--ro-bind"]);
+    args.push(rustup_home.into_os_string());
+    args.push(OsString::from("/sandbox-rustup"));
+    push_args(
+        args,
+        &[
+            "--setenv",
+            "RUSTUP_HOME",
+            "/sandbox-rustup",
+            "--setenv",
+            "CARGO_HOME",
+            "/tmp/cargo-home",
+            "--setenv",
+            "CARGO_NET_OFFLINE",
+            "true",
+            "--setenv",
+            "CC",
+            "gcc",
+            "--setenv",
+            "CXX",
+            "g++",
+            "--dir",
+            "/tmp/cargo-home",
+        ],
+    );
+
+    let cargo_home = env::var_os("CARGO_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".cargo")));
+    if let Some(registry) = cargo_home
+        .map(|home| home.join("registry"))
+        .filter(|path| path.is_dir())
+    {
+        let registry = registry.canonicalize()?;
+        let metadata = fs::symlink_metadata(&registry)?;
+        anyhow::ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "Cargo registry 缓存不能是符号链接"
+        );
+        push_args(args, &["--ro-bind"]);
+        args.push(registry.into_os_string());
+        args.push(OsString::from("/tmp/cargo-home/registry"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn find_executable(name: &str) -> Option<std::path::PathBuf> {
+    env::var_os("PATH").and_then(|path| {
+        env::split_paths(&path)
+            .map(|directory| directory.join(name))
+            .find(|candidate| candidate.is_file())
+    })
+}
+
+#[cfg(unix)]
+fn push_args(args: &mut Vec<OsString>, values: &[&str]) {
+    args.extend(values.iter().map(OsString::from));
 }
 
 #[cfg(unix)]
@@ -190,7 +285,7 @@ mod tests {
 
     #[test]
     fn bubblewrap_never_binds_host_root_or_credentials() {
-        let args = bubblewrap_args(Path::new("/tmp/worktree"), "python3 -m pytest");
+        let args = bubblewrap_args(Path::new("/tmp/worktree"), "python3 -m pytest").unwrap();
         let text = args
             .iter()
             .map(|argument| argument.to_string_lossy())
@@ -224,6 +319,30 @@ test -z "${DEEPSEEK_API_KEY+x}"
             std::fs::read_to_string(root.join("sandbox-write.txt")).unwrap(),
             "sandboxed"
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "需要 Linux Bubblewrap 和 Rustup，用于发布前离线 Rust 工具链回放"]
+    fn live_sandbox_runs_cargo_without_host_credentials() {
+        let root = std::env::temp_dir().join(format!("termiters-cargo-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"sandbox-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn answer() -> u8 { 42 }\n#[test]\nfn works() { assert_eq!(answer(), 42); }\n",
+        )
+        .unwrap();
+        let output = run_sandboxed(
+            "cargo test --offline && test ! -e /tmp/cargo-home/credentials.toml",
+            &root,
+        )
+        .unwrap();
+        assert!(output.success(), "{}", output.stderr);
         std::fs::remove_dir_all(root).unwrap();
     }
 }
