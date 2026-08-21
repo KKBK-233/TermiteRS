@@ -188,6 +188,39 @@ impl ProtectionStore {
         Ok(())
     }
 
+    pub fn osv_advisory_needs_processing(&self, id: &str, modified: &str) -> Result<bool> {
+        let current = self
+            .connection
+            .query_row(
+                "SELECT modified, state FROM osv_advisory_observations WHERE osv_id = ?1",
+                params![id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        Ok(
+            !matches!(current, Some((current_modified, state)) if current_modified == modified && state == "completed"),
+        )
+    }
+
+    pub fn mark_osv_advisory(
+        &self,
+        id: &str,
+        modified: &str,
+        state: &str,
+        last_error: Option<&str>,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO osv_advisory_observations
+             (osv_id, modified, state, last_error, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(osv_id) DO UPDATE SET modified = excluded.modified,
+              state = excluded.state, last_error = excluded.last_error,
+              updated_at = excluded.updated_at",
+            params![id, modified, state, last_error, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
     pub fn upsert_remediation_plan(&self, plan: &RemediationPlan) -> Result<()> {
         self.connection.execute(
             "INSERT INTO remediation_plans
@@ -434,6 +467,14 @@ pub(crate) fn initialize_protection_schema(connection: &Connection) -> Result<()
             passed INTEGER NOT NULL,
             verification_json TEXT NOT NULL,
             created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS osv_advisory_observations (
+            osv_id TEXT PRIMARY KEY,
+            modified TEXT NOT NULL,
+            state TEXT NOT NULL,
+            last_error TEXT,
+            updated_at TEXT NOT NULL
         );
         "#,
     )?;
