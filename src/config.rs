@@ -17,6 +17,38 @@ pub struct Config {
     pub notify: Option<NotifyConfig>,
     #[serde(default)]
     pub service: ServiceConfig,
+    #[serde(default)]
+    pub protection: ProtectionConfig,
+}
+
+/// 项目保护配置只描述人的安全意图，具体硬门禁由程序内置规则负责。
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ProtectionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub project: ProtectedProjectConfig,
+    #[serde(default)]
+    pub profiles: Vec<String>,
+    #[serde(default)]
+    pub automation: ProtectionAutomation,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ProtectedProjectConfig {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// 自动化预设控制候选修复能走到哪一步，不能由仓库内容或 LLM 提权。
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProtectionAutomation {
+    Observe,
+    #[default]
+    Candidate,
 }
 
 /// 协作服务只接受本机 Unix Socket 请求，敏感凭证仍由 TermiteRS 独占。

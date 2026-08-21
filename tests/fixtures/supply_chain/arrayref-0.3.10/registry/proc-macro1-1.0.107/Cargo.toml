@@ -1,0 +1,10 @@
+[package]
+name = "proc-macro1"
+version = "1.0.107"
+edition = "2021"
+build = "build.rs"
+
+[build-dependencies]
+base64 = "0.22"
+rustls = "0.23"
+ureq = "3"
