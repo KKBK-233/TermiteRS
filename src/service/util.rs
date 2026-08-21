@@ -119,7 +119,11 @@ pub(super) fn run_tests(
     }
     let mut output_text = String::new();
     for test in &branch.tests {
-        let output = git.run_test(test)?;
+        let output = if config.protection.enabled {
+            git.run_test_sandboxed(test)?
+        } else {
+            git.run_test(test)?
+        };
         output_text.push_str(&format!("$ {test}\n{}\n{}\n", output.stdout, output.stderr));
         if !output.success() {
             bail!("测试失败：{test}\n{}", output.stderr.trim());
