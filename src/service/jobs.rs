@@ -346,7 +346,7 @@ impl ServiceState {
             .trim()
             .to_string();
         let mut had_activity = job.before_head != after_head || job.remote_head != after_head;
-        let test_output = run_tests(config, git, branch)?;
+        let test_output = run_tests(config, git, branch, Some(&job.before_head))?;
         self.open_database()?.execute(
             "UPDATE jobs SET test_output = ?2, updated_at = ?3 WHERE id = ?1",
             params![job_id, test_output, timestamp()],
