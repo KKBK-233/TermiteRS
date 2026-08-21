@@ -1,11 +1,12 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::{
-    CandidateArtifact, DeliveryDraft, ProtectionFinding, RemediationPlan, SecuritySignal,
-    VerificationResult,
+    CandidateArtifact, DeliveryDraft, EvaluatedSecurityReview, ProtectionFinding, RemediationPlan,
+    SecuritySignal, VerificationResult,
 };
 
 /// 安全保护数据独立于同步任务保存，便于后续重新评估和投送去重。
@@ -177,6 +178,37 @@ impl ProtectionStore {
             .query_row("SELECT COUNT(*) FROM delivery_drafts", [], |row| row.get(0))
             .map_err(Into::into)
     }
+
+    pub fn security_review(&self, dedupe_key: &str) -> Result<Option<EvaluatedSecurityReview>> {
+        self.connection
+            .query_row(
+                "SELECT review_json FROM commit_security_reviews WHERE dedupe_key = ?1",
+                params![dedupe_key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|raw| serde_json::from_str(&raw).map_err(Into::into))
+            .transpose()
+    }
+
+    pub fn upsert_security_review(
+        &self,
+        dedupe_key: &str,
+        review: &EvaluatedSecurityReview,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO commit_security_reviews (dedupe_key, commit_sha, review_json, created_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(dedupe_key) DO UPDATE SET review_json = excluded.review_json",
+            params![
+                dedupe_key,
+                review.commit,
+                serde_json::to_string(review)?,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
 }
 
 fn enum_text(value: &impl serde::Serialize) -> Result<String> {
@@ -258,6 +290,13 @@ pub(crate) fn initialize_protection_schema(connection: &Connection) -> Result<()
             dedupe_key TEXT NOT NULL UNIQUE,
             approval_required INTEGER NOT NULL,
             state TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS commit_security_reviews (
+            dedupe_key TEXT PRIMARY KEY,
+            commit_sha TEXT NOT NULL,
+            review_json TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
         "#,

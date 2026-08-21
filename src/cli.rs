@@ -118,4 +118,31 @@ pub enum ProtectionCommands {
         #[arg(long)]
         issue_repository: Option<String>,
     },
+
+    /// 使用 DS 对指定 Git 范围逐提交进行结构化安全审计。
+    Review {
+        /// YAML 配置文件路径。
+        #[arg(short, long, default_value = "termite.yml")]
+        config: PathBuf,
+
+        /// Git 仓库目录；未填写时使用 repo.path。
+        #[arg(long)]
+        path: Option<PathBuf>,
+
+        /// 审计范围起点，不包含该提交。
+        #[arg(long)]
+        from: String,
+
+        /// 审计范围终点。
+        #[arg(long, default_value = "HEAD")]
+        to: String,
+
+        /// 临时覆盖 Finding 数据目录，适合本地验收生产配置。
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+
+        /// 临时补充项目安全意图，不修改配置文件。
+        #[arg(long)]
+        project_description: Option<String>,
+    },
 }

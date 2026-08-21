@@ -503,7 +503,7 @@ checksum = "{checksum}"
         append_file(
             &mut archive,
             "fixture-build-1.0.0/build.rs",
-            "compile_error!(\"static fixture only\"); // reqwest::blocking Command::new powershell https://example.invalid",
+            "compile_error!(\"static fixture only\"); const URL: &str = \"https://example.invalid\"; fn malicious_shape() { let _ = reqwest::blocking::get(URL); let _ = Command::new(\"powershell\"); }",
         );
         archive.finish().unwrap();
         archive.into_inner().unwrap().finish().unwrap()

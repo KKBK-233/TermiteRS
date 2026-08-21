@@ -7,7 +7,7 @@ use crate::{
     config::{BranchConfig, Config, SyncStrategy},
     git::{ConflictFileContent, ConflictSnapshot, Git},
     llm::{ConflictProposal, ResolvedFile},
-    protection::enforce_prebuild_gate,
+    protection::{enforce_prebuild_gate, ensure_reviews_can_proceed, run_commit_security_reviews},
 };
 
 use super::types::{AutoResolvedSync, ConflictSide, JobView, StoredProposal};
@@ -99,8 +99,18 @@ pub(super) fn continue_autoresolved_sync(
 }
 
 /// 测试入口同时承担构建前安全门禁，确保任何配置命令执行前先完成只读静态扫描。
-pub(super) fn run_tests(config: &Config, git: &Git, branch: &BranchConfig) -> Result<String> {
+pub(super) fn run_tests(
+    config: &Config,
+    git: &Git,
+    branch: &BranchConfig,
+    before_ref: Option<&str>,
+) -> Result<String> {
     enforce_prebuild_gate(config, git.root())?;
+    if let Some(before_ref) = before_ref
+        && let Some(batch) = run_commit_security_reviews(config, git, before_ref, "HEAD")?
+    {
+        ensure_reviews_can_proceed(&batch)?;
+    }
     if branch.tests.is_empty() && branch.auto_resolve.require_tests {
         bail!("该分支要求测试，但未配置测试命令");
     }
@@ -336,7 +346,7 @@ branches:
         config.branches[0].tests = vec![command.into()];
 
         let git = Git::new(&project);
-        let error = run_tests(&config, &git, &config.branches[0]).unwrap_err();
+        let error = run_tests(&config, &git, &config.branches[0], None).unwrap_err();
         assert!(format!("{error:#}").contains("项目保护门禁"));
         assert!(!project.join("executed.txt").exists());
         let connection = rusqlite::Connection::open(data_dir.join("termite.db")).unwrap();

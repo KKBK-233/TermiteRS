@@ -142,3 +142,104 @@ pub struct StaticScanReport {
     pub warnings: Vec<StaticIndicator>,
     pub dedupe_key: String,
 }
+
+/// 这些类别属于跨行业不可接受的通用漏洞能力，模型只能选择，不能扩展或删除。
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "kebab-case")]
+pub enum SecurityCategory {
+    RemoteCodeExecution,
+    CommandInjection,
+    CodeInjection,
+    ServerSideRequestForgery,
+    AuthenticationBypass,
+    AuthorizationBypass,
+    SignatureBypass,
+    ProofVerificationBypass,
+    ArbitraryFileRead,
+    ArbitraryFileWrite,
+    PathTraversal,
+    UnsafeDeserialization,
+    SecretOrKeyDisclosure,
+    SupplyChainMalware,
+    ConsensusSafety,
+    UnauthorizedUpgrade,
+    PermanentServiceHalt,
+    ResourceExhaustion,
+    InformationDisclosure,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SecuritySeverity {
+    P0,
+    P1,
+    P2,
+    P3,
+    Informational,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SecurityConfidence {
+    High,
+    Medium,
+    Low,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct FixContract {
+    pub security_property: String,
+    pub vulnerable_behavior: String,
+    pub fixed_behavior: String,
+    #[serde(default)]
+    pub attack_preconditions: Vec<String>,
+    #[serde(default)]
+    pub regression_cases: Vec<String>,
+}
+
+/// DS 只描述从不可信提交证据中观察到的事实，不拥有最终放行权。
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SecurityReviewDecision {
+    pub security_fix_detected: bool,
+    pub introduced_risk: bool,
+    pub severity: SecuritySeverity,
+    #[serde(default)]
+    pub categories: Vec<SecurityCategory>,
+    pub affected: Option<bool>,
+    pub production_reachable: Option<bool>,
+    pub confidence: SecurityConfidence,
+    pub summary: String,
+    pub mechanism: String,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+    pub fix_contract: Option<FixContract>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SecurityDisposition {
+    Allow,
+    VerifyRequired,
+    NeedsReview,
+    Block,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct EvaluatedSecurityReview {
+    pub commit: String,
+    pub decision: SecurityReviewDecision,
+    pub disposition: SecurityDisposition,
+    pub policy_reasons: Vec<String>,
+    pub policy_fingerprint: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CommitSecurityReviewBatch {
+    pub project: String,
+    pub from: String,
+    pub to: String,
+    pub reviews: Vec<EvaluatedSecurityReview>,
+    pub disposition: SecurityDisposition,
+    pub cache_hits: usize,
+}
