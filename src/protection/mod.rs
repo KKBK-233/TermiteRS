@@ -1,9 +1,11 @@
+mod dependency;
 mod issue;
 mod model;
 mod runner;
 mod store;
 mod supply_chain;
 
+pub use dependency::scan_locked_cargo_dependencies;
 pub use issue::prepare_issue_draft;
 pub use model::{
     CandidateArtifact, DeliveryDraft, DeliveryKind, FindingState, ProtectionFinding,
