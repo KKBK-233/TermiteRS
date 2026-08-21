@@ -56,6 +56,12 @@ pub enum Commands {
         days: u32,
     },
 
+    /// 在执行任何项目代码之前审计受保护项目。
+    Protect {
+        #[command(subcommand)]
+        action: ProtectionCommands,
+    },
+
     /// Show branch status without changing anything.
     Status {
         /// Path to YAML config.
@@ -93,5 +99,23 @@ pub enum Commands {
         /// YAML 配置文件路径。
         #[arg(short, long, default_value = "termite.yml")]
         config: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProtectionCommands {
+    /// 只读扫描 Cargo 锁文件、清单和构建脚本。
+    Scan {
+        /// YAML 配置文件路径。
+        #[arg(short, long, default_value = "termite.yml")]
+        config: PathBuf,
+
+        /// 扫描目录；未填写时使用 repo.path。
+        #[arg(long)]
+        path: Option<PathBuf>,
+
+        /// 仅准备该仓库的 Issue 草稿，不会发送。
+        #[arg(long)]
+        issue_repository: Option<String>,
     },
 }

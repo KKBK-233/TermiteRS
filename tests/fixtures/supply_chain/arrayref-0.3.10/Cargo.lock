@@ -1,0 +1,17 @@
+# 离线安全回归样本；只用于静态解析，不允许执行其中任何构建脚本。
+version = 4
+
+[[package]]
+name = "arrayref"
+version = "0.3.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "25ad700976873c76af785cb99b33c48db7df8b81f21d1e9e06b3676b9a9373ae"
+dependencies = [
+ "proc-macro1",
+]
+
+[[package]]
+name = "proc-macro1"
+version = "1.0.107"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "61198155da51b838772eecf5bfaac6cbc4dcc388dccc56658fc28a8e831b34d4"

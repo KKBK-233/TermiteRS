@@ -8,6 +8,7 @@ pub mod doctor;
 pub mod git;
 pub mod llm;
 pub mod notify;
+pub mod protection;
 pub mod release;
 pub mod report;
 pub mod service;
