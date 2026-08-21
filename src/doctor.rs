@@ -32,6 +32,7 @@ impl Doctor {
         self.check_fetch(&mut report);
         self.check_branches(&mut report);
         self.check_test_policy(&mut report);
+        self.check_protection_sandbox(&mut report);
         self.check_release_config(&mut report);
         self.check_push_permission(&mut report);
         report.finish()
@@ -211,6 +212,16 @@ impl Doctor {
             } else if branch.require_behavioral_tests {
                 report.ok(format!("分支行为测试策略有效：{}", branch.name));
             }
+        }
+    }
+
+    fn check_protection_sandbox(&self, report: &mut DoctorReport) {
+        if !self.config.protection.enabled {
+            return;
+        }
+        match crate::sandbox::verify_sandbox(&self.config.repo.path) {
+            Ok(()) => report.ok("项目保护 Bubblewrap 沙箱可用"),
+            Err(err) => report.fail(format!("项目保护沙箱不可用：{err:#}")),
         }
     }
 

@@ -330,7 +330,11 @@ impl SyncRunner {
         }
 
         for test in &branch.tests {
-            let output = self.git.run_test(test)?;
+            let output = if self.config.protection.enabled {
+                self.git.run_test_sandboxed(test)?
+            } else {
+                self.git.run_test(test)?
+            };
             if !output.success() {
                 let mut entry = BranchReport::new(&branch.name, branch.kind, BranchStatus::Failed)
                     .active()
