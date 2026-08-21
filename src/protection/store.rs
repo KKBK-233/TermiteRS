@@ -5,8 +5,9 @@ use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::{
-    CandidateArtifact, DeliveryDraft, EvaluatedContractVerification, EvaluatedSecurityReview,
-    ProtectionFinding, RemediationPlan, SecuritySignal, VerificationResult,
+    CandidateArtifact, DeliveryDraft, DeliveryReceipt, EvaluatedContractVerification,
+    EvaluatedSecurityReview, ProtectionFinding, RemediationPlan, SecuritySignal,
+    VerificationResult,
 };
 
 /// 安全保护数据独立于同步任务保存，便于后续重新评估和投送去重。
@@ -101,6 +102,89 @@ impl ProtectionStore {
                 draft.created_at,
             ],
         )?;
+        Ok(())
+    }
+
+    pub fn delivery_draft(&self, draft_id: &str) -> Result<Option<DeliveryDraft>> {
+        self.connection
+            .query_row(
+                "SELECT id, finding_id, kind, destination, title, body, labels_json,
+                        dedupe_key, approval_required, created_at
+                 FROM delivery_drafts WHERE id = ?1",
+                params![draft_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, String>(9)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(|value| {
+                Ok(DeliveryDraft {
+                    id: value.0,
+                    finding_id: value.1,
+                    kind: serde_json::from_value(serde_json::Value::String(value.2))?,
+                    destination: value.3,
+                    title: value.4,
+                    body: value.5,
+                    labels: serde_json::from_str(&value.6)?,
+                    dedupe_key: value.7,
+                    approval_required: value.8 != 0,
+                    created_at: value.9,
+                })
+            })
+            .transpose()
+    }
+
+    pub fn delivery_receipt(&self, draft_id: &str) -> Result<Option<DeliveryReceipt>> {
+        self.connection
+            .query_row(
+                "SELECT draft_id, destination, remote_id, remote_url, delivered_at
+                 FROM delivery_receipts WHERE draft_id = ?1",
+                params![draft_id],
+                |row| {
+                    Ok(DeliveryReceipt {
+                        draft_id: row.get(0)?,
+                        destination: row.get(1)?,
+                        remote_id: row.get(2)?,
+                        remote_url: row.get(3)?,
+                        delivered_at: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn mark_delivery_complete(&mut self, receipt: &DeliveryReceipt) -> Result<()> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO delivery_receipts
+             (draft_id, destination, remote_id, remote_url, delivered_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(draft_id) DO NOTHING",
+            params![
+                receipt.draft_id,
+                receipt.destination,
+                receipt.remote_id,
+                receipt.remote_url,
+                receipt.delivered_at,
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE delivery_drafts SET state = 'delivered' WHERE id = ?1",
+            params![receipt.draft_id],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -327,6 +411,14 @@ pub(crate) fn initialize_protection_schema(connection: &Connection) -> Result<()
             approval_required INTEGER NOT NULL,
             state TEXT NOT NULL,
             created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS delivery_receipts (
+            draft_id TEXT PRIMARY KEY REFERENCES delivery_drafts(id),
+            destination TEXT NOT NULL,
+            remote_id TEXT NOT NULL,
+            remote_url TEXT NOT NULL,
+            delivered_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS commit_security_reviews (

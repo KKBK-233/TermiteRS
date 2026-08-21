@@ -172,4 +172,23 @@ pub enum ProtectionCommands {
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
+
+    /// 显式批准并发布已保存的 GitHub Issue 草稿。
+    IssuePublish {
+        /// YAML 配置文件路径。
+        #[arg(short, long, default_value = "termite.yml")]
+        config: PathBuf,
+
+        /// protection 数据库中的草稿 ID。
+        #[arg(long)]
+        draft_id: String,
+
+        /// GitHub fine-grained token 的环境变量名。
+        #[arg(long, default_value = "GITHUB_TOKEN")]
+        token_env: String,
+
+        /// 必须显式提供；缺失时不会进行网络写操作。
+        #[arg(long)]
+        approve: bool,
+    },
 }
