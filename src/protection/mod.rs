@@ -14,7 +14,7 @@ pub use dependency::{cargo_reachability_snapshot, scan_locked_cargo_dependencies
 pub use investigate::{SignalInvestigationOutput, investigate_security_signal};
 pub use issue::{
     github_repository_from_remote, prepare_issue_draft, prepare_security_review_issue_draft,
-    publish_github_issue,
+    prepare_signal_issue_draft, publish_github_issue,
 };
 pub use model::{
     CandidateArtifact, CandidateFileChange, CargoPackageCoordinate, CargoReachabilitySnapshot,

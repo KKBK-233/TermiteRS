@@ -254,10 +254,19 @@ fn append_rust_toolchain_mounts(args: &mut Vec<OsString>) -> Result<()> {
 
 #[cfg(unix)]
 fn find_executable(name: &str) -> Option<std::path::PathBuf> {
-    env::var_os("PATH").and_then(|path| {
+    let from_path = env::var_os("PATH").and_then(|path| {
         env::split_paths(&path)
             .map(|directory| directory.join(name))
             .find(|candidate| candidate.is_file())
+    });
+    from_path.or_else(|| {
+        env::var_os("CARGO_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".cargo"))
+            })
+            .map(|home| home.join("bin").join(name))
+            .filter(|candidate| candidate.is_file())
     })
 }
 

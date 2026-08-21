@@ -18,11 +18,12 @@ use crate::{
 };
 
 use super::{
-    CandidateArtifact, CommitSecurityReviewBatch, EvaluatedSecurityReview, FindingState,
-    ProtectionFinding, ProtectionStore, RemediationPlan, SecurityCategory, SecurityDisposition,
-    SecuritySeverity, SecuritySignal, SecuritySignalSource, SignalFileSelection,
-    SignalInvestigationDecision, VerificationResult, cargo_reachability_snapshot,
-    enforce_prebuild_gate, policy_fingerprint, run_commit_security_reviews,
+    CandidateArtifact, CommitSecurityReviewBatch, DeliveryDraft, EvaluatedSecurityReview,
+    FindingState, ProtectionFinding, ProtectionStore, RemediationPlan, SecurityCategory,
+    SecurityDisposition, SecuritySeverity, SecuritySignal, SecuritySignalSource,
+    SignalFileSelection, SignalInvestigationDecision, VerificationResult,
+    cargo_reachability_snapshot, enforce_prebuild_gate, github_repository_from_remote,
+    policy_fingerprint, prepare_signal_issue_draft, run_commit_security_reviews,
     verify_required_contracts,
 };
 
@@ -41,7 +42,10 @@ pub struct SignalInvestigationOutput {
     pub plan: RemediationPlan,
     pub candidate: Option<CandidateArtifact>,
     pub verification: Option<VerificationResult>,
+    pub issue_draft: Option<DeliveryDraft>,
+    pub candidate_error: Option<String>,
     pub notification_sent: bool,
+    pub notification_error: Option<String>,
 }
 
 /// 将人工粘贴的公告或社交媒体消息映射到当前项目；引用地址仅作为文本保存，绝不抓取。
@@ -102,7 +106,7 @@ pub fn investigate_security_signal(
         received_at: now.clone(),
     };
     let requires_action = requires_remediation(config, &decision);
-    let finding = ProtectionFinding {
+    let mut finding = ProtectionFinding {
         id: format!("finding-user-{suffix}"),
         project: project.clone(),
         signal_id: signal.id.clone(),
@@ -147,8 +151,8 @@ pub fn investigate_security_signal(
     store.upsert_finding(&finding)?;
     store.upsert_remediation_plan(&plan)?;
 
-    let notification_sent = if requires_action {
-        Notifier::new(config.notify.clone()).send(
+    let (notification_sent, notification_error) = if requires_action {
+        match Notifier::new(config.notify.clone()).send(
             &format!("{} 安全消息告警", project),
             &format!(
                 "{}\n\n判断：{}\n严重性：{}\n引用：{}\n\nTermiteRS 尚未推送、发布或部署任何修改。",
@@ -157,30 +161,67 @@ pub fn investigate_security_signal(
                 enum_text(&decision.review.severity)?,
                 reference.unwrap_or("无")
             ),
-        )?
+        ) {
+            Ok(sent) => (sent, None),
+            Err(error) => (false, Some(format!("{error:#}"))),
+        }
     } else {
-        false
+        (false, None)
     };
 
-    let (candidate, verification) = if requires_action
+    let (candidate, verification, candidate_error) = if requires_action
         && matches!(
             config.protection.automation,
             ProtectionAutomation::Candidate
         ) {
-        let (candidate, verification) = prepare_candidate(
+        let candidate_id = format!("candidate-{}", Uuid::new_v4());
+        match prepare_candidate(
             config,
             &git,
             &tracked_files,
             &finding,
             &decision,
             branch_name,
-        )?;
-        store.upsert_candidate(&candidate)?;
-        store.upsert_verification(&verification)?;
-        (Some(candidate), Some(verification))
+            &candidate_id,
+        ) {
+            Ok((candidate, verification)) => {
+                store.upsert_candidate(&candidate)?;
+                store.upsert_verification(&verification)?;
+                (Some(candidate), Some(verification), None)
+            }
+            Err(error) => {
+                let details = format!("{error:#}");
+                let failed = failed_candidate_artifacts(
+                    config,
+                    &finding,
+                    &decision,
+                    &candidate_id,
+                    &details,
+                );
+                store.upsert_candidate(&failed.0)?;
+                store.upsert_verification(&failed.1)?;
+                (Some(failed.0), Some(failed.1), Some(details))
+            }
+        }
     } else {
-        (None, None)
+        (None, None, None)
     };
+    if verification.as_ref().is_some_and(|result| result.passed) {
+        finding.state = FindingState::AwaitingDelivery;
+        finding.updated_at = Utc::now().to_rfc3339();
+        store.upsert_finding(&finding)?;
+    }
+    let issue_draft = github_repository_from_remote(&config.repo.fork).and_then(|repository| {
+        prepare_signal_issue_draft(
+            &finding,
+            repository,
+            candidate.as_ref(),
+            verification.as_ref(),
+        )
+    });
+    if let Some(draft) = &issue_draft {
+        store.upsert_delivery_draft(draft)?;
+    }
 
     Ok(SignalInvestigationOutput {
         signal,
@@ -190,7 +231,10 @@ pub fn investigate_security_signal(
         plan,
         candidate,
         verification,
+        issue_draft,
+        candidate_error,
         notification_sent,
+        notification_error,
     })
 }
 
@@ -201,6 +245,7 @@ fn prepare_candidate(
     finding: &ProtectionFinding,
     decision: &SignalInvestigationDecision,
     branch_name: Option<&str>,
+    candidate_id: &str,
 ) -> Result<(CandidateArtifact, VerificationResult)> {
     anyhow::ensure!(
         !decision.changes.is_empty(),
@@ -223,12 +268,11 @@ fn prepare_candidate(
         "安全候选至少需要一条行为测试命令"
     );
 
-    let candidate_id = format!("candidate-{}", Uuid::new_v4());
     let worktree_path = config
         .service
         .data_dir
         .join("protection/worktrees")
-        .join(&candidate_id);
+        .join(candidate_id);
     fs::create_dir_all(worktree_path.parent().context("候选 worktree 缺少父目录")?)?;
     let worktree = worktree_path.to_string_lossy().to_string();
     let base = main_git
@@ -324,7 +368,7 @@ fn prepare_candidate(
     let content_sha256 = hex_digest(patch.as_bytes());
     let now = Utc::now().to_rfc3339();
     let candidate = CandidateArtifact {
-        id: candidate_id.clone(),
+        id: candidate_id.to_string(),
         finding_id: finding.id.clone(),
         worktree_path: worktree,
         content_sha256,
@@ -333,7 +377,7 @@ fn prepare_candidate(
     };
     let verification = VerificationResult {
         id: format!("verification-{candidate_id}"),
-        candidate_id,
+        candidate_id: candidate_id.to_string(),
         verifier: "static-gate+sandbox-tests+commit-review+fix-contract".to_string(),
         passed: true,
         summary: "候选通过静态门禁、沙箱测试、逐提交审计和独立安全契约验证".to_string(),
@@ -344,6 +388,59 @@ fn prepare_candidate(
         created_at: now,
     };
     Ok((candidate, verification))
+}
+
+/// 失败候选也必须可追踪；保留隔离 worktree 和失败验证，绝不把异常吞掉后继续投送。
+fn failed_candidate_artifacts(
+    config: &Config,
+    finding: &ProtectionFinding,
+    decision: &SignalInvestigationDecision,
+    candidate_id: &str,
+    error: &str,
+) -> (CandidateArtifact, VerificationResult) {
+    let worktree_path = config
+        .service
+        .data_dir
+        .join("protection/worktrees")
+        .join(candidate_id);
+    let patch = if worktree_path.is_dir() {
+        let git = Git::new(&worktree_path);
+        let subject = git
+            .run_git(&["log", "-1", "--pretty=%s"])
+            .ok()
+            .map(|output| output.stdout.trim().to_string());
+        let args = if subject.as_deref() == Some("security candidate") {
+            vec!["show", "--format=", "--patch", "HEAD"]
+        } else {
+            vec!["diff", "--patch", "HEAD"]
+        };
+        git.run_git(&args)
+            .ok()
+            .map(|output| output.stdout)
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let now = Utc::now().to_rfc3339();
+    (
+        CandidateArtifact {
+            id: candidate_id.to_string(),
+            finding_id: finding.id.clone(),
+            worktree_path: worktree_path.to_string_lossy().to_string(),
+            content_sha256: hex_digest(patch.as_bytes()),
+            summary: format!("候选未通过门禁：{}；{}", decision.candidate_summary, error),
+            created_at: now.clone(),
+        },
+        VerificationResult {
+            id: format!("verification-{candidate_id}"),
+            candidate_id: candidate_id.to_string(),
+            verifier: "candidate-pipeline-failed-closed".to_string(),
+            passed: false,
+            summary: error.to_string(),
+            evidence: vec!["测试、推送、发布和部署均未获得授权".to_string()],
+            created_at: now,
+        },
+    )
 }
 
 fn tracked_regular_files(git: &Git) -> Result<Vec<String>> {

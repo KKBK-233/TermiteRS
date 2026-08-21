@@ -3,11 +3,12 @@ use std::{env, path::Path};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use reqwest::blocking::Client;
+use ring::digest::{SHA256, digest};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    DeliveryDraft, DeliveryKind, DeliveryReceipt, EvaluatedSecurityReview, ProtectionFinding,
-    ProtectionStore, StaticScanReport,
+    CandidateArtifact, DeliveryDraft, DeliveryKind, DeliveryReceipt, EvaluatedSecurityReview,
+    ProtectionFinding, ProtectionStore, StaticScanReport, VerificationResult,
 };
 
 const GITHUB_API_BASE: &str = "https://api.github.com";
@@ -103,6 +104,53 @@ pub fn prepare_security_review_issue_draft(
         body,
         labels: vec!["security".to_string(), "termiters".to_string()],
         dedupe_key: format!("github-review-issue:{}", finding.dedupe_key),
+        approval_required: true,
+        created_at: Utc::now().to_rfc3339(),
+    })
+}
+
+/// 外部安全消息确认受影响后准备最小披露草稿，完整攻击证据仍留在本地 Finding。
+pub fn prepare_signal_issue_draft(
+    finding: &ProtectionFinding,
+    repository: impl Into<String>,
+    candidate: Option<&CandidateArtifact>,
+    verification: Option<&VerificationResult>,
+) -> Option<DeliveryDraft> {
+    if finding.affected != Some(true) {
+        return None;
+    }
+    let destination = repository.into();
+    let mut body = format!(
+        "TermiteRS 确认项目受到外部安全消息影响，并停止了自动投送。\n\n项目：{}\n等级：{}\n摘要：{}\n",
+        finding.project, finding.severity, finding.summary
+    );
+    if let Some(candidate) = candidate {
+        body.push_str(&format!(
+            "\n隔离候选：已准备\n候选内容 SHA-256：{}\n候选摘要：{}\n",
+            candidate.content_sha256, candidate.summary
+        ));
+    }
+    if let Some(verification) = verification {
+        body.push_str(&format!(
+            "验证状态：{}\n验证摘要：{}\n",
+            if verification.passed {
+                "通过"
+            } else {
+                "失败"
+            },
+            verification.summary
+        ));
+    }
+    body.push_str("\n完整证据保存在 TermiteRS 本地；公开前必须人工确认披露范围。\n");
+    Some(DeliveryDraft {
+        id: format!("draft-signal-{}", &stable_hash(&finding.dedupe_key)[..32]),
+        finding_id: finding.id.clone(),
+        kind: DeliveryKind::GithubIssue,
+        destination,
+        title: format!("[安全候选] {} 需要人工投送", finding.project),
+        body,
+        labels: vec!["security".to_string(), "termiters".to_string()],
+        dedupe_key: format!("github-signal-issue:{}", finding.dedupe_key),
         approval_required: true,
         created_at: Utc::now().to_rfc3339(),
     })
@@ -238,6 +286,14 @@ fn validate_repository(repository: &str) -> Result<()> {
         "非法 GitHub 仓库：{repository}"
     );
     Ok(())
+}
+
+fn stable_hash(value: &str) -> String {
+    digest(&SHA256, value.as_bytes())
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[cfg(test)]
