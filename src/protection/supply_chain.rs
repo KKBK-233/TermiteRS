@@ -214,6 +214,7 @@ pub(super) fn inspect_build_script(
         "powershell",
         "pwsh",
         "cmd.exe",
+        "command::new(\"cmd\")",
         "wscript",
         "cscript",
         "invoke-webrequest",
