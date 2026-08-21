@@ -13,8 +13,8 @@ use crate::config::{LlmConfig, LlmProvider};
 use crate::conflict::{ConflictResolution, extract_conflict_blocks};
 use crate::git::{ConflictFileContent, ConflictSnapshot, SyncPatchContext};
 use crate::protection::{
-    FixContract, SecurityContractVerificationDecision, SecurityReviewDecision, SignalFileSelection,
-    SignalInvestigationDecision,
+    CargoReachabilitySnapshot, FixContract, SecurityContractVerificationDecision,
+    SecurityReviewDecision, SignalFileSelection, SignalInvestigationDecision,
 };
 use crate::report::SyncReport;
 use crate::text::truncate_to_char_boundary;
@@ -110,7 +110,7 @@ const SIGNAL_INVESTIGATION_SYSTEM_PROMPT: &str = r#"你是受控安全补丁工�
 
 categories 只能使用：remote-code-execution, command-injection, code-injection, server-side-request-forgery, authentication-bypass, authorization-bypass, signature-bypass, proof-verification-bypass, arbitrary-file-read, arbitrary-file-write, path-traversal, unsafe-deserialization, secret-or-key-disclosure, supply-chain-malware, consensus-safety, unauthorized-upgrade, permanent-service-halt, resource-exhaustion, information-disclosure, other。无法归类时使用 other，禁止发明新枚举。recommended_action 只能使用输出格式列出的七个枚举。
 
-review 使用与安全提交审计相同字段。若 affected=true 且需要修复，必须提供 fix_contract 和至少一个回归用例；changes 只能修改证据中已有文件，每项包含完整 content。只输出 JSON：{"review":{"security_fix_detected":true|false,"introduced_risk":false,"severity":"p0|p1|p2|p3|informational","categories":[],"affected":true|false|null,"production_reachable":true|false|null,"confidence":"high|medium|low","summary":"中文摘要","mechanism":"触发机制","evidence":["证据"],"fix_contract":null|{"security_property":"属性","vulnerable_behavior":"修复前","fixed_behavior":"修复后","attack_preconditions":[],"regression_cases":[]}},"recommended_action":"keep-current|pin-version|apply-upstream-patch|upgrade-version|local-security-patch|configuration-mitigation|disable-feature","candidate_summary":"中文摘要","changes":[{"path":"相对路径","content":"完整内容","reason":"理由"}]}"#;
+ review 使用与安全提交审计相同字段。affected_packages 只写公告实际指向的包名；Cargo 图只证明构建依赖，不能据此声称生产运行时可达。若 affected=true 且需要修复，必须将 security_fix_detected 设为 true，并提供 fix_contract 和至少一个回归用例；changes 只能修改证据中已有文件，每项包含完整 content。只输出 JSON：{"review":{"security_fix_detected":true|false,"introduced_risk":false,"severity":"p0|p1|p2|p3|informational","categories":[],"affected":true|false|null,"production_reachable":true|false|null,"confidence":"high|medium|low","summary":"中文摘要","mechanism":"触发机制","evidence":["证据"],"fix_contract":null|{"security_property":"属性","vulnerable_behavior":"修复前","fixed_behavior":"修复后","attack_preconditions":[],"regression_cases":[]}},"affected_packages":["精确包名"],"recommended_action":"keep-current|pin-version|apply-upstream-patch|upgrade-version|local-security-patch|configuration-mitigation|disable-feature","candidate_summary":"中文摘要","changes":[{"path":"相对路径","content":"完整内容","reason":"理由"}]}"#;
 
 #[derive(Debug, Clone)]
 pub struct SecurityReviewRequest {
@@ -139,6 +139,7 @@ pub struct SignalFileSelectionRequest {
     pub signal_reference: Option<String>,
     pub signal_content: String,
     pub tracked_files: Vec<String>,
+    pub cargo_reachability: Option<CargoReachabilitySnapshot>,
 }
 
 #[derive(Debug, Clone)]
@@ -149,6 +150,7 @@ pub struct SignalInvestigationRequest {
     pub signal_reference: Option<String>,
     pub signal_content: String,
     pub file_evidence: Vec<(String, String)>,
+    pub cargo_reachability: Option<CargoReachabilitySnapshot>,
 }
 
 #[derive(Debug, Clone)]
@@ -387,6 +389,7 @@ impl LlmService {
             "signal_reference": request.signal_reference,
             "signal_content": request.signal_content,
             "tracked_files": request.tracked_files,
+            "cargo_reachability": request.cargo_reachability,
         }))?;
         let prompt =
             format!("<untrusted_evidence encoding=\"json\">{evidence}</untrusted_evidence>");
@@ -419,6 +422,7 @@ impl LlmService {
             "signal_reference": request.signal_reference,
             "signal_content": request.signal_content,
             "selected_files": request.file_evidence,
+            "cargo_reachability": request.cargo_reachability,
         }))?;
         let prompt =
             format!("<untrusted_evidence encoding=\"json\">{evidence}</untrusted_evidence>");

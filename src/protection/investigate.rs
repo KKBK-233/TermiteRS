@@ -21,8 +21,9 @@ use super::{
     CandidateArtifact, CommitSecurityReviewBatch, EvaluatedSecurityReview, FindingState,
     ProtectionFinding, ProtectionStore, RemediationPlan, SecurityCategory, SecurityDisposition,
     SecuritySeverity, SecuritySignal, SecuritySignalSource, SignalFileSelection,
-    SignalInvestigationDecision, VerificationResult, enforce_prebuild_gate, policy_fingerprint,
-    run_commit_security_reviews, verify_required_contracts,
+    SignalInvestigationDecision, VerificationResult, cargo_reachability_snapshot,
+    enforce_prebuild_gate, policy_fingerprint, run_commit_security_reviews,
+    verify_required_contracts,
 };
 
 const MAX_SIGNAL_BYTES: usize = 64 * 1024;
@@ -59,6 +60,7 @@ pub fn investigate_security_signal(
     git.ensure_repo()?;
     let project = configured_project_name(config);
     let tracked_files = tracked_regular_files(&git)?;
+    let cargo_reachability = cargo_reachability_snapshot(&config.repo.path)?;
     let selection = llm
         .select_signal_files(&SignalFileSelectionRequest {
             project: project.clone(),
@@ -67,6 +69,7 @@ pub fn investigate_security_signal(
             signal_reference: reference.map(ToOwned::to_owned),
             signal_content: content.to_string(),
             tracked_files: tracked_files.clone(),
+            cargo_reachability: cargo_reachability.clone(),
         })?
         .context("DS 未返回安全消息取证文件选择")?;
     let file_evidence = read_selected_files(&config.repo.path, &tracked_files, &selection)?;
@@ -78,6 +81,7 @@ pub fn investigate_security_signal(
             signal_reference: reference.map(ToOwned::to_owned),
             signal_content: content.to_string(),
             file_evidence,
+            cargo_reachability: cargo_reachability.clone(),
         })?
         .context("DS 未返回安全消息调查结论")?;
 
@@ -115,7 +119,13 @@ pub fn investigate_security_signal(
         affected: decision.review.affected,
         build_allowed: !requires_action && decision.review.affected == Some(false),
         summary: decision.review.summary.clone(),
-        evidence: decision.review.evidence.clone(),
+        evidence: decision
+            .review
+            .evidence
+            .iter()
+            .cloned()
+            .chain(dependency_evidence(&decision, cargo_reachability.as_ref()))
+            .collect(),
         dedupe_key: format!("finding-user:{dedupe}"),
         created_at: now.clone(),
         updated_at: now.clone(),
@@ -506,6 +516,45 @@ fn requires_remediation(config: &Config, decision: &SignalInvestigationDecision)
             .iter()
             .any(|profile| profile == "strict")
             && decision.review.severity == SecuritySeverity::P2)
+}
+
+fn dependency_evidence(
+    decision: &SignalInvestigationDecision,
+    snapshot: Option<&crate::protection::CargoReachabilitySnapshot>,
+) -> Vec<String> {
+    if decision.affected_packages.is_empty() {
+        return Vec::new();
+    }
+    let Some(snapshot) = snapshot else {
+        return vec!["程序化依赖证据：项目没有可解析的 Cargo.lock 依赖图".to_string()];
+    };
+    let mut evidence = Vec::new();
+    for claimed in &decision.affected_packages {
+        let normalized = claimed.trim().to_ascii_lowercase().replace('_', "-");
+        let versions = snapshot
+            .reachable_packages
+            .iter()
+            .filter(|package| package.name.to_ascii_lowercase().replace('_', "-") == normalized)
+            .map(|package| package.version.as_str())
+            .collect::<Vec<_>>();
+        if versions.is_empty() {
+            evidence.push(format!(
+                "程序化依赖证据：{claimed} 不在 Cargo.lock 根包依赖闭包中"
+            ));
+        } else {
+            evidence.push(format!(
+                "程序化依赖证据：{claimed} 进入 Cargo.lock 根包依赖闭包，版本 {}；这不等同于生产运行时可达",
+                versions.join(",")
+            ));
+        }
+    }
+    if !snapshot.ambiguous_edges.is_empty() {
+        evidence.push(format!(
+            "程序化依赖证据：存在 {} 条无法唯一解析的锁文件边，按保守结果处理",
+            snapshot.ambiguous_edges.len()
+        ));
+    }
+    evidence
 }
 
 fn configured_project_name(config: &Config) -> String {
