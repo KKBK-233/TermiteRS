@@ -100,6 +100,33 @@ pub enum Commands {
         #[arg(short, long, default_value = "termite.yml")]
         config: PathBuf,
     },
+
+    /// 追踪个人 PR、CI 与审查状态。
+    Watch {
+        #[command(subcommand)]
+        action: WatchCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WatchCommands {
+    /// 立即执行一次只读采集并保存状态变化。
+    Scan {
+        #[arg(short, long, default_value = "termite.yml")]
+        config: PathBuf,
+    },
+    /// 显示最近一次采集的个人事项状态。
+    Status {
+        #[arg(short, long, default_value = "termite.yml")]
+        config: PathBuf,
+    },
+    /// 显示已去重的状态变化事件。
+    Events {
+        #[arg(short, long, default_value = "termite.yml")]
+        config: PathBuf,
+        #[arg(short, long, default_value_t = 20)]
+        limit: usize,
+    },
 }
 
 #[derive(Debug, Subcommand)]

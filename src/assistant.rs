@@ -9,6 +9,7 @@ use crate::daemon::Daemon;
 use crate::doctor::Doctor;
 use crate::llm::LlmService;
 use crate::sync::{SyncOptions, SyncRunner};
+use crate::watch::{WatchRunner, render_events, render_scan_report, render_status};
 
 const MAX_HISTORY_MESSAGES: usize = 12;
 
@@ -72,6 +73,9 @@ impl Assistant {
                     self.run_daemon()?;
                     return Ok(());
                 }
+                "/watch" => self.run_watch_scan()?,
+                "/watch-status" => self.run_watch_status()?,
+                "/watch-events" => self.run_watch_events()?,
                 _ => {
                     if !self.try_handle_local_action(input, &mut history)? {
                         self.reply_to_user(input, &mut history)?;
@@ -137,6 +141,24 @@ impl Assistant {
         println!("正在启动常驻核心进程。停止请按 Ctrl+C。");
         let config = Config::read_from(&self.config_path)?;
         Daemon::new(config, false, false).run()
+    }
+
+    fn run_watch_scan(&self) -> Result<()> {
+        let runner = WatchRunner::new(Config::read_from(&self.config_path)?);
+        println!("{}", render_scan_report(&runner.scan()?));
+        Ok(())
+    }
+
+    fn run_watch_status(&self) -> Result<()> {
+        let runner = WatchRunner::new(Config::read_from(&self.config_path)?);
+        println!("{}", render_status(&runner.status()?));
+        Ok(())
+    }
+
+    fn run_watch_events(&self) -> Result<()> {
+        let runner = WatchRunner::new(Config::read_from(&self.config_path)?);
+        println!("{}", render_events(&runner.events(20)?));
+        Ok(())
     }
 
     fn reply_to_user(&self, input: &str, history: &mut Vec<ConversationMessage>) -> Result<()> {
@@ -284,6 +306,9 @@ fn print_help() {
     println!("  /status  查看分支状态");
     println!("  /once    运行一次 daemon 同步并退出本次同步");
     println!("  /daemon  启动常驻核心进程");
+    println!("  /watch   立即刷新个人 PR / CI 状态");
+    println!("  /watch-status 查看最近一次个人事项快照");
+    println!("  /watch-events 查看最近的状态变化事件");
     println!("  /clear   清空当前助理会话上下文");
     println!("  /exit    退出助理");
     println!();
