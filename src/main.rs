@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
 use TermiteRS::assistant::Assistant;
-use TermiteRS::cli::{Cli, Commands, ProtectionCommands};
+use TermiteRS::cli::{Cli, Commands, ProtectionCommands, WatchCommands};
 use TermiteRS::config::Config;
 use TermiteRS::daemon::Daemon;
 use TermiteRS::doctor::Doctor;
@@ -16,6 +16,7 @@ use TermiteRS::protection::{
 };
 use TermiteRS::service;
 use TermiteRS::sync::{SyncOptions, SyncRunner};
+use TermiteRS::watch::{WatchRunner, render_events, render_scan_report, render_status};
 
 fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
@@ -196,6 +197,20 @@ fn main() -> Result<()> {
         Commands::Serve { config } => {
             service::run(config)?;
         }
+        Commands::Watch { action } => match action {
+            WatchCommands::Scan { config } => {
+                let report = WatchRunner::new(Config::read_from(config)?).scan()?;
+                println!("{}", render_scan_report(&report));
+            }
+            WatchCommands::Status { config } => {
+                let runner = WatchRunner::new(Config::read_from(config)?);
+                println!("{}", render_status(&runner.status()?));
+            }
+            WatchCommands::Events { config, limit } => {
+                let runner = WatchRunner::new(Config::read_from(config)?);
+                println!("{}", render_events(&runner.events(limit)?));
+            }
+        },
     }
 
     Ok(())

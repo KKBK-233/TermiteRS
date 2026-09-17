@@ -25,6 +25,7 @@ TermiteRS 的主场景是个人自用定制分支长期跟随上游，不是多�
 
 - 拉取上游和 fork 远端。
 - 按配置维护多个分支。
+- 只读追踪个人 GitHub PR、CI 与审查状态，使用 SQLite 保存快照和去重事件。
 - 支持 `rebase` 或 `merge` 到上游基线。
 - 每个分支可配置独立测试命令。
 - 同步成功后推送到 fork。
@@ -182,13 +183,23 @@ cargo run -- daemon --config termite.yml
 
 daemon 自动触发的周期检查只有在出现上游更新、推送变更、失败或冲突时才发送邮件；如果只是无变化自检，不会发邮件。
 
+个人事项追踪使用独立入口，不会触发分支同步：
+
+```powershell
+cargo run -- watch scan --config termite.yml
+cargo run -- watch status --config termite.yml
+cargo run -- watch events --config termite.yml
+```
+
+首次 `watch scan` 只建立本机基线；之后仅为 head、CI、审查、合并状态或生命周期变化生成事件。`repositories` 为空时会通过已登录的 `gh` 动态发现 owner 下的未归档仓库。
+
 无参数启动会进入交互式 AI 助理入口：
 
 ```powershell
 cargo run
 ```
 
-在助理内可以输入 `/check` 执行 `doctor` 和 `sync --dry-run`，输入 `/sync` 执行 `doctor` 和正式同步，输入 `/daemon` 启动常驻核心，输入 `/once` 运行一次同步，输入 `/exit` 退出。
+在助理内可以输入 `/check` 执行 `doctor` 和 `sync --dry-run`，输入 `/sync` 执行 `doctor` 和正式同步，输入 `/daemon` 启动常驻核心，输入 `/once` 运行一次同步；个人事项使用 `/watch`、`/watch-status` 和 `/watch-events`；输入 `/exit` 退出。
 
 显式启动助理：
 
@@ -261,6 +272,15 @@ daemon:
   jitter_seconds: 120
   run_on_start: true
   max_consecutive_failures: 3
+
+watch:
+  enabled: false
+  data_dir: .termite/watch
+  interval_seconds: 600
+  github:
+    owner: D-Nine-Chain
+    author: KKBK-233
+    repositories: []
 ```
 
 项目保护配置只描述人的意图：

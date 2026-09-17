@@ -15,3 +15,4 @@ pub mod sandbox;
 pub mod service;
 pub mod sync;
 pub mod text;
+pub mod watch;

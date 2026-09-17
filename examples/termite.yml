@@ -54,6 +54,17 @@ daemon:
   run_on_start: true
   max_consecutive_failures: 3
 
+# 个人 PR / CI 追踪。首次扫描只建立基线，之后只记录状态变化。
+watch:
+  enabled: false
+  data_dir: .termite/watch
+  interval_seconds: 600
+  github:
+    owner: D-Nine-Chain
+    author: KKBK-233
+    # 留空时动态发现 owner 下的未归档仓库。
+    repositories: []
+
 llm:
   enabled: false
   provider: deep-seek
