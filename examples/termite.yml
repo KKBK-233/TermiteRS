@@ -78,6 +78,7 @@ autonomy:
     # 建议填写 Linear 用户 ID，而不是可能重名的显示名。
     linear_assignee: ""
   permissions:
+    local_read: allow
     github_read: allow
     linear_read: deny
     edit_code: ask

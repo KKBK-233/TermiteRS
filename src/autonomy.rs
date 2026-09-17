@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+pub mod local_task;
+
 /// 新自治流程的权限模式；原有显式 CLI 命令不受这里影响。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -27,6 +29,8 @@ impl PermissionMode {
 #[serde(deny_unknown_fields)]
 pub struct AutonomyPermissions {
     #[serde(default = "default_github_read")]
+    pub local_read: PermissionMode,
+    #[serde(default = "default_github_read")]
     pub github_read: PermissionMode,
     #[serde(default)]
     pub linear_read: PermissionMode,
@@ -49,6 +53,7 @@ pub struct AutonomyPermissions {
 impl Default for AutonomyPermissions {
     fn default() -> Self {
         Self {
+            local_read: default_github_read(),
             github_read: default_github_read(),
             linear_read: PermissionMode::Deny,
             edit_code: default_ask(),
@@ -109,6 +114,7 @@ pub enum AutonomyTarget<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutonomyAction {
+    LocalRead,
     GithubRead,
     LinearRead,
     EditCode,
@@ -121,7 +127,8 @@ pub enum AutonomyAction {
 }
 
 impl AutonomyAction {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
+        Self::LocalRead,
         Self::GithubRead,
         Self::LinearRead,
         Self::EditCode,
@@ -135,6 +142,7 @@ impl AutonomyAction {
 
     pub fn key(self) -> &'static str {
         match self {
+            Self::LocalRead => "local_read",
             Self::GithubRead => "github_read",
             Self::LinearRead => "linear_read",
             Self::EditCode => "edit_code",
@@ -151,6 +159,7 @@ impl AutonomyAction {
 impl AutonomyPermissions {
     fn mode(&self, action: AutonomyAction) -> PermissionMode {
         match action {
+            AutonomyAction::LocalRead => self.local_read,
             AutonomyAction::GithubRead => self.github_read,
             AutonomyAction::LinearRead => self.linear_read,
             AutonomyAction::EditCode => self.edit_code,
@@ -182,7 +191,10 @@ impl AutonomyConfig {
                 AutonomyTarget::Github { repository, author },
             ) => self.scope.github_matches(repository, author),
             (
-                AutonomyAction::EditCode | AutonomyAction::RunTests | AutonomyAction::LocalCommit,
+                AutonomyAction::LocalRead
+                | AutonomyAction::EditCode
+                | AutonomyAction::RunTests
+                | AutonomyAction::LocalCommit,
                 AutonomyTarget::Local { path },
             ) => self.scope.local_matches(path),
             (
@@ -301,6 +313,7 @@ mod tests {
         let config: AutonomyConfig = serde_yaml::from_str(
             r#"enabled: true
 permissions:
+  local_read: deny
   github_read: deny
   linear_read: allow
   edit_code: allow
@@ -313,6 +326,7 @@ permissions:
 "#,
         )
         .unwrap();
+        assert_eq!(config.gate(AutonomyAction::LocalRead), PermissionMode::Deny);
         assert_eq!(
             config.gate(AutonomyAction::GithubRead),
             PermissionMode::Deny
