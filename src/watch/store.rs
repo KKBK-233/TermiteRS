@@ -64,6 +64,7 @@ impl WatchStore {
                 fingerprint TEXT NOT NULL UNIQUE,
                 summary TEXT NOT NULL,
                 evidence_url TEXT NOT NULL,
+                evidence_json TEXT NOT NULL DEFAULT '[]',
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS watch_assessments (
@@ -79,6 +80,12 @@ impl WatchStore {
             );
             "#,
         )?;
+        if !column_exists(&connection, "watch_events", "evidence_json")? {
+            connection.execute(
+                "ALTER TABLE watch_events ADD COLUMN evidence_json TEXT NOT NULL DEFAULT '[]'",
+                [],
+            )?;
+        }
         Ok(Self { connection })
     }
 
@@ -145,6 +152,7 @@ impl WatchStore {
         kind: &str,
         summary: &str,
         evidence_url: &str,
+        evidence: &[String],
         event_material: &str,
     ) -> Result<Option<WatchEvent>> {
         let event_fingerprint = fingerprint(&format!(
@@ -158,10 +166,11 @@ impl WatchStore {
             fingerprint: event_fingerprint,
             summary: summary.to_string(),
             evidence_url: evidence_url.to_string(),
+            evidence: evidence.to_vec(),
             created_at: Utc::now().to_rfc3339(),
         };
         let changed = self.connection.execute(
-            "INSERT OR IGNORE INTO watch_events (id, task_id, entity_key, kind, fingerprint, summary, evidence_url, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT OR IGNORE INTO watch_events (id, task_id, entity_key, kind, fingerprint, summary, evidence_url, evidence_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 event.id,
                 event.task_id,
@@ -170,6 +179,7 @@ impl WatchStore {
                 event.fingerprint,
                 event.summary,
                 event.evidence_url,
+                serde_json::to_string(&event.evidence)?,
                 event.created_at
             ],
         )?;
@@ -205,9 +215,10 @@ impl WatchStore {
 
     pub fn events(&self, limit: usize) -> Result<Vec<WatchEvent>> {
         let mut statement = self.connection.prepare(
-            "SELECT id, task_id, entity_key, kind, fingerprint, summary, evidence_url, created_at FROM watch_events ORDER BY created_at DESC LIMIT ?1",
+            "SELECT id, task_id, entity_key, kind, fingerprint, summary, evidence_url, evidence_json, created_at FROM watch_events ORDER BY created_at DESC LIMIT ?1",
         )?;
         let rows = statement.query_map(params![limit as u64], |row| {
+            let evidence: String = row.get(7)?;
             Ok(WatchEvent {
                 id: row.get(0)?,
                 task_id: row.get(1)?,
@@ -216,7 +227,8 @@ impl WatchStore {
                 fingerprint: row.get(4)?,
                 summary: row.get(5)?,
                 evidence_url: row.get(6)?,
-                created_at: row.get(7)?,
+                evidence: json_vec(&evidence)?,
+                created_at: row.get(8)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -272,13 +284,14 @@ impl WatchStore {
 
     pub fn unassessed_events(&self, task_id: &str) -> Result<Vec<WatchEvent>> {
         let mut statement = self.connection.prepare(
-            r#"SELECT e.id, e.task_id, e.entity_key, e.kind, e.fingerprint, e.summary, e.evidence_url, e.created_at
+            r#"SELECT e.id, e.task_id, e.entity_key, e.kind, e.fingerprint, e.summary, e.evidence_url, e.evidence_json, e.created_at
                FROM watch_events e
                WHERE e.task_id = ?1
                  AND NOT EXISTS (SELECT 1 FROM watch_assessments a WHERE a.event_id = e.id)
                ORDER BY e.created_at"#,
         )?;
         let rows = statement.query_map(params![task_id], |row| {
+            let evidence: String = row.get(7)?;
             Ok(WatchEvent {
                 id: row.get(0)?,
                 task_id: row.get(1)?,
@@ -287,7 +300,8 @@ impl WatchStore {
                 fingerprint: row.get(4)?,
                 summary: row.get(5)?,
                 evidence_url: row.get(6)?,
-                created_at: row.get(7)?,
+                evidence: json_vec(&evidence)?,
+                created_at: row.get(8)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -519,6 +533,16 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<WatchTask> {
     })
 }
 
+fn json_vec(raw: &str) -> rusqlite::Result<Vec<String>> {
+    serde_json::from_str(raw).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            raw.len(),
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
 fn fingerprint(value: &str) -> String {
     digest(&SHA256, value.as_bytes())
         .as_ref()
@@ -562,12 +586,28 @@ mod tests {
             Some(snapshot)
         );
         let event = store
-            .insert_event("task-1", "owner/repo#7", "changed", "changed", "url", "v1")
+            .insert_event(
+                "task-1",
+                "owner/repo#7",
+                "changed",
+                "changed",
+                "url",
+                &["log".to_string()],
+                "v1",
+            )
             .unwrap()
             .unwrap();
         assert!(
             store
-                .insert_event("task-1", "owner/repo#7", "changed", "changed", "url", "v1")
+                .insert_event(
+                    "task-1",
+                    "owner/repo#7",
+                    "changed",
+                    "changed",
+                    "url",
+                    &["log".to_string()],
+                    "v1",
+                )
                 .unwrap()
                 .is_none()
         );
