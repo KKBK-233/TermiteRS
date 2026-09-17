@@ -94,6 +94,30 @@ pub struct WatchEvent {
     pub created_at: String,
 }
 
+/// 事件评估只产生只读建议；任何代码、GitHub 或 Linear 写操作仍需用户确认。
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WatchAssessmentPlan {
+    pub summary: String,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+    pub recommendation: String,
+    #[serde(default)]
+    pub requires_user_decision: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WatchAssessment {
+    pub id: String,
+    pub event_id: String,
+    pub task_id: String,
+    pub entity_key: String,
+    pub summary: String,
+    pub evidence: Vec<String>,
+    pub recommendation: String,
+    pub requires_user_decision: bool,
+    pub created_at: String,
+}
+
 /// 模型只负责把自然语言转换成受限任务计划；程序负责校验和执行。
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct WatchTaskPlan {
@@ -138,4 +162,5 @@ pub struct WatchScanReport {
     pub initial_baseline: bool,
     pub warnings: Vec<String>,
     pub pull_requests: Vec<PullRequestSnapshot>,
+    pub events: Vec<WatchEvent>,
 }
