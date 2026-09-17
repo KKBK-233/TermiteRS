@@ -176,6 +176,10 @@ fn main() -> Result<()> {
             let report = SyncRunner::new(config, SyncOptions::status_only()).status()?;
             println!("{}", report.render_text());
         }
+        Commands::Permissions { config } => {
+            let config = Config::read_from(config)?;
+            println!("{}", config.autonomy.render());
+        }
         Commands::Doctor { config } => {
             let config = Config::read_from(config)?;
             println!("{}", Doctor::new(config).run());

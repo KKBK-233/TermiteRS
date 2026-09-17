@@ -101,6 +101,12 @@ pub enum Commands {
         config: PathBuf,
     },
 
+    /// 查看新增自治流程的有效权限，不执行任何动作。
+    Permissions {
+        #[arg(short, long, default_value = "termite.yml")]
+        config: PathBuf,
+    },
+
     /// 追踪个人 PR、CI 与审查状态。
     Watch {
         #[command(subcommand)]

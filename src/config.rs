@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::autonomy::AutonomyConfig;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub repo: RepoConfig,
@@ -21,6 +23,8 @@ pub struct Config {
     pub protection: ProtectionConfig,
     #[serde(default)]
     pub watch: WatchConfig,
+    #[serde(default)]
+    pub autonomy: AutonomyConfig,
 }
 
 /// 个人事项追踪配置。首版只读取 GitHub，并把状态变化落到本机数据库。

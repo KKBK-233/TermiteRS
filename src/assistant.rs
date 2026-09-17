@@ -75,6 +75,7 @@ impl Assistant {
                 "/sync" => self.run_sync()?,
                 "/doctor" => self.run_doctor()?,
                 "/status" => self.run_status()?,
+                "/permissions" => self.run_permissions()?,
                 "/once" => self.run_daemon_once()?,
                 "/daemon" => {
                     self.run_daemon()?;
@@ -104,6 +105,12 @@ impl Assistant {
         let config = Config::read_from(&self.config_path)?;
         let report = SyncRunner::new(config, SyncOptions::status_only()).status()?;
         println!("{}", report.render_text());
+        Ok(())
+    }
+
+    fn run_permissions(&self) -> Result<()> {
+        let config = Config::read_from(&self.config_path)?;
+        println!("{}", config.autonomy.render());
         Ok(())
     }
 
@@ -426,6 +433,7 @@ fn print_help() {
     println!("  /sync    执行 doctor 和 sync");
     println!("  /doctor  检查 Git、SSH、远端和推送权限");
     println!("  /status  查看分支状态");
+    println!("  /permissions 查看自治流程的有效权限");
     println!("  /once    运行一次 daemon 同步并退出本次同步");
     println!("  /daemon  启动常驻核心进程");
     println!("  /watch   立即刷新个人 PR / CI 状态");

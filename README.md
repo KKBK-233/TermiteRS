@@ -192,6 +192,7 @@ cargo run -- watch events --config termite.yml
 cargo run -- watch tasks --config termite.yml
 cargo run -- watch run-once --config termite.yml
 cargo run -- watch assessments --config termite.yml
+cargo run -- permissions --config termite.yml
 ```
 
 首次 `watch scan` 只建立本机基线；之后仅为 head、CI、审查、合并状态或生命周期变化生成事件。`repositories` 为空时会通过已登录的 `gh` 动态发现 owner 下的未归档仓库。
@@ -202,7 +203,7 @@ cargo run -- watch assessments --config termite.yml
 cargo run
 ```
 
-在助理内可以输入 `/check` 执行 `doctor` 和 `sync --dry-run`，输入 `/sync` 执行 `doctor` 和正式同步，输入 `/daemon` 启动常驻核心，输入 `/once` 运行一次同步；个人事项使用 `/watch`、`/watch-status`、`/watch-events` 和 `/watch-tasks`；输入 `/exit` 退出。
+在助理内可以输入 `/check` 执行 `doctor` 和 `sync --dry-run`，输入 `/sync` 执行 `doctor` 和正式同步，输入 `/daemon` 启动常驻核心，输入 `/once` 运行一次同步；个人事项使用 `/watch`、`/watch-status`、`/watch-events` 和 `/watch-tasks`；输入 `/permissions` 查看自治动作的有效权限，`/exit` 退出。
 
 原有命令保持兼容。助理窗口现在也接受“持续盯着我的 D9 PR，CI 或审查状态变化时记录下来，每十分钟检查一次”这样的自然语言。模型只生成受限任务计划，Rust 核心校验 GitHub 范围、间隔并持久化；窗口保持打开时，调度器会自动执行到期任务。状态变化会按需补取有限的新评论、审查线程和失败日志，并进入只读评估队列；外部正文始终按不可信证据处理，限制总量且清理终端控制字符。使用 `/watch-decisions` 查看评估；需要改代码、推送、回复、合并或写 Linear 的建议一定标为“待判断”。可使用 `/watch-pause <名称>` 和 `/watch-resume <名称>` 控制任务，不会写入 GitHub 或触发分支同步。
 
@@ -286,7 +287,28 @@ watch:
     owner: D-Nine-Chain
     author: KKBK-233
     repositories: []
+
+autonomy:
+  enabled: false
+  scope:
+    github_owners: [D-Nine-Chain]
+    github_repositories: []
+    github_author: KKBK-233
+    local_repositories: []
+    linear_assignee: ""
+  permissions:
+    github_read: allow
+    linear_read: deny
+    edit_code: ask
+    run_tests: ask
+    local_commit: ask
+    push_branch: deny
+    github_reply: deny
+    linear_write: deny
+    merge_pr: deny
 ```
+
+`autonomy` 只约束新增自治流程，不改变已有显式 `sync`、`daemon`、`watch` 命令。`deny` 禁止该动作，`ask` 到执行点暂停等用户决定，`allow` 允许自动执行；总开关默认关闭。每个动作独立配置，模型输出和 GitHub/Linear 正文都不能修改权限。即使设为 `allow`，具体目标仍必须同时匹配 `scope`：GitHub 仓库和 PR 作者、Linear 负责人或解析后的本地仓库绝对路径。空范围不表示“全部”。当前版本只提供配置解析、查询和统一判断入口，尚未接通自治写操作执行器；把某项改成 `allow` 不会立刻推送、回复或合并。
 
 项目保护配置只描述人的意图：
 

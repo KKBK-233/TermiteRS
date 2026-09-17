@@ -65,6 +65,29 @@ watch:
     # 留空时动态发现 owner 下的未归档仓库。
     repositories: []
 
+# 新自治流程的动作权限。总开关默认关闭；deny 禁止，ask 停下等待确认，allow 允许自动执行。
+# 这不会改变已有 sync、daemon、watch 等显式命令的行为。
+autonomy:
+  enabled: false
+  scope:
+    github_owners: [D-Nine-Chain]
+    github_repositories: []
+    github_author: KKBK-233
+    # 只列出允许自治处理的现有仓库绝对路径；空列表表示不授权本地仓库动作。
+    local_repositories: []
+    # 建议填写 Linear 用户 ID，而不是可能重名的显示名。
+    linear_assignee: ""
+  permissions:
+    github_read: allow
+    linear_read: deny
+    edit_code: ask
+    run_tests: ask
+    local_commit: ask
+    push_branch: deny
+    github_reply: deny
+    linear_write: deny
+    merge_pr: deny
+
 llm:
   enabled: false
   provider: deep-seek
