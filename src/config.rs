@@ -19,6 +19,34 @@ pub struct Config {
     pub service: ServiceConfig,
     #[serde(default)]
     pub protection: ProtectionConfig,
+    #[serde(default)]
+    pub watch: WatchConfig,
+}
+
+/// 个人事项追踪配置。首版只读取 GitHub，并把状态变化落到本机数据库。
+#[derive(Debug, Clone, Deserialize)]
+pub struct WatchConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_watch_data_dir")]
+    pub data_dir: PathBuf,
+    #[serde(default = "default_watch_interval_seconds")]
+    pub interval_seconds: u64,
+    #[serde(default)]
+    pub github: WatchGithubConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct WatchGithubConfig {
+    /// GitHub 组织或个人账号；repositories 为空时从这里动态发现仓库。
+    #[serde(default)]
+    pub owner: String,
+    /// 只追踪该作者创建的 PR；为空时读取当前 gh 登录身份。
+    #[serde(default)]
+    pub author: String,
+    /// 可填写 owner/name；只填 name 时自动使用 owner 补全。
+    #[serde(default)]
+    pub repositories: Vec<String>,
 }
 
 /// 项目保护配置只描述人的安全意图，具体硬门禁由程序内置规则负责。
@@ -389,6 +417,17 @@ impl Default for DaemonConfig {
     }
 }
 
+impl Default for WatchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            data_dir: default_watch_data_dir(),
+            interval_seconds: default_watch_interval_seconds(),
+            github: WatchGithubConfig::default(),
+        }
+    }
+}
+
 impl Default for AutoResolveConfig {
     fn default() -> Self {
         Self {
@@ -428,6 +467,14 @@ fn default_daemon_run_on_start() -> bool {
 
 fn default_daemon_max_consecutive_failures() -> u32 {
     3
+}
+
+fn default_watch_data_dir() -> PathBuf {
+    PathBuf::from(".termite/watch")
+}
+
+fn default_watch_interval_seconds() -> u64 {
+    600
 }
 
 impl Default for ServiceConfig {
