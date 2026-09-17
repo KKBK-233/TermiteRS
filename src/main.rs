@@ -16,7 +16,9 @@ use TermiteRS::protection::{
 };
 use TermiteRS::service;
 use TermiteRS::sync::{SyncOptions, SyncRunner};
-use TermiteRS::watch::{WatchRunner, render_events, render_scan_report, render_status};
+use TermiteRS::watch::{
+    WatchRunner, render_events, render_scan_report, render_status, render_tasks,
+};
 
 fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
@@ -209,6 +211,19 @@ fn main() -> Result<()> {
             WatchCommands::Events { config, limit } => {
                 let runner = WatchRunner::new(Config::read_from(config)?);
                 println!("{}", render_events(&runner.events(limit)?));
+            }
+            WatchCommands::Tasks { config } => {
+                let runner = WatchRunner::new(Config::read_from(config)?);
+                println!("{}", render_tasks(&runner.tasks()?));
+            }
+            WatchCommands::RunOnce { config } => {
+                let runner = WatchRunner::new(Config::read_from(config)?);
+                let results = runner.run_due_tasks()?;
+                if results.is_empty() {
+                    println!("没有到期的持续任务。");
+                } else {
+                    println!("{}", results.join("\n"));
+                }
             }
         },
     }

@@ -127,6 +127,16 @@ pub enum WatchCommands {
         #[arg(short, long, default_value_t = 20)]
         limit: usize,
     },
+    /// 显示自然语言创建的持续任务。
+    Tasks {
+        #[arg(short, long, default_value = "termite.yml")]
+        config: PathBuf,
+    },
+    /// 立即执行所有到期的持续任务，供脚本和本机验收使用。
+    RunOnce {
+        #[arg(short, long, default_value = "termite.yml")]
+        config: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
