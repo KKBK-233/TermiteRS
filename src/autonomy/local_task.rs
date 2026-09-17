@@ -13,7 +13,7 @@ use crate::{config::Config, git::Git};
 use super::{AutonomyAction, AutonomyTarget, PermissionMode};
 
 const MAX_STEPS: usize = 8;
-const MAX_FILE_BYTES: u64 = 24 * 1024;
+const MAX_FILE_BYTES: u64 = 48 * 1024;
 const MAX_OBSERVATION_BYTES: usize = 12 * 1024;
 
 /// JSON 动作协议没有命令字段；测试只能引用可信配置中的序号。
@@ -224,7 +224,10 @@ fn read_tracked_file(git: &Git, root: &Path, path: &str) -> Result<String> {
         metadata.file_type().is_file() && metadata.len() <= MAX_FILE_BYTES,
         "文件不是普通小文件"
     );
-    ensure!(full.canonicalize()?.starts_with(root), "文件解析后越出仓库");
+    ensure!(
+        full.canonicalize()?.starts_with(root.canonicalize()?),
+        "文件解析后越出仓库"
+    );
     let content = fs::read_to_string(&full).with_context(|| format!("无法读取 {path}"))?;
     Ok(format!("文件 {path}：\n{content}"))
 }
@@ -311,6 +314,22 @@ mod tests {
         assert!(read_tracked_file(&git, &root, "src/private.rs").is_err());
         fs::write(root.join("src/untracked.rs"), "unknown").unwrap();
         assert!(read_tracked_file(&git, &root, "src/untracked.rs").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ordinary_readme_larger_than_old_limit_is_read_with_bounded_context() {
+        let (root, _) = fixture();
+        fs::write(root.join("README.md"), "说明\n".repeat(6_000)).unwrap();
+        let output = Command::new("git")
+            .args(["add", "README.md"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let content = bounded(read_tracked_file(&Git::new(&root), &root, "README.md").unwrap());
+        assert!(content.contains("[输出已截断]"));
+        assert!(content.len() < MAX_OBSERVATION_BYTES + 64);
         fs::remove_dir_all(root).unwrap();
     }
 
