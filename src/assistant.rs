@@ -9,7 +9,10 @@ use crate::daemon::Daemon;
 use crate::doctor::Doctor;
 use crate::llm::LlmService;
 use crate::sync::{SyncOptions, SyncRunner};
-use crate::watch::{WatchRunner, render_events, render_scan_report, render_status};
+use crate::watch::model::WatchTaskPlan;
+use crate::watch::{
+    WatchRunner, WatchSupervisor, render_events, render_scan_report, render_status, render_tasks,
+};
 
 const MAX_HISTORY_MESSAGES: usize = 12;
 
@@ -40,6 +43,9 @@ impl Assistant {
         print_agent_summary(Path::new("agents/termite-config/system.md"))?;
         println!();
 
+        // 交互窗口存活期间持续执行用户已保存的个人事项任务。
+        let supervisor_config = Config::read_from(&self.config_path)?;
+        let _watch_supervisor = WatchSupervisor::start(supervisor_config);
         let stdin = io::stdin();
         let mut history = Vec::new();
         loop {
@@ -76,6 +82,7 @@ impl Assistant {
                 "/watch" => self.run_watch_scan()?,
                 "/watch-status" => self.run_watch_status()?,
                 "/watch-events" => self.run_watch_events()?,
+                "/watch-tasks" => self.run_watch_tasks()?,
                 _ => {
                     if !self.try_handle_local_action(input, &mut history)? {
                         self.reply_to_user(input, &mut history)?;
@@ -151,7 +158,8 @@ impl Assistant {
 
     fn run_watch_status(&self) -> Result<()> {
         let runner = WatchRunner::new(Config::read_from(&self.config_path)?);
-        println!("{}", render_status(&runner.status()?));
+        println!("持续任务：\n{}", render_tasks(&runner.tasks()?));
+        println!("\n配置任务快照：\n{}", render_status(&runner.status()?));
         Ok(())
     }
 
@@ -159,6 +167,95 @@ impl Assistant {
         let runner = WatchRunner::new(Config::read_from(&self.config_path)?);
         println!("{}", render_events(&runner.events(20)?));
         Ok(())
+    }
+
+    fn run_watch_tasks(&self) -> Result<()> {
+        let runner = WatchRunner::new(Config::read_from(&self.config_path)?);
+        println!("{}", render_tasks(&runner.tasks()?));
+        Ok(())
+    }
+
+    fn create_watch_task_from_request(&self, input: &str) -> Result<()> {
+        let config = Config::read_from(&self.config_path)?;
+        let llm = LlmService::new(config.llm.clone());
+        let plan = llm
+            .plan_watch_task(
+                input,
+                &config.watch.github.owner,
+                &config.watch.github.author,
+                config.watch.interval_seconds,
+            )?
+            .unwrap_or_else(|| WatchTaskPlan {
+                action: "create".to_string(),
+                name: format!("{} 个人事项", config.watch.github.owner),
+                owner: config.watch.github.owner.clone(),
+                author: config.watch.github.author.clone(),
+                repositories: config.watch.github.repositories.clone(),
+                interval_seconds: config.watch.interval_seconds,
+                instructions: input.to_string(),
+            });
+        let runner = WatchRunner::new(config);
+        let task = runner.create_task(plan, input)?;
+        println!("已创建持续任务：{}", task.name);
+        println!(
+            "范围：{}；作者：{}；间隔：{} 秒",
+            task.owner,
+            if task.author.is_empty() {
+                "当前 gh 用户"
+            } else {
+                &task.author
+            },
+            task.interval_seconds
+        );
+        println!("约束：{}", task.instructions);
+        for result in runner.run_due_tasks()? {
+            println!("首次扫描：{result}");
+        }
+        Ok(())
+    }
+
+    fn try_change_watch_task_state(&self, input: &str) -> Result<bool> {
+        let explicit_pause = input.strip_prefix("/watch-pause ");
+        let explicit_resume = input.strip_prefix("/watch-resume ");
+        let state = if explicit_pause.is_some()
+            || ((input.contains("暂停") || input.contains("先停"))
+                && (input.contains("追踪") || input.contains("监控") || input.contains("任务")))
+        {
+            "paused"
+        } else if explicit_resume.is_some()
+            || ((input.contains("恢复") || input.contains("继续"))
+                && (input.contains("追踪") || input.contains("监控") || input.contains("任务")))
+        {
+            "active"
+        } else {
+            return Ok(false);
+        };
+
+        let runner = WatchRunner::new(Config::read_from(&self.config_path)?);
+        let tasks = runner.tasks()?;
+        let explicit_name = explicit_pause.or(explicit_resume).map(str::trim);
+        let matched = explicit_name
+            .and_then(|name| tasks.iter().find(|task| task.name == name))
+            .or_else(|| tasks.iter().find(|task| input.contains(&task.name)))
+            .or_else(|| (tasks.len() == 1).then(|| &tasks[0]));
+        let Some(task) = matched else {
+            println!(
+                "无法确定要修改的任务，请使用 /watch-tasks 查看名称，再输入 /watch-pause <名称> 或 /watch-resume <名称>。"
+            );
+            return Ok(true);
+        };
+        if runner.set_task_state(&task.name, state)? {
+            println!(
+                "已{}持续任务：{}",
+                if state == "paused" {
+                    "暂停"
+                } else {
+                    "恢复"
+                },
+                task.name
+            );
+        }
+        Ok(true)
     }
 
     fn reply_to_user(&self, input: &str, history: &mut Vec<ConversationMessage>) -> Result<()> {
@@ -197,6 +294,23 @@ impl Assistant {
         input: &str,
         history: &mut Vec<ConversationMessage>,
     ) -> Result<bool> {
+        if self.try_change_watch_task_state(input)? {
+            push_history(history, "user", input.to_string());
+            push_history(history, "assistant", "已更新持续任务状态。".to_string());
+            return Ok(true);
+        }
+
+        if wants_watch_task(input) {
+            push_history(history, "user", input.to_string());
+            self.create_watch_task_from_request(input)?;
+            push_history(
+                history,
+                "assistant",
+                "已创建并首次扫描持续任务。".to_string(),
+            );
+            return Ok(true);
+        }
+
         if wants_confirmed_sync(input, history) {
             push_history(history, "user", input.to_string());
             self.run_sync()?;
@@ -309,11 +423,27 @@ fn print_help() {
     println!("  /watch   立即刷新个人 PR / CI 状态");
     println!("  /watch-status 查看最近一次个人事项快照");
     println!("  /watch-events 查看最近的状态变化事件");
+    println!("  /watch-tasks 查看持续追踪任务");
+    println!("  /watch-pause <名称> 暂停持续任务");
+    println!("  /watch-resume <名称> 恢复持续任务");
     println!("  /clear   清空当前助理会话上下文");
     println!("  /exit    退出助理");
     println!();
     println!("自然语言示例：");
     println!("  我只想维护 my/ok-ww，自用分支，允许改远端历史，每小时检查一次。");
+    println!("  持续盯着我的 D9 PR，CI 或审查状态变化时记录下来，每十分钟检查一次。");
+}
+
+fn wants_watch_task(input: &str) -> bool {
+    let continuous = ["持续", "一直", "定时", "盯着", "监控", "追踪"]
+        .iter()
+        .any(|keyword| input.contains(keyword));
+    let subject = [
+        "PR", "pr", "CI", "ci", "GitHub", "github", "审查", "评论", "D9",
+    ]
+    .iter()
+    .any(|keyword| input.contains(keyword));
+    continuous && subject
 }
 
 fn print_agent_summary(path: &Path) -> Result<()> {
@@ -674,5 +804,11 @@ mod tests {
         }];
 
         assert!(wants_confirmed_sync("你直接上", &history));
+    }
+
+    #[test]
+    fn natural_language_watch_request_is_routed_locally() {
+        assert!(wants_watch_task("持续盯着我的 D9 PR，CI 出问题时记录下来"));
+        assert!(!wants_watch_task("帮我解释这个 CI 为什么失败"));
     }
 }

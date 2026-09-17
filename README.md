@@ -189,6 +189,8 @@ daemon 自动触发的周期检查只有在出现上游更新、推送变更、�
 cargo run -- watch scan --config termite.yml
 cargo run -- watch status --config termite.yml
 cargo run -- watch events --config termite.yml
+cargo run -- watch tasks --config termite.yml
+cargo run -- watch run-once --config termite.yml
 ```
 
 首次 `watch scan` 只建立本机基线；之后仅为 head、CI、审查、合并状态或生命周期变化生成事件。`repositories` 为空时会通过已登录的 `gh` 动态发现 owner 下的未归档仓库。
@@ -199,7 +201,9 @@ cargo run -- watch events --config termite.yml
 cargo run
 ```
 
-在助理内可以输入 `/check` 执行 `doctor` 和 `sync --dry-run`，输入 `/sync` 执行 `doctor` 和正式同步，输入 `/daemon` 启动常驻核心，输入 `/once` 运行一次同步；个人事项使用 `/watch`、`/watch-status` 和 `/watch-events`；输入 `/exit` 退出。
+在助理内可以输入 `/check` 执行 `doctor` 和 `sync --dry-run`，输入 `/sync` 执行 `doctor` 和正式同步，输入 `/daemon` 启动常驻核心，输入 `/once` 运行一次同步；个人事项使用 `/watch`、`/watch-status`、`/watch-events` 和 `/watch-tasks`；输入 `/exit` 退出。
+
+原有命令保持兼容。助理窗口现在也接受“持续盯着我的 D9 PR，CI 或审查状态变化时记录下来，每十分钟检查一次”这样的自然语言。模型只生成受限任务计划，Rust 核心校验 GitHub 范围、间隔并持久化；窗口保持打开时，调度器会自动执行到期任务。可使用 `/watch-pause <名称>` 和 `/watch-resume <名称>` 控制任务，不会写入 GitHub 或触发分支同步。
 
 显式启动助理：
 

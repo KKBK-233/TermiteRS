@@ -2,20 +2,69 @@ mod github;
 pub mod model;
 mod store;
 
-use std::collections::HashSet;
+use std::{
+    collections::HashSet,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::Duration,
+};
 
 use anyhow::Result;
+use chrono::Utc;
+use uuid::Uuid;
 
-use crate::config::Config;
+use crate::config::{Config, WatchGithubConfig};
 
 use self::{
     github::GithubCollector,
-    model::{PullRequestSnapshot, WatchEvent, WatchScanReport},
+    model::{PullRequestSnapshot, WatchEvent, WatchScanReport, WatchTask, WatchTaskPlan},
     store::WatchStore,
 };
 
 pub struct WatchRunner {
     config: Config,
+}
+
+pub struct WatchSupervisor {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl WatchSupervisor {
+    pub fn start(config: Config) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            let runner = WatchRunner::new(config);
+            while !thread_stop.load(Ordering::Relaxed) {
+                for _ in 0..10 {
+                    if thread_stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_secs(1));
+                }
+                if let Err(error) = runner.run_due_tasks() {
+                    eprintln!("watch 调度失败：{error:#}");
+                }
+            }
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for WatchSupervisor {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 impl WatchRunner {
@@ -25,17 +74,25 @@ impl WatchRunner {
 
     pub fn scan(&self) -> Result<WatchScanReport> {
         anyhow::ensure!(self.config.watch.enabled, "watch.enabled 尚未启用");
-        let collector = GithubCollector::new(self.config.watch.github.clone());
+        self.scan_scope("config", self.config.watch.github.clone())
+    }
+
+    fn scan_scope(
+        &self,
+        task_id: &str,
+        github_config: WatchGithubConfig,
+    ) -> Result<WatchScanReport> {
+        let collector = GithubCollector::new(github_config);
         let author = collector.current_user()?;
         let repositories = collector.repositories()?;
         let store = WatchStore::open(&self.config.watch.data_dir)?;
-        let initial_baseline = !store.initialized()?;
+        let initial_baseline = !store.initialized(task_id)?;
         let mut report = WatchScanReport {
             repositories_scanned: repositories.len(),
             initial_baseline,
             ..WatchScanReport::default()
         };
-        let previous_snapshots = store.snapshots()?;
+        let previous_snapshots = store.snapshots(task_id)?;
         let mut seen = HashSet::new();
         let mut successful_repositories = HashSet::new();
 
@@ -51,11 +108,12 @@ impl WatchRunner {
             for snapshot in pull_requests {
                 report.pull_requests_observed += 1;
                 seen.insert(snapshot.key());
-                if let Some(previous) = store.snapshot(&snapshot.key())? {
+                if let Some(previous) = store.snapshot(task_id, &snapshot.key())? {
                     if previous != snapshot {
                         let changes = describe_changes(&previous, &snapshot);
                         let material = serde_json::to_string(&snapshot)?;
                         if store.insert_event(
+                            task_id,
                             &snapshot.key(),
                             "github-pr-changed",
                             &changes,
@@ -67,6 +125,7 @@ impl WatchRunner {
                     }
                 } else if !initial_baseline
                     && store.insert_event(
+                        task_id,
                         &snapshot.key(),
                         "github-pr-discovered",
                         &format!("发现新的个人 PR：{}", snapshot.title),
@@ -76,7 +135,7 @@ impl WatchRunner {
                 {
                     report.events_created += 1;
                 }
-                store.upsert_snapshot(&snapshot)?;
+                store.upsert_snapshot(task_id, &snapshot)?;
                 report.pull_requests.push(snapshot);
             }
         }
@@ -109,6 +168,7 @@ impl WatchRunner {
                         lifecycle.title
                     );
                     if store.insert_event(
+                        task_id,
                         &previous.key(),
                         kind,
                         &summary,
@@ -117,7 +177,7 @@ impl WatchRunner {
                     )? {
                         report.events_created += 1;
                     }
-                    store.delete_snapshot(&previous.key())?;
+                    store.delete_snapshot(task_id, &previous.key())?;
                 }
                 Ok(_) => report.warnings.push(format!(
                     "{} 未出现在 open 列表但远端仍为 OPEN，已保留快照",
@@ -128,17 +188,126 @@ impl WatchRunner {
                     .push(format!("{} 无法确认关闭状态：{error:#}", previous.key())),
             }
         }
-        store.mark_initialized()?;
+        store.mark_initialized(task_id)?;
         Ok(report)
     }
 
     pub fn status(&self) -> Result<Vec<PullRequestSnapshot>> {
-        WatchStore::open(&self.config.watch.data_dir)?.snapshots()
+        WatchStore::open(&self.config.watch.data_dir)?.snapshots("config")
     }
 
     pub fn events(&self, limit: usize) -> Result<Vec<WatchEvent>> {
         WatchStore::open(&self.config.watch.data_dir)?.events(limit)
     }
+
+    pub fn create_task(&self, plan: WatchTaskPlan, prompt: &str) -> Result<WatchTask> {
+        anyhow::ensure!(plan.action == "create", "当前计划不是创建任务");
+        let owner = non_empty_or(plan.owner, &self.config.watch.github.owner);
+        anyhow::ensure!(!owner.is_empty(), "持续追踪任务需要 GitHub owner");
+        let author = non_empty_or(plan.author, &self.config.watch.github.author);
+        anyhow::ensure!(valid_github_name(&owner), "GitHub owner 格式无效");
+        anyhow::ensure!(
+            author.is_empty() || valid_github_name(&author),
+            "GitHub author 格式无效"
+        );
+        anyhow::ensure!(
+            plan.repositories
+                .iter()
+                .all(|repository| valid_repository(repository)),
+            "仓库必须使用 owner/name 格式"
+        );
+        let interval_seconds = if plan.interval_seconds == 0 {
+            self.config.watch.interval_seconds
+        } else {
+            plan.interval_seconds
+        };
+        anyhow::ensure!(
+            (60..=86_400).contains(&interval_seconds),
+            "追踪间隔必须在 60 到 86400 秒之间"
+        );
+        let name = if plan.name.trim().is_empty() {
+            format!("{owner} 个人事项")
+        } else {
+            plan.name.trim().to_string()
+        };
+        let now = Utc::now().to_rfc3339();
+        WatchStore::open(&self.config.watch.data_dir)?.save_task(WatchTask {
+            id: Uuid::new_v4().to_string(),
+            name,
+            prompt: prompt.to_string(),
+            owner,
+            author,
+            repositories: plan.repositories,
+            interval_seconds,
+            instructions: plan.instructions,
+            state: "active".to_string(),
+            last_run_at: String::new(),
+            last_result: String::new(),
+            next_run_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+        })
+    }
+
+    pub fn tasks(&self) -> Result<Vec<WatchTask>> {
+        WatchStore::open(&self.config.watch.data_dir)?.tasks()
+    }
+
+    pub fn set_task_state(&self, name: &str, state: &str) -> Result<bool> {
+        anyhow::ensure!(matches!(state, "active" | "paused"), "无效的任务状态");
+        WatchStore::open(&self.config.watch.data_dir)?.set_task_state(name, state)
+    }
+
+    pub fn run_due_tasks(&self) -> Result<Vec<String>> {
+        let mut store = WatchStore::open(&self.config.watch.data_dir)?;
+        let tasks = store.claim_due_tasks()?;
+        let mut results = Vec::new();
+        for task in tasks {
+            let github = WatchGithubConfig {
+                owner: task.owner.clone(),
+                author: task.author.clone(),
+                repositories: task.repositories.clone(),
+            };
+            match self.scan_scope(&task.id, github) {
+                Ok(report) => {
+                    let result = format!(
+                        "{}：{} 个 PR，{} 个新事件",
+                        task.name, report.pull_requests_observed, report.events_created
+                    );
+                    store.finish_task_run(&task, &result, false)?;
+                    results.push(result);
+                }
+                Err(error) => {
+                    let result = format!("{}：失败：{error:#}", task.name);
+                    store.finish_task_run(&task, &result, true)?;
+                    results.push(result);
+                }
+            }
+        }
+        Ok(results)
+    }
+}
+
+fn non_empty_or(value: String, fallback: &str) -> String {
+    if value.trim().is_empty() {
+        fallback.trim().to_string()
+    } else {
+        value.trim().to_string()
+    }
+}
+
+fn valid_github_name(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn valid_repository(value: &str) -> bool {
+    let Some((owner, name)) = value.split_once('/') else {
+        return false;
+    };
+    !name.contains('/') && valid_github_name(owner) && valid_github_name(name)
 }
 
 fn describe_changes(previous: &PullRequestSnapshot, current: &PullRequestSnapshot) -> String {
@@ -246,6 +415,36 @@ pub fn render_events(events: &[WatchEvent]) -> String {
             format!(
                 "{} [{}] {}\n  {}\n  {}",
                 event.created_at, event.kind, event.entity_key, event.summary, event.evidence_url
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub fn render_tasks(tasks: &[WatchTask]) -> String {
+    if tasks.is_empty() {
+        return "尚未创建持续追踪任务。".to_string();
+    }
+    tasks
+        .iter()
+        .map(|task| {
+            format!(
+                "{} [{}]\n  {}/{}，每 {} 秒\n  上次：{}\n  下次：{}",
+                task.name,
+                task.state,
+                task.owner,
+                if task.author.is_empty() {
+                    "当前 gh 用户"
+                } else {
+                    &task.author
+                },
+                task.interval_seconds,
+                if task.last_result.is_empty() {
+                    "尚未运行"
+                } else {
+                    &task.last_result
+                },
+                task.next_run_at
             )
         })
         .collect::<Vec<_>>()
