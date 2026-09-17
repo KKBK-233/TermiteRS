@@ -85,12 +85,49 @@ impl CheckSummary {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct WatchEvent {
     pub id: String,
+    pub task_id: String,
     pub entity_key: String,
     pub kind: String,
     pub fingerprint: String,
     pub summary: String,
     pub evidence_url: String,
     pub created_at: String,
+}
+
+/// 模型只负责把自然语言转换成受限任务计划；程序负责校验和执行。
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WatchTaskPlan {
+    pub action: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub owner: String,
+    #[serde(default)]
+    pub author: String,
+    #[serde(default)]
+    pub repositories: Vec<String>,
+    #[serde(default)]
+    pub interval_seconds: u64,
+    #[serde(default)]
+    pub instructions: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WatchTask {
+    pub id: String,
+    pub name: String,
+    pub prompt: String,
+    pub owner: String,
+    pub author: String,
+    pub repositories: Vec<String>,
+    pub interval_seconds: u64,
+    pub instructions: String,
+    pub state: String,
+    pub last_run_at: String,
+    pub last_result: String,
+    pub next_run_at: String,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
