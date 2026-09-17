@@ -91,6 +91,8 @@ pub struct WatchEvent {
     pub fingerprint: String,
     pub summary: String,
     pub evidence_url: String,
+    #[serde(default)]
+    pub evidence: Vec<String>,
     pub created_at: String,
 }
 

@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use crate::config::{Config, WatchGithubConfig};
 use crate::llm::LlmService;
+use crate::text::truncate_to_char_boundary;
 
 use self::{
     github::GithubCollector,
@@ -124,28 +125,49 @@ impl WatchRunner {
                     if previous != snapshot {
                         let changes = describe_changes(&previous, &snapshot);
                         let material = serde_json::to_string(&snapshot)?;
+                        let evidence = match collector.change_evidence(&previous, &snapshot) {
+                            Ok(evidence) => evidence,
+                            Err(error) => {
+                                report.warnings.push(format!(
+                                    "{} 补取评论或失败日志失败：{error:#}",
+                                    snapshot.key()
+                                ));
+                                Vec::new()
+                            }
+                        };
                         if let Some(event) = store.insert_event(
                             task_id,
                             &snapshot.key(),
                             "github-pr-changed",
                             &changes,
                             &snapshot.url,
+                            &evidence,
                             &material,
                         )? {
                             report.events.push(event);
                         }
                     }
-                } else if !initial_baseline
-                    && let Some(event) = store.insert_event(
+                } else if !initial_baseline {
+                    let evidence = match collector.failed_check_logs(&snapshot) {
+                        Ok(evidence) => evidence,
+                        Err(error) => {
+                            report
+                                .warnings
+                                .push(format!("{} 读取失败日志失败：{error:#}", snapshot.key()));
+                            Vec::new()
+                        }
+                    };
+                    if let Some(event) = store.insert_event(
                         task_id,
                         &snapshot.key(),
                         "github-pr-discovered",
                         &format!("发现新的个人 PR：{}", snapshot.title),
                         &snapshot.url,
+                        &evidence,
                         &snapshot.head_oid,
-                    )?
-                {
-                    report.events.push(event);
+                    )? {
+                        report.events.push(event);
+                    }
                 }
                 store.upsert_snapshot(task_id, &snapshot)?;
                 report.pull_requests.push(snapshot);
@@ -185,6 +207,7 @@ impl WatchRunner {
                         kind,
                         &summary,
                         &lifecycle.url,
+                        &[],
                         occurred_at,
                     )? {
                         report.events.push(event);
@@ -341,6 +364,7 @@ impl WatchRunner {
                 .ok()
                 .flatten()
                 .unwrap_or_else(|| deterministic_assessment(event, snapshot));
+            let plan = constrain_assessment(plan, event);
             let assessment = WatchAssessment {
                 id: Uuid::new_v4().to_string(),
                 event_id: event.id.clone(),
@@ -370,7 +394,11 @@ fn deterministic_assessment(
     let closed = matches!(event.kind.as_str(), "github-pr-merged" | "github-pr-closed");
     WatchAssessmentPlan {
         summary: event.summary.clone(),
-        evidence: vec![event.evidence_url.clone()],
+        evidence: if event.evidence.is_empty() {
+            vec![event.evidence_url.clone()]
+        } else {
+            event.evidence.clone()
+        },
         recommendation: if closed {
             "记录生命周期结果，无需自动操作。".to_string()
         } else if failed > 0 {
@@ -380,6 +408,50 @@ fn deterministic_assessment(
         },
         requires_user_decision: !closed,
     }
+}
+
+fn constrain_assessment(mut plan: WatchAssessmentPlan, event: &WatchEvent) -> WatchAssessmentPlan {
+    // 模型输出不能降低外部写操作的审批门槛，也不能注入终端控制字符。
+    if !matches!(event.kind.as_str(), "github-pr-merged" | "github-pr-closed") {
+        plan.requires_user_decision = true;
+    }
+    plan.summary = safe_display_text(&plan.summary, 1_000);
+    plan.recommendation = safe_display_text(&plan.recommendation, 2_000);
+    plan.evidence = plan
+        .evidence
+        .into_iter()
+        .take(3)
+        .map(|item| safe_display_evidence(&item))
+        .collect();
+    if plan.summary.is_empty() {
+        plan.summary = event.summary.clone();
+    }
+    plan
+}
+
+fn safe_display_text(value: &str, max_bytes: usize) -> String {
+    let mut output = value
+        .chars()
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\r' | '\t'))
+        .collect::<String>();
+    truncate_to_char_boundary(&mut output, max_bytes);
+    output
+}
+
+fn safe_display_evidence(value: &str) -> String {
+    if !value.starts_with("GitHub Actions run ") || value.len() <= 2_000 {
+        return safe_display_text(value, 2_000);
+    }
+    let cleaned = value
+        .chars()
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\r' | '\t'))
+        .collect::<String>();
+    let marker = "... 仅显示日志末尾 ...\n";
+    let mut start = cleaned.len() - 2_000 + marker.len();
+    while start < cleaned.len() && !cleaned.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("{marker}{}", &cleaned[start..])
 }
 
 fn non_empty_or(value: String, fallback: &str) -> String {
@@ -577,8 +649,12 @@ pub fn render_tasks(tasks: &[WatchTask]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{describe_changes, deterministic_assessment};
-    use crate::watch::model::{CheckSnapshot, PullRequestSnapshot, WatchEvent};
+    use super::{
+        constrain_assessment, describe_changes, deterministic_assessment, safe_display_evidence,
+    };
+    use crate::watch::model::{
+        CheckSnapshot, PullRequestSnapshot, WatchAssessmentPlan, WatchEvent,
+    };
 
     fn snapshot() -> PullRequestSnapshot {
         PullRequestSnapshot {
@@ -632,10 +708,42 @@ mod tests {
             fingerprint: "fingerprint".to_string(),
             summary: "CI 失败".to_string(),
             evidence_url: "url".to_string(),
+            evidence: vec!["failed log".to_string()],
             created_at: "now".to_string(),
         };
         let assessment = deterministic_assessment(&event, Some(&current));
         assert!(assessment.requires_user_decision);
         assert!(assessment.recommendation.contains("等待用户确认"));
+    }
+
+    #[test]
+    fn model_cannot_downgrade_changed_event_decision_gate() {
+        let event = WatchEvent {
+            id: "event".to_string(),
+            task_id: "task".to_string(),
+            entity_key: "owner/repo#1".to_string(),
+            kind: "github-pr-changed".to_string(),
+            fingerprint: "fingerprint".to_string(),
+            summary: "状态变化".to_string(),
+            evidence_url: "url".to_string(),
+            evidence: vec![],
+            created_at: "now".to_string(),
+        };
+        let plan = WatchAssessmentPlan {
+            summary: "建议\u{1b}[31m".to_string(),
+            evidence: vec![],
+            recommendation: "自动推送".to_string(),
+            requires_user_decision: false,
+        };
+        let result = constrain_assessment(plan, &event);
+        assert!(result.requires_user_decision);
+        assert!(!result.summary.contains('\u{1b}'));
+        let log = format!(
+            "GitHub Actions run 1 失败日志：{}最终错误",
+            "前文".repeat(1_000)
+        );
+        let excerpt = safe_display_evidence(&log);
+        assert!(excerpt.contains("最终错误"));
+        assert!(excerpt.len() <= 2_000);
     }
 }
