@@ -4,6 +4,7 @@ use std::{env, fs};
 
 use anyhow::{Context, Result};
 
+use crate::autonomy::local_task::{LocalTaskRunner, LocalTaskState};
 use crate::config::Config;
 use crate::daemon::Daemon;
 use crate::doctor::Doctor;
@@ -87,8 +88,27 @@ impl Assistant {
                 "/watch-tasks" => self.run_watch_tasks()?,
                 "/watch-decisions" => self.run_watch_assessments()?,
                 _ => {
-                    if !self.try_handle_local_action(input, &mut history)? {
-                        self.reply_to_user(input, &mut history)?;
+                    if let Some(request) = input.strip_prefix("/task ") {
+                        if let Err(err) = self.run_local_task(request.trim()) {
+                            println!("本地任务已停止：{err:#}");
+                        }
+                    } else {
+                        let config = Config::read_from(&self.config_path)?;
+                        if config.autonomy.enabled
+                            && config.llm.as_ref().is_some_and(|llm| llm.enabled)
+                            && !wants_watch_task(input)
+                        {
+                            if self.try_change_watch_task_state(input)? {
+                                continue;
+                            }
+                            if let Err(err) = self.run_local_task(input) {
+                                println!("本地任务已停止：{err:#}");
+                            }
+                            continue;
+                        }
+                        if !self.try_handle_local_action(input, &mut history)? {
+                            self.reply_to_user(input, &mut history)?;
+                        }
                     }
                 }
             }
@@ -111,6 +131,45 @@ impl Assistant {
     fn run_permissions(&self) -> Result<()> {
         let config = Config::read_from(&self.config_path)?;
         println!("{}", config.autonomy.render());
+        Ok(())
+    }
+
+    fn run_local_task(&self, request: &str) -> Result<()> {
+        anyhow::ensure!(!request.is_empty(), "请输入任务内容");
+        let config = Config::read_from(&self.config_path)?;
+        anyhow::ensure!(
+            config.autonomy.enabled,
+            "自治流程未启用；请先配置 autonomy.enabled"
+        );
+        anyhow::ensure!(
+            config.llm.as_ref().is_some_and(|llm| llm.enabled),
+            "LLM 未启用；请先配置 llm.enabled"
+        );
+        let llm = LlmService::new(config.llm.clone());
+        let result = LocalTaskRunner::new(&config).run(
+            request,
+            |context| llm.plan_local_step(context)?.context("LLM 未启用"),
+            |action| {
+                print!("动作 {action} 需要单次确认。批准本次执行？[y/N] ");
+                io::stdout().flush()?;
+                let mut answer = String::new();
+                io::stdin().read_line(&mut answer)?;
+                Ok(matches!(
+                    answer.trim().to_ascii_lowercase().as_str(),
+                    "y" | "yes" | "是"
+                ))
+            },
+        )?;
+        for line in result.trace {
+            println!("- {line}");
+        }
+        match result.state {
+            LocalTaskState::Finished => println!(
+                "模型结论（本任务执行环未提供代码修改、提交或远端写入）：{}",
+                result.summary
+            ),
+            LocalTaskState::Stopped => println!("任务停止：{}", result.summary),
+        }
         Ok(())
     }
 
@@ -434,6 +493,7 @@ fn print_help() {
     println!("  /doctor  检查 Git、SSH、远端和推送权限");
     println!("  /status  查看分支状态");
     println!("  /permissions 查看自治流程的有效权限");
+    println!("  /task <需求> 在本地仓库运行受限模型任务");
     println!("  /once    运行一次 daemon 同步并退出本次同步");
     println!("  /daemon  启动常驻核心进程");
     println!("  /watch   立即刷新个人 PR / CI 状态");
