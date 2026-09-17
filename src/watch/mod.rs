@@ -17,10 +17,14 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use crate::config::{Config, WatchGithubConfig};
+use crate::llm::LlmService;
 
 use self::{
     github::GithubCollector,
-    model::{PullRequestSnapshot, WatchEvent, WatchScanReport, WatchTask, WatchTaskPlan},
+    model::{
+        PullRequestSnapshot, WatchAssessment, WatchAssessmentPlan, WatchEvent, WatchScanReport,
+        WatchTask, WatchTaskPlan,
+    },
     store::WatchStore,
 };
 
@@ -46,8 +50,16 @@ impl WatchSupervisor {
                     }
                     thread::sleep(Duration::from_secs(1));
                 }
-                if let Err(error) = runner.run_due_tasks() {
-                    eprintln!("watch 调度失败：{error:#}");
+                match runner.run_due_tasks() {
+                    Ok(results) => {
+                        for result in results
+                            .into_iter()
+                            .filter(|result| !result.contains("0 个新事件"))
+                        {
+                            println!("\n[watch] {result}");
+                        }
+                    }
+                    Err(error) => eprintln!("watch 调度失败：{error:#}"),
                 }
             }
         });
@@ -112,7 +124,7 @@ impl WatchRunner {
                     if previous != snapshot {
                         let changes = describe_changes(&previous, &snapshot);
                         let material = serde_json::to_string(&snapshot)?;
-                        if store.insert_event(
+                        if let Some(event) = store.insert_event(
                             task_id,
                             &snapshot.key(),
                             "github-pr-changed",
@@ -120,11 +132,11 @@ impl WatchRunner {
                             &snapshot.url,
                             &material,
                         )? {
-                            report.events_created += 1;
+                            report.events.push(event);
                         }
                     }
                 } else if !initial_baseline
-                    && store.insert_event(
+                    && let Some(event) = store.insert_event(
                         task_id,
                         &snapshot.key(),
                         "github-pr-discovered",
@@ -133,7 +145,7 @@ impl WatchRunner {
                         &snapshot.head_oid,
                     )?
                 {
-                    report.events_created += 1;
+                    report.events.push(event);
                 }
                 store.upsert_snapshot(task_id, &snapshot)?;
                 report.pull_requests.push(snapshot);
@@ -167,7 +179,7 @@ impl WatchRunner {
                         },
                         lifecycle.title
                     );
-                    if store.insert_event(
+                    if let Some(event) = store.insert_event(
                         task_id,
                         &previous.key(),
                         kind,
@@ -175,7 +187,7 @@ impl WatchRunner {
                         &lifecycle.url,
                         occurred_at,
                     )? {
-                        report.events_created += 1;
+                        report.events.push(event);
                     }
                     store.delete_snapshot(task_id, &previous.key())?;
                 }
@@ -189,6 +201,7 @@ impl WatchRunner {
             }
         }
         store.mark_initialized(task_id)?;
+        report.events_created = report.events.len();
         Ok(report)
     }
 
@@ -198,6 +211,10 @@ impl WatchRunner {
 
     pub fn events(&self, limit: usize) -> Result<Vec<WatchEvent>> {
         WatchStore::open(&self.config.watch.data_dir)?.events(limit)
+    }
+
+    pub fn assessments(&self, limit: usize) -> Result<Vec<WatchAssessment>> {
+        WatchStore::open(&self.config.watch.data_dir)?.assessments(limit)
     }
 
     pub fn create_task(&self, plan: WatchTaskPlan, prompt: &str) -> Result<WatchTask> {
@@ -270,9 +287,27 @@ impl WatchRunner {
             };
             match self.scan_scope(&task.id, github) {
                 Ok(report) => {
+                    let pending_events = store.unassessed_events(&task.id)?;
+                    let assessments =
+                        match self.assess_events(&store, &task, &report, &pending_events) {
+                            Ok(assessments) => assessments,
+                            Err(error) => {
+                                let result = format!("{}：事件评估失败：{error:#}", task.name);
+                                store.finish_task_run(&task, &result, true)?;
+                                results.push(result);
+                                continue;
+                            }
+                        };
+                    let decision_count = assessments
+                        .iter()
+                        .filter(|assessment| assessment.requires_user_decision)
+                        .count();
                     let result = format!(
-                        "{}：{} 个 PR，{} 个新事件",
-                        task.name, report.pull_requests_observed, report.events_created
+                        "{}：{} 个 PR，{} 个新事件，{} 个待判断",
+                        task.name,
+                        report.pull_requests_observed,
+                        report.events_created,
+                        decision_count
                     );
                     store.finish_task_run(&task, &result, false)?;
                     results.push(result);
@@ -285,6 +320,65 @@ impl WatchRunner {
             }
         }
         Ok(results)
+    }
+
+    fn assess_events(
+        &self,
+        store: &WatchStore,
+        task: &WatchTask,
+        report: &WatchScanReport,
+        events: &[WatchEvent],
+    ) -> Result<Vec<WatchAssessment>> {
+        let llm = LlmService::new(self.config.llm.clone());
+        let mut assessments = Vec::new();
+        for event in events {
+            let snapshot = report
+                .pull_requests
+                .iter()
+                .find(|snapshot| snapshot.key() == event.entity_key);
+            let plan = llm
+                .assess_watch_event(event, snapshot, &task.instructions)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| deterministic_assessment(event, snapshot));
+            let assessment = WatchAssessment {
+                id: Uuid::new_v4().to_string(),
+                event_id: event.id.clone(),
+                task_id: task.id.clone(),
+                entity_key: event.entity_key.clone(),
+                summary: plan.summary,
+                evidence: plan.evidence,
+                recommendation: plan.recommendation,
+                requires_user_decision: plan.requires_user_decision,
+                created_at: Utc::now().to_rfc3339(),
+            };
+            if store.save_assessment(&assessment)? {
+                assessments.push(assessment);
+            }
+        }
+        Ok(assessments)
+    }
+}
+
+fn deterministic_assessment(
+    event: &WatchEvent,
+    snapshot: Option<&PullRequestSnapshot>,
+) -> WatchAssessmentPlan {
+    let failed = snapshot
+        .map(|snapshot| snapshot.check_summary().failed)
+        .unwrap_or_default();
+    let closed = matches!(event.kind.as_str(), "github-pr-merged" | "github-pr-closed");
+    WatchAssessmentPlan {
+        summary: event.summary.clone(),
+        evidence: vec![event.evidence_url.clone()],
+        recommendation: if closed {
+            "记录生命周期结果，无需自动操作。".to_string()
+        } else if failed > 0 {
+            "检查失败日志并判断是否需要修改代码；修改和推送前等待用户确认。".to_string()
+        } else {
+            "检查本次变化，涉及回复、修改或合并时等待用户确认。".to_string()
+        },
+        requires_user_decision: !closed,
     }
 }
 
@@ -421,6 +515,36 @@ pub fn render_events(events: &[WatchEvent]) -> String {
         .join("\n")
 }
 
+pub fn render_assessments(assessments: &[WatchAssessment]) -> String {
+    if assessments.is_empty() {
+        return "暂无事件评估。".to_string();
+    }
+    assessments
+        .iter()
+        .map(|assessment| {
+            let evidence = if assessment.evidence.is_empty() {
+                "无附加证据".to_string()
+            } else {
+                assessment.evidence.join("；")
+            };
+            format!(
+                "{} [{}] {}\n  {}\n  建议：{}\n  证据：{}",
+                assessment.created_at,
+                if assessment.requires_user_decision {
+                    "待判断"
+                } else {
+                    "仅记录"
+                },
+                assessment.entity_key,
+                assessment.summary,
+                assessment.recommendation,
+                evidence
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub fn render_tasks(tasks: &[WatchTask]) -> String {
     if tasks.is_empty() {
         return "尚未创建持续追踪任务。".to_string();
@@ -453,8 +577,8 @@ pub fn render_tasks(tasks: &[WatchTask]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::describe_changes;
-    use crate::watch::model::{CheckSnapshot, PullRequestSnapshot};
+    use super::{describe_changes, deterministic_assessment};
+    use crate::watch::model::{CheckSnapshot, PullRequestSnapshot, WatchEvent};
 
     fn snapshot() -> PullRequestSnapshot {
         PullRequestSnapshot {
@@ -489,5 +613,29 @@ mod tests {
         assert!(changes.contains("head aaaaaaaa → bbbbbbbb"));
         assert!(changes.contains("合并状态 BEHIND → BLOCKED"));
         assert!(changes.contains("失败 1"));
+    }
+
+    #[test]
+    fn failed_ci_requires_user_decision() {
+        let mut current = snapshot();
+        current.checks.push(CheckSnapshot {
+            name: "build".to_string(),
+            status: "COMPLETED".to_string(),
+            conclusion: "FAILURE".to_string(),
+            details_url: "url".to_string(),
+        });
+        let event = WatchEvent {
+            id: "event".to_string(),
+            task_id: "task".to_string(),
+            entity_key: current.key(),
+            kind: "github-pr-changed".to_string(),
+            fingerprint: "fingerprint".to_string(),
+            summary: "CI 失败".to_string(),
+            evidence_url: "url".to_string(),
+            created_at: "now".to_string(),
+        };
+        let assessment = deterministic_assessment(&event, Some(&current));
+        assert!(assessment.requires_user_decision);
+        assert!(assessment.recommendation.contains("等待用户确认"));
     }
 }

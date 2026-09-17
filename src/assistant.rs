@@ -11,7 +11,8 @@ use crate::llm::LlmService;
 use crate::sync::{SyncOptions, SyncRunner};
 use crate::watch::model::WatchTaskPlan;
 use crate::watch::{
-    WatchRunner, WatchSupervisor, render_events, render_scan_report, render_status, render_tasks,
+    WatchRunner, WatchSupervisor, render_assessments, render_events, render_scan_report,
+    render_status, render_tasks,
 };
 
 const MAX_HISTORY_MESSAGES: usize = 12;
@@ -83,6 +84,7 @@ impl Assistant {
                 "/watch-status" => self.run_watch_status()?,
                 "/watch-events" => self.run_watch_events()?,
                 "/watch-tasks" => self.run_watch_tasks()?,
+                "/watch-decisions" => self.run_watch_assessments()?,
                 _ => {
                     if !self.try_handle_local_action(input, &mut history)? {
                         self.reply_to_user(input, &mut history)?;
@@ -172,6 +174,12 @@ impl Assistant {
     fn run_watch_tasks(&self) -> Result<()> {
         let runner = WatchRunner::new(Config::read_from(&self.config_path)?);
         println!("{}", render_tasks(&runner.tasks()?));
+        Ok(())
+    }
+
+    fn run_watch_assessments(&self) -> Result<()> {
+        let runner = WatchRunner::new(Config::read_from(&self.config_path)?);
+        println!("{}", render_assessments(&runner.assessments(20)?));
         Ok(())
     }
 
@@ -424,6 +432,7 @@ fn print_help() {
     println!("  /watch-status 查看最近一次个人事项快照");
     println!("  /watch-events 查看最近的状态变化事件");
     println!("  /watch-tasks 查看持续追踪任务");
+    println!("  /watch-decisions 查看只读评估与待判断事项");
     println!("  /watch-pause <名称> 暂停持续任务");
     println!("  /watch-resume <名称> 恢复持续任务");
     println!("  /clear   清空当前助理会话上下文");
