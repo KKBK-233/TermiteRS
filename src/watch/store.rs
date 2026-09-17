@@ -6,7 +6,7 @@ use ring::digest::{SHA256, digest};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use uuid::Uuid;
 
-use super::model::{PullRequestSnapshot, WatchEvent, WatchTask};
+use super::model::{PullRequestSnapshot, WatchAssessment, WatchEvent, WatchTask};
 
 pub struct WatchStore {
     connection: Connection,
@@ -64,6 +64,17 @@ impl WatchStore {
                 fingerprint TEXT NOT NULL UNIQUE,
                 summary TEXT NOT NULL,
                 evidence_url TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS watch_assessments (
+                id TEXT PRIMARY KEY,
+                event_id TEXT NOT NULL UNIQUE,
+                task_id TEXT NOT NULL,
+                entity_key TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                evidence_json TEXT NOT NULL,
+                recommendation TEXT NOT NULL,
+                requires_user_decision INTEGER NOT NULL,
                 created_at TEXT NOT NULL
             );
             "#,
@@ -135,24 +146,34 @@ impl WatchStore {
         summary: &str,
         evidence_url: &str,
         event_material: &str,
-    ) -> Result<bool> {
+    ) -> Result<Option<WatchEvent>> {
         let event_fingerprint = fingerprint(&format!(
             "{task_id}\n{entity_key}\n{kind}\n{event_material}"
         ));
+        let event = WatchEvent {
+            id: Uuid::new_v4().to_string(),
+            task_id: task_id.to_string(),
+            entity_key: entity_key.to_string(),
+            kind: kind.to_string(),
+            fingerprint: event_fingerprint,
+            summary: summary.to_string(),
+            evidence_url: evidence_url.to_string(),
+            created_at: Utc::now().to_rfc3339(),
+        };
         let changed = self.connection.execute(
             "INSERT OR IGNORE INTO watch_events (id, task_id, entity_key, kind, fingerprint, summary, evidence_url, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
-                Uuid::new_v4().to_string(),
-                task_id,
-                entity_key,
-                kind,
-                event_fingerprint,
-                summary,
-                evidence_url,
-                Utc::now().to_rfc3339()
+                event.id,
+                event.task_id,
+                event.entity_key,
+                event.kind,
+                event.fingerprint,
+                event.summary,
+                event.evidence_url,
+                event.created_at
             ],
         )?;
-        Ok(changed == 1)
+        Ok((changed == 1).then_some(event))
     }
 
     pub fn snapshots(&self, task_id: &str) -> Result<Vec<PullRequestSnapshot>> {
@@ -187,6 +208,77 @@ impl WatchStore {
             "SELECT id, task_id, entity_key, kind, fingerprint, summary, evidence_url, created_at FROM watch_events ORDER BY created_at DESC LIMIT ?1",
         )?;
         let rows = statement.query_map(params![limit as u64], |row| {
+            Ok(WatchEvent {
+                id: row.get(0)?,
+                task_id: row.get(1)?,
+                entity_key: row.get(2)?,
+                kind: row.get(3)?,
+                fingerprint: row.get(4)?,
+                summary: row.get(5)?,
+                evidence_url: row.get(6)?,
+                created_at: row.get(7)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn save_assessment(&self, assessment: &WatchAssessment) -> Result<bool> {
+        let changed = self.connection.execute(
+            "INSERT OR IGNORE INTO watch_assessments (id, event_id, task_id, entity_key, summary, evidence_json, recommendation, requires_user_decision, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                assessment.id,
+                assessment.event_id,
+                assessment.task_id,
+                assessment.entity_key,
+                assessment.summary,
+                serde_json::to_string(&assessment.evidence)?,
+                assessment.recommendation,
+                assessment.requires_user_decision,
+                assessment.created_at
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn assessments(&self, limit: usize) -> Result<Vec<WatchAssessment>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, event_id, task_id, entity_key, summary, evidence_json, recommendation, requires_user_decision, created_at FROM watch_assessments ORDER BY created_at DESC LIMIT ?1",
+        )?;
+        let rows = statement.query_map(params![limit as u64], |row| {
+            let evidence: String = row.get(5)?;
+            let evidence = serde_json::from_str(&evidence).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    evidence.len(),
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            Ok(WatchAssessment {
+                id: row.get(0)?,
+                event_id: row.get(1)?,
+                task_id: row.get(2)?,
+                entity_key: row.get(3)?,
+                summary: row.get(4)?,
+                evidence,
+                recommendation: row.get(6)?,
+                requires_user_decision: row.get(7)?,
+                created_at: row.get(8)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn unassessed_events(&self, task_id: &str) -> Result<Vec<WatchEvent>> {
+        let mut statement = self.connection.prepare(
+            r#"SELECT e.id, e.task_id, e.entity_key, e.kind, e.fingerprint, e.summary, e.evidence_url, e.created_at
+               FROM watch_events e
+               WHERE e.task_id = ?1
+                 AND NOT EXISTS (SELECT 1 FROM watch_assessments a WHERE a.event_id = e.id)
+               ORDER BY e.created_at"#,
+        )?;
+        let rows = statement.query_map(params![task_id], |row| {
             Ok(WatchEvent {
                 id: row.get(0)?,
                 task_id: row.get(1)?,
@@ -444,7 +536,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::WatchStore;
-    use crate::watch::model::{PullRequestSnapshot, WatchTask};
+    use crate::watch::model::{PullRequestSnapshot, WatchAssessment, WatchTask};
 
     #[test]
     fn snapshot_event_and_task_writes_are_idempotent() {
@@ -469,15 +561,15 @@ mod tests {
             store.snapshot("task-1", &snapshot.key()).unwrap(),
             Some(snapshot)
         );
+        let event = store
+            .insert_event("task-1", "owner/repo#7", "changed", "changed", "url", "v1")
+            .unwrap()
+            .unwrap();
         assert!(
             store
                 .insert_event("task-1", "owner/repo#7", "changed", "changed", "url", "v1")
                 .unwrap()
-        );
-        assert!(
-            !store
-                .insert_event("task-1", "owner/repo#7", "changed", "changed", "url", "v1")
-                .unwrap()
+                .is_none()
         );
 
         let now = Utc::now().to_rfc3339();
@@ -504,6 +596,25 @@ mod tests {
         let mut store = store;
         assert_eq!(store.claim_due_tasks().unwrap().len(), 1);
         assert!(store.claim_due_tasks().unwrap().is_empty());
+        assert_eq!(
+            store.unassessed_events("task-1").unwrap(),
+            vec![event.clone()]
+        );
+        let assessment = WatchAssessment {
+            id: Uuid::new_v4().to_string(),
+            event_id: event.id,
+            task_id: task.id,
+            entity_key: "owner/repo#7".to_string(),
+            summary: "CI 失败".to_string(),
+            evidence: vec!["build failure".to_string()],
+            recommendation: "等待判断".to_string(),
+            requires_user_decision: true,
+            created_at: Utc::now().to_rfc3339(),
+        };
+        assert!(store.save_assessment(&assessment).unwrap());
+        assert!(!store.save_assessment(&assessment).unwrap());
+        assert_eq!(store.assessments(10).unwrap(), vec![assessment]);
+        assert!(store.unassessed_events("task-1").unwrap().is_empty());
         drop(store);
         fs::remove_dir_all(root).unwrap();
     }

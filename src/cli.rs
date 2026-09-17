@@ -137,6 +137,13 @@ pub enum WatchCommands {
         #[arg(short, long, default_value = "termite.yml")]
         config: PathBuf,
     },
+    /// 显示模型或规则生成的只读事件评估。
+    Assessments {
+        #[arg(short, long, default_value = "termite.yml")]
+        config: PathBuf,
+        #[arg(short, long, default_value_t = 20)]
+        limit: usize,
+    },
 }
 
 #[derive(Debug, Subcommand)]

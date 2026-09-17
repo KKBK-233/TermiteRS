@@ -17,7 +17,7 @@ use TermiteRS::protection::{
 use TermiteRS::service;
 use TermiteRS::sync::{SyncOptions, SyncRunner};
 use TermiteRS::watch::{
-    WatchRunner, render_events, render_scan_report, render_status, render_tasks,
+    WatchRunner, render_assessments, render_events, render_scan_report, render_status, render_tasks,
 };
 
 fn main() -> Result<()> {
@@ -224,6 +224,10 @@ fn main() -> Result<()> {
                 } else {
                     println!("{}", results.join("\n"));
                 }
+            }
+            WatchCommands::Assessments { config, limit } => {
+                let runner = WatchRunner::new(Config::read_from(config)?);
+                println!("{}", render_assessments(&runner.assessments(limit)?));
             }
         },
     }
