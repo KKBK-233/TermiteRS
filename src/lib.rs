@@ -1,4 +1,5 @@
 pub mod assistant;
+pub mod autonomy;
 pub mod cli;
 pub mod command;
 pub mod config;
