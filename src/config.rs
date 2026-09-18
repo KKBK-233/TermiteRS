@@ -246,6 +246,17 @@ pub enum LlmProvider {
     Custom,
 }
 
+impl LlmProvider {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::DeepSeek => "deep-seek",
+            Self::OpenAi => "open-ai",
+            Self::OpenAiCompatible => "open-ai-compatible",
+            Self::Custom => "custom",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct NotifyConfig {
     #[serde(default)]

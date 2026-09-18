@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 pub mod local_task;
+pub mod task_report;
 
 /// 新自治流程的权限模式；原有显式 CLI 命令不受这里影响。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -76,6 +77,27 @@ pub struct AutonomyConfig {
     pub permissions: AutonomyPermissions,
     #[serde(default)]
     pub scope: AutonomyScope,
+    #[serde(default)]
+    pub reports: TaskReportConfig,
+}
+
+/// 任务报告只保存受限任务摘要，不保存模型观察、文件正文或凭据。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskReportConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_task_report_data_dir")]
+    pub data_dir: PathBuf,
+}
+
+impl Default for TaskReportConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            data_dir: default_task_report_data_dir(),
+        }
+    }
 }
 
 /// 对象范围与动作权限同时成立才可以执行；空范围不代表全部。
@@ -237,6 +259,15 @@ impl AutonomyConfig {
         output.push_str(
             "范围规则：未填写的作者、负责人或仓库列表不表示全部；执行前还会检查具体目标。\n",
         );
+        output.push_str(&format!(
+            "任务报告：{}；目录：{}\n",
+            if self.reports.enabled {
+                "启用"
+            } else {
+                "停用"
+            },
+            self.reports.data_dir.display()
+        ));
         output.trim_end().to_string()
     }
 }
@@ -284,13 +315,21 @@ fn default_ask() -> PermissionMode {
     PermissionMode::Ask
 }
 
+fn default_task_report_data_dir() -> PathBuf {
+    PathBuf::from(".termite/reports")
+}
+
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::{AutonomyAction, AutonomyConfig, AutonomyTarget, PermissionMode};
 
     #[test]
     fn default_policy_does_not_grant_automatic_writes() {
         let mut config = AutonomyConfig::default();
+        assert!(!config.reports.enabled);
+        assert_eq!(config.reports.data_dir, PathBuf::from(".termite/reports"));
         assert_eq!(
             config.gate(AutonomyAction::GithubRead),
             PermissionMode::Deny
