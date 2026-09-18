@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
-use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, params_from_iter};
 use uuid::Uuid;
 
 use crate::git::{ConflictSnapshot, Git};
@@ -168,14 +168,16 @@ impl ServiceState {
         let connection = self.open_database()?;
         let now = timestamp();
         connection.execute(
-            "UPDATE jobs SET state = 'failed', summary = '服务重启时任务仍在执行，请重新发起', updated_at = ?1 WHERE state IN ('queued', 'running', 'generating_proposal', 'applying', 'pushing')",
+            "UPDATE jobs SET state = 'failed', summary = '服务重启时任务仍在执行，请重新发起', updated_at = ?1 WHERE state IN ('queued', 'running', 'generating_proposal', 'applying', 'pushing', 'abandoning')",
             params![now],
         )?;
         Ok(())
     }
 
     pub(crate) fn create_job(&self, kind: &str, branch: &str) -> Result<String> {
-        let connection = self.open_database()?;
+        let mut connection = self.open_database()?;
+        // 写事务序列化同一分支的检查与创建，避免并发请求都看到空闲状态。
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if kind == "sync" {
             let placeholders = ACTIVE_STATES
                 .iter()
@@ -185,7 +187,7 @@ impl ServiceState {
             let sql = format!(
                 "SELECT id FROM jobs WHERE branch = ?1 AND state IN ({placeholders}) LIMIT 1"
             );
-            if connection
+            if transaction
                 .query_row(&sql, params![branch], |row| row.get::<_, String>(0))
                 .optional()?
                 .is_some()
@@ -196,10 +198,11 @@ impl ServiceState {
 
         let id = Uuid::new_v4().to_string();
         let now = timestamp();
-        connection.execute(
+        transaction.execute(
             "INSERT INTO jobs (id, kind, branch, state, created_at, updated_at) VALUES (?1, ?2, ?3, 'queued', ?4, ?4)",
             params![id, kind, branch, now],
         )?;
+        transaction.commit()?;
         self.emit(Some(&id), "job", "任务已进入队列")?;
         Ok(id)
     }
@@ -250,6 +253,40 @@ impl ServiceState {
             "UPDATE jobs SET state = ?2, summary = ?3, updated_at = ?4 WHERE id = ?1",
             params![job_id, state, summary, timestamp()],
         )?;
+        self.emit(Some(job_id), "state", &format!("{state}: {summary}"))
+    }
+
+    /// 仅在任务仍处于允许状态时切换，阻止并发请求重复执行同一副作用。
+    pub(crate) fn transition_state(
+        &self,
+        job_id: &str,
+        allowed: &[&str],
+        state: &str,
+        summary: &str,
+    ) -> Result<()> {
+        anyhow::ensure!(!allowed.is_empty(), "缺少允许的任务状态");
+        let placeholders = std::iter::repeat_n("?", allowed.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "UPDATE jobs SET state = ?1, summary = ?2, updated_at = ?3 WHERE id = ?4 AND state IN ({placeholders})"
+        );
+        let values = [
+            state.to_string(),
+            summary.to_string(),
+            timestamp(),
+            job_id.to_string(),
+        ];
+        let changed = self.open_database()?.execute(
+            &sql,
+            params_from_iter(
+                values
+                    .iter()
+                    .map(String::as_str)
+                    .chain(allowed.iter().copied()),
+            ),
+        )?;
+        anyhow::ensure!(changed == 1, "任务状态已变化，不允许重复执行：{job_id}");
         self.emit(Some(job_id), "state", &format!("{state}: {summary}"))
     }
 
@@ -386,4 +423,73 @@ pub(crate) fn load_messages(
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod concurrency_tests {
+    use std::sync::{Arc, Barrier, Mutex};
+
+    use tokio::sync::broadcast;
+    use uuid::Uuid;
+
+    use super::ServiceState;
+
+    #[test]
+    fn concurrent_requests_create_only_one_sync_job() {
+        let root = std::env::temp_dir().join(format!("termiters-job-race-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let (events, _) = broadcast::channel(8);
+        let state = ServiceState {
+            config_path: root.join("termite.yml"),
+            data_dir: root.clone(),
+            database_path: root.join("termite.db"),
+            events,
+            repository_lock: Arc::new(Mutex::new(())),
+        };
+        state.initialize_database().unwrap();
+
+        let barrier = Arc::new(Barrier::new(3));
+        let threads = (0..2)
+            .map(|_| {
+                let state = state.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    state.create_job("sync", "main")
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let results = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(state.jobs().unwrap().len(), 1);
+
+        let job_id = results.into_iter().find_map(Result::ok).unwrap();
+        state
+            .set_state(&job_id, "waiting_push", "等待推送")
+            .unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let threads = (0..2)
+            .map(|_| {
+                let state = state.clone();
+                let barrier = barrier.clone();
+                let job_id = job_id.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    state.transition_state(&job_id, &["waiting_push"], "pushing", "开始推送")
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let results = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(state.job(&job_id).unwrap().state, "pushing");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

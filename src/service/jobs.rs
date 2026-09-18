@@ -78,7 +78,7 @@ impl ServiceState {
         let worktree_path = self.data_dir.join("worktrees").join(job_id);
         let main_git = Git::new(config.repo.path.clone());
 
-        {
+        let from_remote = {
             let _guard = self
                 .repository_lock
                 .lock()
@@ -91,7 +91,8 @@ impl ServiceState {
             }
             let worktree = worktree_path.to_string_lossy().to_string();
             let remote_ref = format!("{}/{}", config.repo.fork_remote, branch_name);
-            let branch_ref = if optional_short_ref(&main_git, &remote_ref).is_some() {
+            let from_remote = optional_short_ref(&main_git, &remote_ref).is_some();
+            let branch_ref = if from_remote {
                 remote_ref
             } else {
                 branch_name.to_owned()
@@ -101,7 +102,8 @@ impl ServiceState {
             if !output.success() {
                 bail!("创建 worktree 失败：{}", output.stderr.trim());
             }
-        }
+            from_remote
+        };
 
         let git = Git::new(worktree_path.clone());
         let base_ref = format!(
@@ -113,14 +115,17 @@ impl ServiceState {
             .stdout
             .trim()
             .to_string();
+        // worktree 的实际起点就是本次推送的 lease 基线，不能再从远端重新采样。
+        let remote_head = if from_remote {
+            before_head.clone()
+        } else {
+            String::new()
+        };
         let base_head = git
             .run_git(&["rev-parse", &base_ref])?
             .stdout
             .trim()
             .to_string();
-        let remote_head = main_git
-            .remote_head(&config.repo.fork_remote, branch_name)?
-            .unwrap_or_default();
         self.open_database()?.execute(
             "UPDATE jobs SET worktree_path = ?2, base_ref = ?3, before_head = ?4, base_head = ?5, remote_head = ?6, updated_at = ?7 WHERE id = ?1",
             params![
@@ -355,7 +360,19 @@ impl ServiceState {
             "UPDATE jobs SET test_output = ?2, updated_at = ?3 WHERE id = ?1",
             params![job_id, test_output, timestamp()],
         )?;
-        let release_tag = self.push_job(config, branch, git, job_id, false)?;
+        let release_tag = match self.push_job(config, branch, git, job_id, false) {
+            Ok(tag) => tag,
+            Err(err) if self.job(job_id)?.remote_head == after_head => {
+                // 分支已经推送成功，保留 worktree 供管理员重试发布标签。
+                self.set_state(
+                    job_id,
+                    "waiting_push",
+                    &format!("分支已推送，发布标签失败，等待重试：{err:#}"),
+                )?;
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        };
         had_activity |= release_tag.is_some();
         let report = build_completed_sync_report(
             config,
