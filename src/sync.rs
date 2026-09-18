@@ -187,7 +187,7 @@ impl SyncRunner {
             self.config.repo.upstream_remote, self.config.repo.base_branch
         );
         let remote_branch = format!("{}/{}", self.config.repo.fork_remote, branch.name);
-        let remote_before = self.prepare_branch_for_sync(branch, &remote_branch)?;
+        let remote_before = self.prepare_branch_for_sync(branch)?;
         let before_head = self.git.head()?;
         let base_head = self.git.short_ref(&base)?;
         let upstream_commits = self.upstream_commits_since_branch_base(&base)?;
@@ -391,14 +391,18 @@ impl SyncRunner {
 
         let after_sync_head = self.git.head()?;
         let commits_to_push = if remote_before.is_some() {
-            self.git
-                .log_oneline(&format!("{remote_branch}..HEAD"), MAX_REPORTED_COMMITS)?
+            self.git.log_oneline(
+                &format!("{}..HEAD", remote_before.as_deref().unwrap()),
+                MAX_REPORTED_COMMITS,
+            )?
         } else {
             self.git.log_oneline("HEAD", MAX_REPORTED_COMMITS)?
         };
         let files_to_push = if remote_before.is_some() {
-            self.git
-                .changed_files(&format!("{remote_branch}..HEAD"), MAX_REPORTED_FILES)?
+            self.git.changed_files(
+                &format!("{}..HEAD", remote_before.as_deref().unwrap()),
+                MAX_REPORTED_FILES,
+            )?
         } else {
             self.git
                 .changed_files(
@@ -416,9 +420,13 @@ impl SyncRunner {
                 {
                     return Ok(SyncBranchOutcome::RemoteChanged { expected, current });
                 }
-                let output = self
-                    .git
-                    .push(&self.config.repo.fork_remote, &branch.name, false)?;
+                let output = if remote_before.is_none() {
+                    self.git
+                        .push_new_branch_with_lease(&self.config.repo.fork_remote, &branch.name)?
+                } else {
+                    self.git
+                        .push(&self.config.repo.fork_remote, &branch.name, false)?
+                };
                 if !output.success() {
                     return Ok(SyncBranchOutcome::Report(push_failed_report(
                         branch,
@@ -441,7 +449,7 @@ impl SyncRunner {
                     )?
                 } else {
                     self.git
-                        .push(&self.config.repo.fork_remote, &branch.name, false)?
+                        .push_new_branch_with_lease(&self.config.repo.fork_remote, &branch.name)?
                 };
                 if !output.success() {
                     return Ok(SyncBranchOutcome::Report(push_failed_report(
@@ -517,18 +525,33 @@ impl SyncRunner {
         Ok(SyncBranchOutcome::Report(entry))
     }
 
-    fn prepare_branch_for_sync(
-        &self,
-        branch: &BranchConfig,
-        remote_branch: &str,
-    ) -> Result<Option<String>> {
-        self.git
-            .fetch_branch(&self.config.repo.fork_remote, &branch.name)?;
+    fn prepare_branch_for_sync(&self, branch: &BranchConfig) -> Result<Option<String>> {
         let remote_before = self
             .git
-            .remote_head(&self.config.repo.fork_remote, &branch.name)?;
-        if remote_before.is_some() && !matches!(branch.push, PushStrategy::None) {
-            self.git.checkout_branch_at(&branch.name, remote_branch)?;
+            .fetch_branch(&self.config.repo.fork_remote, &branch.name)?;
+        if let Some(remote_head) = remote_before.as_deref()
+            && !matches!(branch.push, PushStrategy::None)
+        {
+            let local_ref = format!("refs/heads/{}", branch.name);
+            match self.git.ref_head(&local_ref)? {
+                None => self.git.checkout_branch_at(&branch.name, remote_head)?,
+                Some(local_head) if local_head == remote_head => self.git.checkout(&branch.name)?,
+                Some(local_head) => {
+                    let common = self.git.merge_base(&local_head, remote_head)?;
+                    if common.as_deref() == Some(local_head.as_str()) {
+                        // 本地提交已全部包含在远端，移动分支不会丢失独有提交。
+                        self.git.checkout_branch_at(&branch.name, remote_head)?;
+                    } else if common.as_deref() == Some(remote_head) {
+                        // 保留尚未推送的本地提交，后续推送仍受远端基线保护。
+                        self.git.checkout(&branch.name)?;
+                    } else {
+                        anyhow::bail!(
+                            "本地分支 {} 与远端已分叉，拒绝重置，请先人工整合提交",
+                            branch.name
+                        );
+                    }
+                }
+            }
         } else {
             self.git.checkout(&branch.name)?;
         }
@@ -540,8 +563,6 @@ impl SyncRunner {
         branch: &BranchConfig,
         expected_remote_head: Option<&str>,
     ) -> Result<PushGuard> {
-        self.git
-            .fetch_branch(&self.config.repo.fork_remote, &branch.name)?;
         let current_remote_head = self
             .git
             .remote_head(&self.config.repo.fork_remote, &branch.name)?;
@@ -663,5 +684,162 @@ impl SyncRunner {
         }
 
         Ok(entry)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, process::Command};
+
+    use uuid::Uuid;
+
+    use super::{SyncOptions, SyncRunner};
+    use crate::{config::Config, git::Git};
+
+    #[test]
+    fn sync_keeps_local_commits_and_rejects_divergent_remote() {
+        let root = std::env::temp_dir().join(format!("termiters-sync-{}", Uuid::new_v4()));
+        let repo = root.join("repo");
+        let other = root.join("other");
+        let remote = root.join("fork.git");
+        fs::create_dir_all(&repo).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "--bare"])
+                .arg(&remote)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let git = Git::new(&repo);
+        run(&git, &["init"]);
+        run(&git, &["config", "user.name", "TermiteRS Test"]);
+        run(&git, &["config", "user.email", "termite@example.com"]);
+        fs::write(repo.join("base.txt"), "base\n").unwrap();
+        run(&git, &["add", "base.txt"]);
+        run(&git, &["commit", "-m", "base"]);
+        run(&git, &["branch", "-M", "main"]);
+        run(&git, &["remote", "add", "fork", remote.to_str().unwrap()]);
+        run(&git, &["push", "fork", "main"]);
+        let remote_base = git.ref_head("HEAD").unwrap().unwrap();
+        fs::write(repo.join("local.txt"), "local\n").unwrap();
+        run(&git, &["add", "local.txt"]);
+        run(&git, &["commit", "-m", "local"]);
+        let local_head = git.ref_head("HEAD").unwrap().unwrap();
+
+        let mut config: Config = serde_yaml::from_str("repo:\n  path: .\n  upstream: unused\n  fork: unused\nbranches:\n  - name: main\n    push: force-with-lease\n").unwrap();
+        config.repo.path = repo.clone();
+        let runner = SyncRunner::new(
+            config,
+            SyncOptions {
+                branch: None,
+                dry_run: false,
+                notify_on_noop: false,
+            },
+        );
+        let branch = &runner.config.branches[0];
+        assert_eq!(
+            runner.prepare_branch_for_sync(branch).unwrap().as_deref(),
+            Some(remote_base.as_str())
+        );
+        assert_eq!(git.ref_head("HEAD").unwrap().unwrap(), local_head);
+
+        // 另一写入者推进远端后，本地独有提交仍保留，旧 lease 无法覆盖新提交。
+        assert!(
+            Command::new("git")
+                .args(["clone"])
+                .arg(&remote)
+                .arg(&other)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let other_git = Git::new(&other);
+        run(&other_git, &["checkout", "main"]);
+        run(&other_git, &["config", "user.name", "TermiteRS Test"]);
+        run(&other_git, &["config", "user.email", "termite@example.com"]);
+        fs::write(other.join("remote.txt"), "remote\n").unwrap();
+        run(&other_git, &["add", "remote.txt"]);
+        run(&other_git, &["commit", "-m", "remote"]);
+        run(&other_git, &["push", "origin", "main"]);
+        let new_remote = other_git.ref_head("HEAD").unwrap().unwrap();
+        assert!(
+            !git.push_with_lease("fork", "main", &remote_base)
+                .unwrap()
+                .success()
+        );
+        assert!(runner.prepare_branch_for_sync(branch).is_err());
+        assert_eq!(git.ref_head("HEAD").unwrap().unwrap(), local_head);
+        assert_eq!(
+            git.remote_head("fork", "main").unwrap().as_deref(),
+            Some(new_remote.as_str())
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn new_remote_branch_can_be_fetched_and_created_with_empty_lease() {
+        let root = std::env::temp_dir().join(format!("termiters-new-branch-{}", Uuid::new_v4()));
+        let repo = root.join("repo");
+        let remote = root.join("fork.git");
+        fs::create_dir_all(&repo).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "--bare"])
+                .arg(&remote)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let git = Git::new(&repo);
+        run(&git, &["init"]);
+        run(&git, &["config", "user.name", "TermiteRS Test"]);
+        run(&git, &["config", "user.email", "termite@example.com"]);
+        fs::write(repo.join("base.txt"), "base\n").unwrap();
+        run(&git, &["add", "base.txt"]);
+        run(&git, &["commit", "-m", "base"]);
+        run(&git, &["branch", "-M", "main"]);
+        run(&git, &["remote", "add", "fork", remote.to_str().unwrap()]);
+        assert_eq!(git.fetch_branch("fork", "main").unwrap(), None);
+        let mut config: Config = serde_yaml::from_str("repo:\n  path: .\n  upstream: unused\n  fork: unused\nbranches:\n  - name: main\n    push: force-with-lease\n").unwrap();
+        config.repo.path = repo.clone();
+        let runner = SyncRunner::new(
+            config,
+            SyncOptions {
+                branch: None,
+                dry_run: false,
+                notify_on_noop: false,
+            },
+        );
+        assert_eq!(
+            runner
+                .prepare_branch_for_sync(&runner.config.branches[0])
+                .unwrap(),
+            None
+        );
+        assert!(
+            git.push_new_branch_with_lease("fork", "main")
+                .unwrap()
+                .success()
+        );
+        let published = git.ref_head("HEAD").unwrap().unwrap();
+        fs::write(repo.join("next.txt"), "next\n").unwrap();
+        run(&git, &["add", "next.txt"]);
+        run(&git, &["commit", "-m", "next"]);
+        assert!(
+            !git.push_new_branch_with_lease("fork", "main")
+                .unwrap()
+                .success()
+        );
+        assert_eq!(
+            git.remote_head("fork", "main").unwrap().as_deref(),
+            Some(published.as_str())
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn run(git: &Git, args: &[&str]) {
+        let output = git.run_git(args).unwrap();
+        assert!(output.success(), "git {args:?}: {}", output.stderr);
     }
 }
