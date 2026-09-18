@@ -8,7 +8,11 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
-use crate::{config::Config, git::Git, linear::LinearClient};
+use crate::{
+    config::Config,
+    git::Git,
+    linear::{LinearClient, LinearIssueSummary},
+};
 
 use super::{AutonomyAction, AutonomyTarget, PermissionMode};
 
@@ -34,6 +38,7 @@ pub struct LocalTaskContext<'a> {
     pub observation: &'a str,
     pub tests: &'a [String],
     pub linear_available: bool,
+    pub linear_queried: bool,
     pub step: usize,
 }
 
@@ -60,10 +65,27 @@ impl<'a> LocalTaskRunner<'a> {
     }
 
     /// 每轮重新检查动作权限；ask 仅批准当前一步，不改变持久配置。
-    pub fn run<P, A>(&self, request: &str, mut plan: P, mut approve: A) -> Result<LocalTaskResult>
+    pub fn run<P, A>(&self, request: &str, plan: P, approve: A) -> Result<LocalTaskResult>
     where
         P: FnMut(&LocalTaskContext<'_>) -> Result<LocalTaskStep>,
         A: FnMut(&str) -> Result<bool>,
+    {
+        self.run_with_linear(request, plan, approve, |assignee| {
+            LinearClient::new(&self.config.linear).assigned_issues(assignee)
+        })
+    }
+
+    fn run_with_linear<P, A, F>(
+        &self,
+        request: &str,
+        mut plan: P,
+        mut approve: A,
+        mut fetch_linear: F,
+    ) -> Result<LocalTaskResult>
+    where
+        P: FnMut(&LocalTaskContext<'_>) -> Result<LocalTaskStep>,
+        A: FnMut(&str) -> Result<bool>,
+        F: FnMut(&str) -> Result<Vec<LinearIssueSummary>>,
     {
         let root = self.config.repo.path.clone();
         let mut tests = Vec::new();
@@ -77,6 +99,7 @@ impl<'a> LocalTaskRunner<'a> {
                     assignee: linear_assignee,
                 },
             ) != PermissionMode::Deny;
+        let mut linear_queried = false;
         let mut trace = Vec::new();
         for step in 1..=MAX_STEPS {
             let context = LocalTaskContext {
@@ -84,7 +107,8 @@ impl<'a> LocalTaskRunner<'a> {
                 repository: &root,
                 observation: &observation,
                 tests: &tests,
-                linear_available,
+                linear_available: linear_available && !linear_queried,
+                linear_queried,
                 step,
             };
             match plan(&context)? {
@@ -135,10 +159,14 @@ impl<'a> LocalTaskRunner<'a> {
                 }
                 LocalTaskStep::LinearIssues => {
                     ensure!(linear_available, "Linear 只读动作未启用或不在个人范围内");
+                    if linear_queried {
+                        trace.push("已复用本任务内的 Linear 查询结果，未重复请求。".to_string());
+                        continue;
+                    }
                     self.check_linear_permission(linear_assignee, &mut approve)?;
-                    let issues =
-                        LinearClient::new(&self.config.linear).assigned_issues(linear_assignee)?;
+                    let issues = fetch_linear(linear_assignee)?;
                     observation = bounded(serde_json::to_string(&issues)?);
+                    linear_queried = true;
                     trace.push(format!("已读取本人 Linear 事项 {} 条。", issues.len()));
                 }
                 LocalTaskStep::Finish { summary } => {
@@ -450,5 +478,56 @@ autonomy:
                 .to_string()
                 .contains("TERMITERS_LINEAR_TEST_KEY_NOT_SET")
         );
+    }
+
+    #[test]
+    fn repeated_linear_step_reuses_result_without_second_request() {
+        let raw = r#"repo:
+  path: this-repository-does-not-exist
+  upstream: unused
+  fork: unused
+linear:
+  enabled: true
+autonomy:
+  enabled: true
+  scope:
+    linear_assignee: person-1
+  permissions:
+    local_read: deny
+    linear_read: allow
+"#;
+        let config: Config = serde_yaml::from_str(raw).unwrap();
+        let mut calls = 0;
+        let mut steps = [
+            LocalTaskStep::LinearIssues,
+            LocalTaskStep::LinearIssues,
+            LocalTaskStep::Finish {
+                summary: "已概述".into(),
+            },
+        ]
+        .into_iter();
+        let result = LocalTaskRunner::new(&config)
+            .run_with_linear(
+                "看我的 Linear 事项",
+                |context| {
+                    assert_eq!(context.linear_queried, context.step > 1);
+                    assert_eq!(context.linear_available, context.step == 1);
+                    if context.step > 1 {
+                        assert_eq!(context.observation, "[]");
+                    }
+                    Ok(steps.next().unwrap())
+                },
+                |_| panic!("allow 不应请求批准"),
+                |assignee| {
+                    assert_eq!(assignee, "person-1");
+                    calls += 1;
+                    Ok(Vec::new())
+                },
+            )
+            .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(result.state, LocalTaskState::Finished);
+        assert_eq!(result.trace.len(), 2);
+        assert!(result.trace[1].contains("未重复请求"));
     }
 }
