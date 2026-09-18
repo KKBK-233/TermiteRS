@@ -169,7 +169,7 @@ impl Git {
     }
 
     pub fn add_file(&self, path: &str) -> Result<()> {
-        self.git_checked(&["add", path])?;
+        self.git_checked(&["add", "--", path])?;
         Ok(())
     }
 
@@ -349,10 +349,10 @@ impl Git {
     pub fn conflict_snapshot(&self, max_diff_bytes: usize) -> Result<ConflictSnapshot> {
         let status = self.git(&["status", "--porcelain=v1"])?.stdout;
         let files = self
-            .git(&["diff", "--name-only", "--diff-filter=U"])?
+            .git_checked(&["diff", "--name-only", "--diff-filter=U", "-z"])?
             .stdout
-            .lines()
-            .map(str::trim)
+            // NUL 分隔保留中文、换行及首尾空格，不使用 Git 的展示用转义路径。
+            .split('\0')
             .filter(|line| !line.is_empty())
             .map(ToOwned::to_owned)
             .collect();
