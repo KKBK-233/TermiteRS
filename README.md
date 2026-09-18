@@ -288,6 +288,11 @@ watch:
     author: KKBK-233
     repositories: []
 
+linear:
+  enabled: false
+  api_key_env: LINEAR_API_KEY
+  max_issues: 20
+
 autonomy:
   enabled: false
   scope:
@@ -309,7 +314,7 @@ autonomy:
     merge_pr: deny
 ```
 
-`autonomy` 只约束新增自治流程，不改变已有显式 `sync`、`daemon`、`watch` 命令。`deny` 禁止该动作，`ask` 到执行点停下请求本次确认，`allow` 允许自动执行；总开关默认关闭。每个动作独立配置，模型输出和 GitHub/Linear 正文都不能修改权限。即使设为 `allow`，具体目标仍必须同时匹配 `scope`：GitHub 仓库和 PR 作者、Linear 负责人或解析后的本地仓库绝对路径。空范围不表示“全部”。启用 `autonomy.enabled` 与 `llm.enabled` 后，助理中未匹配旧命令的自然语言会进入本地任务执行环；也可显式输入 `/task <需求>`。模型最多规划 8 步，只能查看 Git 状态、读取受限的已跟踪代码/文档文件，或选择当前分支预先配置的测试。测试仍由隔离沙箱运行；Windows 主机目前会拒绝测试，需要从 WSL/Linux 启动 TermiteRS。代码编辑、提交、推送、GitHub 回复、Linear 写入和合并尚未接入此执行环，配置为 `allow` 也不会执行这些写动作。
+`autonomy` 只约束新增自治流程，不改变已有显式 `sync`、`daemon`、`watch` 命令。`deny` 禁止该动作，`ask` 到执行点停下请求本次确认，`allow` 允许自动执行；总开关默认关闭。每个动作独立配置，模型输出和 GitHub/Linear 正文都不能修改权限。即使设为 `allow`，具体目标仍必须同时匹配 `scope`：GitHub 仓库和 PR 作者、Linear 负责人或解析后的本地仓库绝对路径。空范围不表示“全部”。启用 `autonomy.enabled` 与 `llm.enabled` 后，助理中未匹配旧命令的自然语言会进入受限任务执行环；也可显式输入 `/task <需求>`。模型最多规划 8 步，可查看 Git 状态、读取受限的已跟踪代码/文档文件、选择当前分支预先配置的测试，或读取本人分配的 Linear 事项。Linear 读取须另行设置 `linear.enabled: true`、`linear_read` 权限、`scope.linear_assignee` 为本机 API key 的 viewer UUID，并将 key 放在 `LINEAR_API_KEY` 环境变量；Codex 应用内的 Linear 授权不会传给独立运行的 TermiteRS。测试仍由隔离沙箱运行；Windows 主机目前会拒绝测试，需要从 WSL/Linux 启动 TermiteRS。代码编辑、提交、推送、GitHub 回复、Linear 写入和合并尚未接入此执行环，配置为 `allow` 也不会执行这些写动作。
 
 项目保护配置只描述人的意图：
 

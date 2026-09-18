@@ -7,6 +7,7 @@ pub mod conflict;
 pub mod daemon;
 pub mod doctor;
 pub mod git;
+pub mod linear;
 pub mod llm;
 pub mod notify;
 pub mod protection;
