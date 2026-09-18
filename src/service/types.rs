@@ -15,6 +15,7 @@ pub(crate) const ACTIVE_STATES: &[&str] = &[
     "test_failed",
     "waiting_push",
     "pushing",
+    "abandoning",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
