@@ -67,9 +67,10 @@ impl Git {
         Ok(())
     }
 
-    pub fn fetch_branch(&self, remote: &str, branch: &str) -> Result<()> {
-        self.git_checked(&["fetch", "--prune", remote, branch])?;
-        Ok(())
+    /// 获取远端跟踪分支，并返回本次获取后的提交；新分支尚不存在时返回 None。
+    pub fn fetch_branch(&self, remote: &str, branch: &str) -> Result<Option<String>> {
+        self.git_checked(&["fetch", "--prune", remote])?;
+        self.ref_head(&format!("refs/remotes/{remote}/{branch}"))
     }
 
     pub fn checkout(&self, branch: &str) -> Result<()> {
@@ -126,6 +127,13 @@ impl Git {
         expected_remote_head: &str,
     ) -> Result<CommandOutput> {
         let lease = format!("--force-with-lease=refs/heads/{branch}:{expected_remote_head}");
+        let refspec = format!("HEAD:refs/heads/{branch}");
+        self.git(&["push", &lease, remote, &refspec])
+    }
+
+    /// 空的预期提交表示远端分支必须尚不存在。
+    pub fn push_new_branch_with_lease(&self, remote: &str, branch: &str) -> Result<CommandOutput> {
+        let lease = format!("--force-with-lease=refs/heads/{branch}:");
         let refspec = format!("HEAD:refs/heads/{branch}");
         self.git(&["push", &lease, remote, &refspec])
     }
@@ -194,6 +202,11 @@ impl Git {
         Ok(self
             .git(&["rev-parse", "--verify", "--quiet", &reference])?
             .success())
+    }
+
+    pub fn ref_head(&self, reference: &str) -> Result<Option<String>> {
+        let output = self.git(&["rev-parse", "--verify", "--quiet", reference])?;
+        Ok(output.success().then(|| output.stdout.trim().to_string()))
     }
 
     pub fn remote_branch_exists(&self, remote: &str, branch: &str) -> Result<bool> {

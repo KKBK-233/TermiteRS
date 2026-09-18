@@ -86,13 +86,10 @@ impl ServiceState {
             );
         }
         if current_remote != candidate_head {
-            let output = if require_lease || matches!(branch.push, PushStrategy::ForceWithLease) {
-                if job.remote_head.is_empty() {
-                    let refspec = format!("HEAD:refs/heads/{}", branch.name);
-                    git.run_git(&["push", &config.repo.fork_remote, &refspec])?
-                } else {
-                    git.push_with_lease(&config.repo.fork_remote, &branch.name, &job.remote_head)?
-                }
+            let output = if job.remote_head.is_empty() {
+                git.push_new_branch_with_lease(&config.repo.fork_remote, &branch.name)?
+            } else if require_lease || matches!(branch.push, PushStrategy::ForceWithLease) {
+                git.push_with_lease(&config.repo.fork_remote, &branch.name, &job.remote_head)?
             } else {
                 let refspec = format!("HEAD:refs/heads/{}", branch.name);
                 git.run_git(&["push", &config.repo.fork_remote, &refspec])?
