@@ -3,7 +3,7 @@ use anyhow::Result;
 use crate::git::Git;
 
 use super::state::ServiceState;
-use super::types::{ACTIVE_STATES, BranchDashboard, Dashboard, StatusView};
+use super::types::{BranchDashboard, Dashboard, StatusView};
 use super::util::optional_short_ref;
 
 impl ServiceState {
@@ -11,10 +11,7 @@ impl ServiceState {
         let config = self.config()?;
         let git = Git::new(config.repo.path.clone());
         let jobs = self.jobs()?;
-        let active = jobs
-            .iter()
-            .filter(|job| ACTIVE_STATES.contains(&job.state.as_str()))
-            .collect::<Vec<_>>();
+        let active = self.active_job_summaries()?;
         let upstream_ref = format!(
             "{}/{}",
             config.repo.upstream_remote, config.repo.base_branch
@@ -36,7 +33,7 @@ impl ServiceState {
                 (Some(compare_ref), Some(_)) => git.ahead_behind(compare_ref, &upstream_ref).ok(),
                 _ => None,
             };
-            let current = active.iter().find(|job| job.branch == branch.name);
+            let current = active.iter().find(|(_, name, _)| name == &branch.name);
             branches.push(BranchDashboard {
                 name: branch.name.clone(),
                 note: branch.note.clone().unwrap_or_default(),
@@ -45,8 +42,8 @@ impl ServiceState {
                 remote_head,
                 upstream_ahead: upstream_count.map(|count| count.ahead),
                 upstream_behind: upstream_count.map(|count| count.behind),
-                current_job_id: current.map(|job| job.id.clone()),
-                current_state: current.map(|job| job.state.clone()),
+                current_job_id: current.map(|(id, _, _)| id.clone()),
+                current_state: current.map(|(_, _, state)| state.clone()),
             });
         }
         Ok(Dashboard {
@@ -61,11 +58,7 @@ impl ServiceState {
 
     pub(crate) fn status_view(&self) -> Result<StatusView> {
         let config = self.config()?;
-        let jobs = self.jobs()?;
-        let active_jobs = jobs
-            .iter()
-            .filter(|job| ACTIVE_STATES.contains(&job.state.as_str()))
-            .count();
+        let active_jobs = self.active_job_summaries()?.len();
         Ok(StatusView {
             repository: config.repo.path.display().to_string(),
             upstream_url: config.repo.upstream,

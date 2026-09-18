@@ -337,6 +337,23 @@ impl ServiceState {
         Ok(jobs)
     }
 
+    /// 活动任务单独全量查询，避免最近 50 条历史记录掩盖长时间运行的任务。
+    pub(crate) fn active_job_summaries(&self) -> Result<Vec<(String, String, String)>> {
+        let connection = self.open_database()?;
+        let placeholders = std::iter::repeat_n("?", ACTIVE_STATES.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT id, branch, state FROM jobs WHERE state IN ({placeholders}) ORDER BY created_at DESC"
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement.query_map(params_from_iter(ACTIVE_STATES.iter()), |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub(crate) fn job_stats(&self) -> Result<ServiceStats> {
         let connection = self.open_database()?;
         let mut stats = ServiceStats {
@@ -490,6 +507,52 @@ mod concurrency_tests {
             .collect::<Vec<_>>();
         assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
         assert_eq!(state.job(&job_id).unwrap().state, "pushing");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn old_active_job_remains_visible_after_fifty_newer_jobs() {
+        let root = std::env::temp_dir().join(format!("termiters-active-jobs-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let config_path = root.join("termite.yml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "repo:\n  path: '{}'\n  upstream: unused\n  fork: unused\nbranches:\n  - name: main\n",
+                root.display()
+            ),
+        )
+        .unwrap();
+        let (events, _) = broadcast::channel(8);
+        let state = ServiceState {
+            config_path,
+            data_dir: root.clone(),
+            database_path: root.join("termite.db"),
+            events,
+            repository_lock: Arc::new(Mutex::new(())),
+        };
+        state.initialize_database().unwrap();
+        let active_id = state.create_job("sync", "main").unwrap();
+        state
+            .open_database()
+            .unwrap()
+            .execute(
+                "UPDATE jobs SET created_at = '2000-01-01T00:00:00Z' WHERE id = ?1",
+                [active_id.as_str()],
+            )
+            .unwrap();
+        for _ in 0..50 {
+            let id = state.create_job("check", "main").unwrap();
+            state.set_state(&id, "completed", "完成").unwrap();
+        }
+        assert_eq!(state.jobs().unwrap().len(), 50);
+        assert!(!state.jobs().unwrap().iter().any(|job| job.id == active_id));
+        assert_eq!(state.status_view().unwrap().active_jobs, 1);
+        let dashboard = state.dashboard().unwrap();
+        assert_eq!(
+            dashboard.branches[0].current_job_id.as_deref(),
+            Some(active_id.as_str())
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -1,10 +1,11 @@
-use std::{env, path::Path};
+use std::{env, path::Path, time::Duration};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
 use reqwest::blocking::Client;
 use ring::digest::{SHA256, digest};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use super::{
     CandidateArtifact, DeliveryDraft, DeliveryKind, DeliveryReceipt, EvaluatedSecurityReview,
@@ -211,6 +212,7 @@ fn publish_github_issue_at(
         env::var(token_env).with_context(|| format!("缺少 GitHub Token 环境变量：{token_env}"))?;
     let client = Client::builder()
         .user_agent("TermiteRS-security-delivery/1")
+        .timeout(Duration::from_secs(30))
         .build()?;
     let endpoint = format!(
         "{}/repos/{}/issues",
@@ -218,29 +220,54 @@ fn publish_github_issue_at(
         draft.destination
     );
     let marker = format!("<!-- TermiteRS:{} -->", draft.id);
+    let owner = Uuid::new_v4().to_string();
+    anyhow::ensure!(
+        store.claim_delivery(draft_id, &owner)?,
+        "Issue 投送正在进行，请稍后重试"
+    );
+    if let Some(receipt) = store.delivery_receipt(draft_id)? {
+        store.release_delivery_claim(draft_id, &owner)?;
+        return Ok(receipt);
+    }
+    let mut post_attempted = false;
+    let issue = (|| -> Result<GithubIssueResponse> {
+        // 查询所有页，覆盖回执丢失且目标 Issue 已排在第一页之外的情况。
+        let mut page = 1u32;
+        loop {
+            store.refresh_delivery_claim(draft_id, &owner)?;
+            let page_value = page.to_string();
+            let issues = client
+                .get(&endpoint)
+                .query(&[
+                    ("state", "all"),
+                    ("per_page", "100"),
+                    ("page", page_value.as_str()),
+                ])
+                .bearer_auth(&token)
+                .header("Accept", "application/vnd.github+json")
+                .send()
+                .context("查询 GitHub Issue 幂等标记失败")?
+                .error_for_status()
+                .context("GitHub Issue 查询返回失败状态")?
+                .json::<Vec<GithubIssueResponse>>()?;
+            let count = issues.len();
+            if let Some(issue) = issues.into_iter().find(|issue| {
+                issue
+                    .body
+                    .as_deref()
+                    .is_some_and(|body| body.contains(&marker))
+            }) {
+                return Ok(issue);
+            }
+            if count < 100 {
+                break;
+            }
+            page = page.checked_add(1).context("GitHub Issue 页码溢出")?;
+        }
 
-    // 发布前先查询远端标记，覆盖“请求成功但本地写回失败”后的重试场景。
-    let existing = client
-        .get(&endpoint)
-        .query(&[("state", "all"), ("per_page", "100")])
-        .bearer_auth(&token)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .context("查询 GitHub Issue 幂等标记失败")?
-        .error_for_status()
-        .context("GitHub Issue 查询返回失败状态")?
-        .json::<Vec<GithubIssueResponse>>()?
-        .into_iter()
-        .find(|issue| {
-            issue
-                .body
-                .as_deref()
-                .is_some_and(|body| body.contains(&marker))
-        });
-    let issue = if let Some(issue) = existing {
-        issue
-    } else {
+        store.refresh_delivery_claim(draft_id, &owner)?;
         let request = github_issue_request(&draft, &marker);
+        post_attempted = true;
         client
             .post(&endpoint)
             .bearer_auth(&token)
@@ -250,7 +277,18 @@ fn publish_github_issue_at(
             .context("发布 GitHub Issue 失败")?
             .error_for_status()
             .context("GitHub Issue 发布返回失败状态")?
-            .json::<GithubIssueResponse>()?
+            .json::<GithubIssueResponse>()
+            .map_err(Into::into)
+    })();
+    let issue = match issue {
+        Ok(issue) => issue,
+        Err(err) => {
+            // POST 结果不明时保留占位，延后重试远端查询，避免立即重复投送。
+            if !post_attempted {
+                store.release_delivery_claim(draft_id, &owner)?;
+            }
+            return Err(err);
+        }
     };
     let receipt = DeliveryReceipt {
         draft_id: draft.id,
@@ -260,6 +298,7 @@ fn publish_github_issue_at(
         delivered_at: Utc::now().to_rfc3339(),
     };
     store.mark_delivery_complete(&receipt)?;
+    store.release_delivery_claim(draft_id, &owner)?;
     Ok(receipt)
 }
 
@@ -335,48 +374,7 @@ mod tests {
     fn approved_publish_uses_remote_marker_and_local_receipt_for_retries() {
         let root = std::env::temp_dir().join(format!("termiters-issue-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
-        let store = ProtectionStore::open(root.join("termite.db")).unwrap();
-        let signal = SecuritySignal {
-            id: "signal-1".to_string(),
-            project: "fixture".to_string(),
-            source: SecuritySignalSource::UserReport,
-            summary: "fixture".to_string(),
-            reference: None,
-            dedupe_key: "signal-dedupe".to_string(),
-            received_at: "now".to_string(),
-        };
-        let finding = ProtectionFinding {
-            id: "finding-1".to_string(),
-            project: "fixture".to_string(),
-            signal_id: signal.id.clone(),
-            state: FindingState::Affected,
-            classification: "fixture".to_string(),
-            severity: "p1".to_string(),
-            confidence: "high".to_string(),
-            affected: Some(true),
-            build_allowed: false,
-            summary: "fixture".to_string(),
-            evidence: vec!["evidence".to_string()],
-            dedupe_key: "finding-dedupe".to_string(),
-            created_at: "now".to_string(),
-            updated_at: "now".to_string(),
-        };
-        let draft = DeliveryDraft {
-            id: "draft-live-test".to_string(),
-            finding_id: finding.id.clone(),
-            kind: DeliveryKind::GithubIssue,
-            destination: "owner/repo".to_string(),
-            title: "security finding".to_string(),
-            body: "evidence".to_string(),
-            labels: vec!["security".to_string()],
-            dedupe_key: "draft-dedupe".to_string(),
-            approval_required: true,
-            created_at: "now".to_string(),
-        };
-        store.upsert_signal(&signal).unwrap();
-        store.upsert_finding(&finding).unwrap();
-        store.upsert_delivery_draft(&draft).unwrap();
-        drop(store);
+        let draft = saved_draft(&root);
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -424,6 +422,106 @@ mod tests {
         assert_eq!(first, repeated);
         unsafe { std::env::remove_var(&token_env) };
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_marker_on_second_page_prevents_duplicate_post() {
+        let root = std::env::temp_dir().join(format!("termiters-issue-page-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let draft = saved_draft(&root);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut first);
+            assert!(request.contains("page=1"));
+            let first_page = (0..100)
+                .map(|number| serde_json::json!({"number": number, "html_url": "https://github.com/owner/repo/issues/1", "body": "unrelated"}))
+                .collect::<Vec<_>>();
+            write_json_response(&mut first, &serde_json::to_string(&first_page).unwrap());
+            let (mut second, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut second);
+            assert!(request.contains("page=2"));
+            write_json_response(
+                &mut second,
+                r#"[{"number":42,"html_url":"https://github.com/owner/repo/issues/42","body":"<!-- TermiteRS:draft-live-test -->"}]"#,
+            );
+        });
+        let token_env = format!("TERMITERS_GITHUB_TEST_{}", Uuid::new_v4().simple());
+        unsafe { std::env::set_var(&token_env, "test-token") };
+        let receipt = publish_github_issue_at(
+            &root,
+            &draft.id,
+            &token_env,
+            true,
+            &format!("http://{address}"),
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(receipt.remote_id, "42");
+        unsafe { std::env::remove_var(&token_env) };
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn draft_claim_allows_only_one_publisher() {
+        let root = std::env::temp_dir().join(format!("termiters-issue-claim-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let draft = saved_draft(&root);
+        let mut first = ProtectionStore::open(root.join("termite.db")).unwrap();
+        let mut second = ProtectionStore::open(root.join("termite.db")).unwrap();
+        assert!(first.claim_delivery(&draft.id, "first").unwrap());
+        assert!(!second.claim_delivery(&draft.id, "second").unwrap());
+        first.release_delivery_claim(&draft.id, "first").unwrap();
+        assert!(second.claim_delivery(&draft.id, "second").unwrap());
+        drop(first);
+        drop(second);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn saved_draft(root: &Path) -> DeliveryDraft {
+        let store = ProtectionStore::open(root.join("termite.db")).unwrap();
+        let signal = SecuritySignal {
+            id: "signal-1".to_string(),
+            project: "fixture".to_string(),
+            source: SecuritySignalSource::UserReport,
+            summary: "fixture".to_string(),
+            reference: None,
+            dedupe_key: "signal-dedupe".to_string(),
+            received_at: "now".to_string(),
+        };
+        let finding = ProtectionFinding {
+            id: "finding-1".to_string(),
+            project: "fixture".to_string(),
+            signal_id: signal.id.clone(),
+            state: FindingState::Affected,
+            classification: "fixture".to_string(),
+            severity: "p1".to_string(),
+            confidence: "high".to_string(),
+            affected: Some(true),
+            build_allowed: false,
+            summary: "fixture".to_string(),
+            evidence: vec!["evidence".to_string()],
+            dedupe_key: "finding-dedupe".to_string(),
+            created_at: "now".to_string(),
+            updated_at: "now".to_string(),
+        };
+        let draft = DeliveryDraft {
+            id: "draft-live-test".to_string(),
+            finding_id: finding.id.clone(),
+            kind: DeliveryKind::GithubIssue,
+            destination: "owner/repo".to_string(),
+            title: "security finding".to_string(),
+            body: "evidence".to_string(),
+            labels: vec!["security".to_string()],
+            dedupe_key: "draft-dedupe".to_string(),
+            approval_required: true,
+            created_at: "now".to_string(),
+        };
+        store.upsert_signal(&signal).unwrap();
+        store.upsert_finding(&finding).unwrap();
+        store.upsert_delivery_draft(&draft).unwrap();
+        draft
     }
 
     fn read_http_request(stream: &mut TcpStream) -> String {

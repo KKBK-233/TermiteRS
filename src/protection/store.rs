@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use super::{
     CandidateArtifact, DeliveryDraft, DeliveryReceipt, EvaluatedContractVerification,
@@ -163,6 +163,41 @@ impl ProtectionStore {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    /// 跨进程独占投送草稿；过期占位只在上一请求无法继续活动后回收。
+    pub fn claim_delivery(&mut self, draft_id: &str, owner: &str) -> Result<bool> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let expired = (Utc::now() - chrono::Duration::minutes(2)).timestamp_millis();
+        transaction.execute(
+            "DELETE FROM delivery_claims WHERE draft_id = ?1 AND claimed_at < ?2",
+            params![draft_id, expired],
+        )?;
+        let changed = transaction.execute(
+            "INSERT OR IGNORE INTO delivery_claims (draft_id, owner, claimed_at) VALUES (?1, ?2, ?3)",
+            params![draft_id, owner, Utc::now().timestamp_millis()],
+        )?;
+        transaction.commit()?;
+        Ok(changed == 1)
+    }
+
+    pub fn refresh_delivery_claim(&self, draft_id: &str, owner: &str) -> Result<()> {
+        let changed = self.connection.execute(
+            "UPDATE delivery_claims SET claimed_at = ?3 WHERE draft_id = ?1 AND owner = ?2",
+            params![draft_id, owner, Utc::now().timestamp_millis()],
+        )?;
+        anyhow::ensure!(changed == 1, "Issue 投送占位已失效，拒绝继续发布");
+        Ok(())
+    }
+
+    pub fn release_delivery_claim(&self, draft_id: &str, owner: &str) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM delivery_claims WHERE draft_id = ?1 AND owner = ?2",
+            params![draft_id, owner],
+        )?;
+        Ok(())
     }
 
     pub fn mark_delivery_complete(&mut self, receipt: &DeliveryReceipt) -> Result<()> {
@@ -452,6 +487,12 @@ pub(crate) fn initialize_protection_schema(connection: &Connection) -> Result<()
             remote_id TEXT NOT NULL,
             remote_url TEXT NOT NULL,
             delivered_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS delivery_claims (
+            draft_id TEXT PRIMARY KEY REFERENCES delivery_drafts(id),
+            owner TEXT NOT NULL,
+            claimed_at INTEGER NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS commit_security_reviews (
