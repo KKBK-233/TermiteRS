@@ -34,8 +34,8 @@ impl ServiceState {
         let options = LlmService::new(config.llm.clone())
             .conflict_options(&request, &conversation)?
             .context("DeepSeek 未启用")?;
-        self.open_database()?.execute(
-            "UPDATE jobs SET options_json = ?2, proposal_json = NULL, summary = ?3, updated_at = ?4 WHERE id = ?1",
+        let changed = self.open_database()?.execute(
+            "UPDATE jobs SET options_json = ?2, proposal_json = NULL, summary = ?3, updated_at = ?4 WHERE id = ?1 AND state IN ('waiting_guidance', 'test_failed')",
             params![
                 job_id,
                 serde_json::to_string(&options)?,
@@ -43,6 +43,10 @@ impl ServiceState {
                 timestamp()
             ],
         )?;
+        anyhow::ensure!(
+            changed == 1,
+            "任务状态已变化，指导方案没有覆盖正在应用的候选"
+        );
         self.open_database()?.execute(
             "INSERT INTO messages (job_id, role, content, created_at) VALUES (?1, 'assistant', ?2, ?3)",
             params![
@@ -77,10 +81,11 @@ impl ServiceState {
             .iter()
             .find(|option| option.id == option_id)
             .context("选择的方案不存在")?;
-        self.open_database()?.execute(
-            "UPDATE jobs SET state = 'generating_proposal', proposal_json = NULL, summary = '正在生成候选修改', updated_at = ?2 WHERE id = ?1",
+        let changed = self.open_database()?.execute(
+            "UPDATE jobs SET state = 'generating_proposal', proposal_json = NULL, summary = '正在生成候选修改', updated_at = ?2 WHERE id = ?1 AND state IN ('waiting_guidance', 'test_failed')",
             params![job_id, timestamp()],
         )?;
+        anyhow::ensure!(changed == 1, "任务状态已变化，不能重复生成候选");
         self.emit(Some(job_id), "proposal", "正在生成候选修改")
     }
 
@@ -157,7 +162,16 @@ impl ServiceState {
         if job.proposal.is_none() {
             bail!("请先生成候选修改");
         }
-        self.set_state(job_id, "applying", "正在应用候选修改并执行测试")
+        let changed = self.open_database()?.execute(
+            "UPDATE jobs SET state = 'applying', summary = '正在应用候选修改并执行测试', updated_at = ?2 WHERE id = ?1 AND state IN ('waiting_guidance', 'test_failed') AND proposal_json IS NOT NULL",
+            params![job_id, timestamp()],
+        )?;
+        anyhow::ensure!(changed == 1, "任务状态或候选已变化，不能重复应用");
+        self.emit(
+            Some(job_id),
+            "state",
+            "applying: 正在应用候选修改并执行测试",
+        )
     }
 
     pub(crate) fn execute_apply(&self, job_id: &str) {
