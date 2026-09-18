@@ -2,13 +2,13 @@
 
 use std::{
     fs,
-    path::{Component, Path},
+    path::{Component, Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
-use crate::{config::Config, git::Git};
+use crate::{config::Config, git::Git, linear::LinearClient};
 
 use super::{AutonomyAction, AutonomyTarget, PermissionMode};
 
@@ -23,6 +23,7 @@ pub enum LocalTaskStep {
     Inspect,
     ReadFile { path: String },
     RunTests { test_index: usize },
+    LinearIssues,
     Finish { summary: String },
 }
 
@@ -32,6 +33,7 @@ pub struct LocalTaskContext<'a> {
     pub repository: &'a Path,
     pub observation: &'a str,
     pub tests: &'a [String],
+    pub linear_available: bool,
     pub step: usize,
 }
 
@@ -63,38 +65,18 @@ impl<'a> LocalTaskRunner<'a> {
         P: FnMut(&LocalTaskContext<'_>) -> Result<LocalTaskStep>,
         A: FnMut(&str) -> Result<bool>,
     {
-        let root = self
-            .config
-            .repo
-            .path
-            .canonicalize()
-            .context("本地仓库不存在")?;
-        let git = Git::new(&root);
-        let top = git.run_git(&["rev-parse", "--show-toplevel"])?;
-        ensure!(top.success(), "自治任务目标不是 Git 仓库");
-        ensure!(
-            Path::new(top.stdout.trim()).canonicalize()? == root,
-            "自治任务只接受仓库根目录"
-        );
-        self.check_permission(AutonomyAction::LocalRead, &root, &mut approve)?;
-
-        let branch = git.run_git(&["symbolic-ref", "--short", "HEAD"])?;
-        let tests = if branch.success() {
-            self.config
-                .branches
-                .iter()
-                .find(|entry| entry.name == branch.stdout.trim())
-                .map(|entry| entry.tests.clone())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let mut observation = format!(
-            "仓库：{}；当前分支：{}；可选测试数：{}。",
-            root.display(),
-            branch.stdout.trim(),
-            tests.len()
-        );
+        let root = self.config.repo.path.clone();
+        let mut tests = Vec::new();
+        let mut observation =
+            "尚未执行任何动作；本地测试须先 inspect 才能列出当前分支的测试。".to_string();
+        let linear_assignee = &self.config.autonomy.scope.linear_assignee;
+        let linear_available = self.config.linear.enabled
+            && self.config.autonomy.authorize(
+                AutonomyAction::LinearRead,
+                AutonomyTarget::Linear {
+                    assignee: linear_assignee,
+                },
+            ) != PermissionMode::Deny;
         let mut trace = Vec::new();
         for step in 1..=MAX_STEPS {
             let context = LocalTaskContext {
@@ -102,37 +84,62 @@ impl<'a> LocalTaskRunner<'a> {
                 repository: &root,
                 observation: &observation,
                 tests: &tests,
+                linear_available,
                 step,
             };
             match plan(&context)? {
                 LocalTaskStep::Inspect => {
-                    self.check_permission(AutonomyAction::LocalRead, &root, &mut approve)?;
+                    let (_, git) =
+                        self.local_git(AutonomyAction::LocalRead, &root, &mut approve)?;
                     let status = git.run_git(&["status", "--short"])?;
                     ensure!(status.success(), "读取 Git 状态失败");
                     let files = git.run_git(&["ls-files"])?;
                     ensure!(files.success(), "列出仓库文件失败");
+                    let branch = git.run_git(&["symbolic-ref", "--short", "HEAD"])?;
+                    tests = if branch.success() {
+                        self.config
+                            .branches
+                            .iter()
+                            .find(|entry| entry.name == branch.stdout.trim())
+                            .map(|entry| entry.tests.clone())
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
                     observation = bounded(format!(
-                        "Git 状态：\n{}\n跟踪文件：\n{}",
-                        status.stdout, files.stdout
+                        "当前分支：{}；可选测试数：{}\nGit 状态：\n{}\n跟踪文件：\n{}",
+                        branch.stdout.trim(),
+                        tests.len(),
+                        status.stdout,
+                        files.stdout
                     ));
                     trace.push("已读取 Git 状态和跟踪文件名。".to_string());
                 }
                 LocalTaskStep::ReadFile { path } => {
-                    self.check_permission(AutonomyAction::LocalRead, &root, &mut approve)?;
-                    observation = bounded(read_tracked_file(&git, &root, &path)?);
+                    let (resolved, git) =
+                        self.local_git(AutonomyAction::LocalRead, &root, &mut approve)?;
+                    observation = bounded(read_tracked_file(&git, &resolved, &path)?);
                     trace.push(format!("已读取受限文件：{path}"));
                 }
                 LocalTaskStep::RunTests { test_index } => {
                     let Some(command) = tests.get(test_index) else {
-                        bail!("模型选择了未配置的测试序号 {test_index}");
+                        bail!("模型选择了未配置的测试序号 {test_index}；请先 inspect 当前分支");
                     };
-                    self.check_permission(AutonomyAction::RunTests, &root, &mut approve)?;
+                    let (_, git) = self.local_git(AutonomyAction::RunTests, &root, &mut approve)?;
                     let output = git.run_test_sandboxed(command)?;
                     observation = bounded(format!(
                         "测试：{command}\n退出码：{}\nstdout:\n{}\nstderr:\n{}",
                         output.status, output.stdout, output.stderr
                     ));
                     trace.push(format!("沙箱测试 `{command}`：退出码 {}", output.status));
+                }
+                LocalTaskStep::LinearIssues => {
+                    ensure!(linear_available, "Linear 只读动作未启用或不在个人范围内");
+                    self.check_linear_permission(linear_assignee, &mut approve)?;
+                    let issues =
+                        LinearClient::new(&self.config.linear).assigned_issues(linear_assignee)?;
+                    observation = bounded(serde_json::to_string(&issues)?);
+                    trace.push(format!("已读取本人 Linear 事项 {} 条。", issues.len()));
                 }
                 LocalTaskStep::Finish { summary } => {
                     ensure!(!summary.trim().is_empty(), "模型没有给出任务结论");
@@ -151,20 +158,48 @@ impl<'a> LocalTaskRunner<'a> {
         })
     }
 
-    fn check_permission<A>(
+    fn local_git<A>(
         &self,
         action: AutonomyAction,
         root: &Path,
+        approve: &mut A,
+    ) -> Result<(PathBuf, Git)>
+    where
+        A: FnMut(&str) -> Result<bool>,
+    {
+        let resolved = root.canonicalize().context("本地仓库不存在")?;
+        self.check_permission(action, AutonomyTarget::Local { path: &resolved }, approve)?;
+        let git = Git::new(&resolved);
+        let top = git.run_git(&["rev-parse", "--show-toplevel"])?;
+        ensure!(top.success(), "自治任务目标不是 Git 仓库");
+        ensure!(
+            Path::new(top.stdout.trim()).canonicalize()? == resolved,
+            "自治任务只接受仓库根目录"
+        );
+        Ok((resolved, git))
+    }
+
+    fn check_linear_permission<A>(&self, assignee: &str, approve: &mut A) -> Result<()>
+    where
+        A: FnMut(&str) -> Result<bool>,
+    {
+        self.check_permission(
+            AutonomyAction::LinearRead,
+            AutonomyTarget::Linear { assignee },
+            approve,
+        )
+    }
+
+    fn check_permission<A>(
+        &self,
+        action: AutonomyAction,
+        target: AutonomyTarget<'_>,
         approve: &mut A,
     ) -> Result<()>
     where
         A: FnMut(&str) -> Result<bool>,
     {
-        match self
-            .config
-            .autonomy
-            .authorize(action, AutonomyTarget::Local { path: root })
-        {
+        match self.config.autonomy.authorize(action, target) {
             PermissionMode::Deny => {
                 bail!("权限拒绝 {}：仓库不在 scope 内或动作被禁用", action.key())
             }
@@ -336,9 +371,14 @@ mod tests {
     #[test]
     fn test_action_requires_permission_and_never_accepts_model_command() {
         let (root, mut config) = fixture();
+        let mut steps = [
+            LocalTaskStep::Inspect,
+            LocalTaskStep::RunTests { test_index: 0 },
+        ]
+        .into_iter();
         let result = LocalTaskRunner::new(&config).run(
             "测试",
-            |_| Ok(LocalTaskStep::RunTests { test_index: 0 }),
+            |_| Ok(steps.next().unwrap()),
             |_| panic!("deny 不应请求批准"),
         );
         assert!(
@@ -348,11 +388,13 @@ mod tests {
                 .contains("权限拒绝 run_tests")
         );
         config.autonomy.permissions.run_tests = PermissionMode::Ask;
-        let result = LocalTaskRunner::new(&config).run(
-            "测试",
-            |_| Ok(LocalTaskStep::RunTests { test_index: 0 }),
-            |_| Ok(false),
-        );
+        let mut steps = [
+            LocalTaskStep::Inspect,
+            LocalTaskStep::RunTests { test_index: 0 },
+        ]
+        .into_iter();
+        let result =
+            LocalTaskRunner::new(&config).run("测试", |_| Ok(steps.next().unwrap()), |_| Ok(false));
         assert!(result.unwrap_err().to_string().contains("等待人工决定"));
         assert!(
             serde_json::from_str::<LocalTaskStep>(r#"{"action":"run_tests","command":"rm -rf ."}"#)
@@ -374,5 +416,39 @@ mod tests {
                 .contains("权限拒绝 local_read")
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn linear_read_does_not_require_local_repository_permission() {
+        let raw = r#"repo:
+  path: this-repository-does-not-exist
+  upstream: unused
+  fork: unused
+linear:
+  enabled: true
+  api_key_env: TERMITERS_LINEAR_TEST_KEY_NOT_SET
+autonomy:
+  enabled: true
+  scope:
+    linear_assignee: person-1
+  permissions:
+    local_read: deny
+    linear_read: allow
+"#;
+        let config: Config = serde_yaml::from_str(raw).unwrap();
+        let result = LocalTaskRunner::new(&config).run(
+            "看我的 Linear 事项",
+            |context| {
+                assert!(context.linear_available);
+                Ok(LocalTaskStep::LinearIssues)
+            },
+            |_| panic!("allow 不应请求批准"),
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("TERMITERS_LINEAR_TEST_KEY_NOT_SET")
+        );
     }
 }

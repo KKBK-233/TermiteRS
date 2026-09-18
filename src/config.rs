@@ -24,7 +24,39 @@ pub struct Config {
     #[serde(default)]
     pub watch: WatchConfig,
     #[serde(default)]
+    pub linear: LinearConfig,
+    #[serde(default)]
     pub autonomy: AutonomyConfig,
+}
+
+/// 本机 Linear API 凭据仅从环境变量读取；默认不启用网络读取。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinearConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_linear_api_key_env")]
+    pub api_key_env: String,
+    #[serde(default = "default_linear_max_issues")]
+    pub max_issues: usize,
+}
+
+impl Default for LinearConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key_env: default_linear_api_key_env(),
+            max_issues: default_linear_max_issues(),
+        }
+    }
+}
+
+fn default_linear_api_key_env() -> String {
+    "LINEAR_API_KEY".to_string()
+}
+
+fn default_linear_max_issues() -> usize {
+    20
 }
 
 /// 个人事项追踪配置。首版只读取 GitHub，并把状态变化落到本机数据库。
