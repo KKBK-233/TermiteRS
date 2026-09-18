@@ -75,6 +75,10 @@ linear:
 
 autonomy:
   enabled: false
+  reports:
+    # 可选；启用后保存请求、执行轨迹和结论，不保存原始观察或凭据。
+    enabled: false
+    data_dir: .termite/reports
   scope:
     github_owners: [D-Nine-Chain]
     github_repositories: []

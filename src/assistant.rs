@@ -4,7 +4,10 @@ use std::{env, fs};
 
 use anyhow::{Context, Result};
 
-use crate::autonomy::local_task::{LocalTaskRunner, LocalTaskState};
+use crate::autonomy::{
+    local_task::{LocalTaskRunner, LocalTaskState},
+    task_report::{TaskReport, TaskReportStore, render_report, render_report_list},
+};
 use crate::config::Config;
 use crate::daemon::Daemon;
 use crate::doctor::Doctor;
@@ -77,6 +80,8 @@ impl Assistant {
                 "/doctor" => self.run_doctor()?,
                 "/status" => self.run_status()?,
                 "/permissions" => self.run_permissions()?,
+                "/reports" => self.run_task_reports()?,
+                "/report" => println!("用法：/report <报告 ID>"),
                 "/once" => self.run_daemon_once()?,
                 "/daemon" => {
                     self.run_daemon()?;
@@ -88,7 +93,9 @@ impl Assistant {
                 "/watch-tasks" => self.run_watch_tasks()?,
                 "/watch-decisions" => self.run_watch_assessments()?,
                 _ => {
-                    if let Some(request) = input.strip_prefix("/task ") {
+                    if let Some(report_id) = input.strip_prefix("/report ") {
+                        self.run_task_report(report_id)?;
+                    } else if let Some(request) = input.strip_prefix("/task ") {
                         if let Err(err) = self.run_local_task(request.trim()) {
                             println!("本地任务已停止：{err:#}");
                         }
@@ -145,6 +152,10 @@ impl Assistant {
             config.llm.as_ref().is_some_and(|llm| llm.enabled),
             "LLM 未启用；请先配置 llm.enabled"
         );
+        let llm_config = config.llm.as_ref().expect("已检查 LLM 配置");
+        let provider = llm_config.provider.label();
+        let model = llm_config.model.clone();
+        let redactions = report_redactions(&config);
         let llm = LlmService::new(config.llm.clone());
         let result = LocalTaskRunner::new(&config).run(
             request,
@@ -159,16 +170,74 @@ impl Assistant {
                     "y" | "yes" | "是"
                 ))
             },
-        )?;
-        for line in result.trace {
+        );
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                let report = TaskReport::failed(
+                    request,
+                    provider,
+                    &model,
+                    &format!("{error:#}"),
+                    &redactions,
+                );
+                if let Err(report_error) = self.save_task_report(&config, &report) {
+                    eprintln!("任务报告保存失败：{report_error:#}");
+                }
+                return Err(error);
+            }
+        };
+        for line in &result.trace {
             println!("- {line}");
         }
-        match result.state {
+        match &result.state {
             LocalTaskState::Finished => println!(
                 "模型结论（本任务执行环未提供代码修改、提交或远端写入）：{}",
                 result.summary
             ),
             LocalTaskState::Stopped => println!("任务停止：{}", result.summary),
+        }
+        let report = TaskReport::completed(
+            request,
+            provider,
+            &model,
+            result.state,
+            &result.trace,
+            &result.summary,
+            &redactions,
+        );
+        self.save_task_report(&config, &report)?;
+        Ok(())
+    }
+
+    fn save_task_report(&self, config: &Config, report: &TaskReport) -> Result<()> {
+        if let Some(id) = TaskReportStore::new(&config.autonomy.reports).save(report)? {
+            println!("任务报告已保存：{}（使用 /report {} 查看）", id, &id[..8]);
+        }
+        Ok(())
+    }
+
+    fn run_task_reports(&self) -> Result<()> {
+        let config = Config::read_from(&self.config_path)?;
+        let store = TaskReportStore::new(&config.autonomy.reports);
+        if !store.enabled() {
+            println!("任务报告未启用；请设置 autonomy.reports.enabled: true。");
+            return Ok(());
+        }
+        println!("{}", render_report_list(&store.list(20)?));
+        Ok(())
+    }
+
+    fn run_task_report(&self, report_id: &str) -> Result<()> {
+        let config = Config::read_from(&self.config_path)?;
+        let store = TaskReportStore::new(&config.autonomy.reports);
+        if !store.enabled() {
+            println!("任务报告未启用；请设置 autonomy.reports.enabled: true。");
+            return Ok(());
+        }
+        match store.get(report_id)? {
+            Some(report) => println!("{}", render_report(&report)),
+            None => println!("未找到任务报告：{}", report_id.trim()),
         }
         Ok(())
     }
@@ -494,6 +563,8 @@ fn print_help() {
     println!("  /status  查看分支状态");
     println!("  /permissions 查看自治流程的有效权限");
     println!("  /task <需求> 在本地仓库运行受限模型任务");
+    println!("  /reports 查看最近 20 份模型任务报告");
+    println!("  /report <ID> 查看一份模型任务报告");
     println!("  /once    运行一次 daemon 同步并退出本次同步");
     println!("  /daemon  启动常驻核心进程");
     println!("  /watch   立即刷新个人 PR / CI 状态");
@@ -509,6 +580,25 @@ fn print_help() {
     println!("自然语言示例：");
     println!("  我只想维护 my/ok-ww，自用分支，允许改远端历史，每小时检查一次。");
     println!("  持续盯着我的 D9 PR，CI 或审查状态变化时记录下来，每十分钟检查一次。");
+}
+
+fn report_redactions(config: &Config) -> Vec<String> {
+    let mut names = vec![
+        config.linear.api_key_env.as_str(),
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+    ];
+    if let Some(llm) = &config.llm {
+        names.push(llm.api_key_env.as_str());
+    }
+    let mut values = names
+        .into_iter()
+        .filter_map(|name| env::var(name).ok())
+        .filter(|value| value.len() >= 8)
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    values
 }
 
 fn wants_watch_task(input: &str) -> bool {

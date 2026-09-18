@@ -203,7 +203,7 @@ cargo run -- permissions --config termite.yml
 cargo run
 ```
 
-在助理内可以输入 `/check` 执行 `doctor` 和 `sync --dry-run`，输入 `/sync` 执行 `doctor` 和正式同步，输入 `/daemon` 启动常驻核心，输入 `/once` 运行一次同步；个人事项使用 `/watch`、`/watch-status`、`/watch-events` 和 `/watch-tasks`；输入 `/permissions` 查看自治动作的有效权限，`/task <需求>` 启动本地受限任务，`/exit` 退出。
+在助理内可以输入 `/check` 执行 `doctor` 和 `sync --dry-run`，输入 `/sync` 执行 `doctor` 和正式同步，输入 `/daemon` 启动常驻核心，输入 `/once` 运行一次同步；个人事项使用 `/watch`、`/watch-status`、`/watch-events` 和 `/watch-tasks`；输入 `/permissions` 查看自治动作的有效权限，`/task <需求>` 启动本地受限任务。启用任务报告后，使用 `/reports` 查看最近报告，用 `/report <ID>` 回看请求、执行轨迹、状态和模型结论；输入 `/exit` 退出。
 
 原有命令保持兼容。助理窗口现在也接受“持续盯着我的 D9 PR，CI 或审查状态变化时记录下来，每十分钟检查一次”这样的自然语言。模型只生成受限任务计划，Rust 核心校验 GitHub 范围、间隔并持久化；窗口保持打开时，调度器会自动执行到期任务。状态变化会按需补取有限的新评论、审查线程和失败日志，并进入只读评估队列；外部正文始终按不可信证据处理，限制总量且清理终端控制字符。使用 `/watch-decisions` 查看评估；需要改代码、推送、回复、合并或写 Linear 的建议一定标为“待判断”。可使用 `/watch-pause <名称>` 和 `/watch-resume <名称>` 控制任务，不会写入 GitHub 或触发分支同步。
 
@@ -295,6 +295,9 @@ linear:
 
 autonomy:
   enabled: false
+  reports:
+    enabled: false
+    data_dir: .termite/reports
   scope:
     github_owners: [D-Nine-Chain]
     github_repositories: []
@@ -314,7 +317,7 @@ autonomy:
     merge_pr: deny
 ```
 
-`autonomy` 只约束新增自治流程，不改变已有显式 `sync`、`daemon`、`watch` 命令。`deny` 禁止该动作，`ask` 到执行点停下请求本次确认，`allow` 允许自动执行；总开关默认关闭。每个动作独立配置，模型输出和 GitHub/Linear 正文都不能修改权限。即使设为 `allow`，具体目标仍必须同时匹配 `scope`：GitHub 仓库和 PR 作者、Linear 负责人或解析后的本地仓库绝对路径。空范围不表示“全部”。启用 `autonomy.enabled` 与 `llm.enabled` 后，助理中未匹配旧命令的自然语言会进入受限任务执行环；也可显式输入 `/task <需求>`。模型最多规划 8 步，可查看 Git 状态、读取受限的已跟踪代码/文档文件、选择当前分支预先配置的测试，或读取本人分配的 Linear 事项。Linear 读取须另行设置 `linear.enabled: true`、`linear_read` 权限、`scope.linear_assignee` 为本机 API key 的 viewer UUID，并将 key 放在 `LINEAR_API_KEY` 环境变量；Codex 应用内的 Linear 授权不会传给独立运行的 TermiteRS。测试仍由隔离沙箱运行；Windows 主机目前会拒绝测试，需要从 WSL/Linux 启动 TermiteRS。代码编辑、提交、推送、GitHub 回复、Linear 写入和合并尚未接入此执行环，配置为 `allow` 也不会执行这些写动作。
+`autonomy` 只约束新增自治流程，不改变已有显式 `sync`、`daemon`、`watch` 命令。`deny` 禁止该动作，`ask` 到执行点停下请求本次确认，`allow` 允许自动执行；总开关默认关闭。每个动作独立配置，模型输出和 GitHub/Linear 正文都不能修改权限。即使设为 `allow`，具体目标仍必须同时匹配 `scope`：GitHub 仓库和 PR 作者、Linear 负责人或解析后的本地仓库绝对路径。空范围不表示“全部”。启用 `autonomy.enabled` 与 `llm.enabled` 后，助理中未匹配旧命令的自然语言会进入受限任务执行环；也可显式输入 `/task <需求>`。模型最多规划 8 步，可查看 Git 状态、读取受限的已跟踪代码/文档文件、选择当前分支预先配置的测试，或读取本人分配的 Linear 事项。`autonomy.reports.enabled` 独立控制报告持久化，默认关闭；启用后，完成、停止和失败任务均写入 `data_dir`，报告只包含有长度上限且清理控制字符的请求、动作轨迹和结论，不包含文件正文、模型原始观察或 API key，当前进程已加载的凭据值还会在写入前精确替换。Linear 读取须另行设置 `linear.enabled: true`、`linear_read` 权限、`scope.linear_assignee` 为本机 API key 的 viewer UUID，并将 key 放在 `LINEAR_API_KEY` 环境变量；Codex 应用内的 Linear 授权不会传给独立运行的 TermiteRS。测试仍由隔离沙箱运行；Windows 主机目前会拒绝测试，需要从 WSL/Linux 启动 TermiteRS。代码编辑、提交、推送、GitHub 回复、Linear 写入和合并尚未接入此执行环，配置为 `allow` 也不会执行这些写动作。
 
 项目保护配置只描述人的意图：
 

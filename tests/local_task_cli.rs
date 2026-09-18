@@ -76,7 +76,7 @@ fn natural_language_runs_scoped_read_only_loop() {
 
     let path = root.to_string_lossy().replace('\\', "/");
     let config = format!(
-        "repo:\n  path: '{path}'\n  upstream: unused\n  fork: unused\nautonomy:\n  enabled: true\n  scope:\n    local_repositories: ['{path}']\n  permissions:\n    local_read: allow\nllm:\n  enabled: true\n  provider: open-ai-compatible\n  model: mock\n  api_key_env: TERMITERS_TEST_API_KEY\n  base_url: http://127.0.0.1:{port}\n  max_retries: 0\nwatch:\n  enabled: false\n"
+        "repo:\n  path: '{path}'\n  upstream: unused\n  fork: unused\nautonomy:\n  enabled: true\n  reports:\n    enabled: true\n    data_dir: .termite/reports\n  scope:\n    local_repositories: ['{path}']\n  permissions:\n    local_read: allow\nllm:\n  enabled: true\n  provider: open-ai-compatible\n  model: mock\n  api_key_env: TERMITERS_TEST_API_KEY\n  base_url: http://127.0.0.1:{port}\n  max_retries: 0\nwatch:\n  enabled: false\n"
     );
     fs::write(root.join("termite.yml"), config).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_TermiteRS"))
@@ -106,6 +106,48 @@ fn natural_language_runs_scoped_read_only_loop() {
     );
     assert!(stdout.contains("已读取 Git 状态和跟踪文件名"), "{stdout}");
     assert!(stdout.contains("已检查，未修改"), "{stdout}");
+    assert!(stdout.contains("任务报告已保存"), "{stdout}");
     assert!(!stdout.contains("开始执行 doctor"), "{stdout}");
+
+    let report_path = fs::read_dir(root.join(".termite/reports"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .unwrap();
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report_path).unwrap()).unwrap();
+    let report_id = report["id"].as_str().unwrap();
+    assert_eq!(report["outcome"], "finished");
+    assert_eq!(report["summary"], "已检查，未修改");
+    assert!(
+        !fs::read_to_string(&report_path)
+            .unwrap()
+            .contains("mock-key")
+    );
+
+    let mut report_child = Command::new(env!("CARGO_BIN_EXE_TermiteRS"))
+        .current_dir(&root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    report_child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("/reports\n/report {}\n/exit\n", &report_id[..8]).as_bytes())
+        .unwrap();
+    let report_output = report_child.wait_with_output().unwrap();
+    let report_stdout = String::from_utf8_lossy(&report_output.stdout);
+    assert!(report_output.status.success());
+    assert!(report_stdout.contains(&report_id[..8]), "{report_stdout}");
+    assert!(
+        report_stdout.contains("模型结论：\n已检查，未修改"),
+        "{report_stdout}"
+    );
     fs::remove_dir_all(root).unwrap();
 }
