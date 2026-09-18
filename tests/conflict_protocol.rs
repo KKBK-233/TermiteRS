@@ -63,6 +63,60 @@ fn block_resolution_continues_real_git_rebase() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// 真实合并冲突覆盖中文、空格、选项形状及 Unix 特殊文件名。
+#[test]
+fn conflict_paths_round_trip_without_display_escaping() {
+    let root = std::env::temp_dir().join(format!("termiters-paths-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    run(&root, &["init"]);
+    run(&root, &["config", "user.name", "TermiteRS Test"]);
+    run(&root, &["config", "user.email", "termite@example.com"]);
+    run(&root, &["config", "core.quotePath", "true"]);
+    let mut names = vec!["中文.txt", " leading.txt", "-option.txt"];
+    if cfg!(unix) {
+        names.extend([
+            "trailing.txt ",
+            "line\nbreak.txt",
+            "tab\tname.txt",
+            "quote\".txt",
+        ]);
+    }
+    for name in &names {
+        fs::write(root.join(name), "base\n").unwrap();
+    }
+    run(&root, &["add", "."]);
+    run(&root, &["commit", "-m", "base"]);
+    run(&root, &["branch", "-M", "main"]);
+    run(&root, &["checkout", "-b", "other"]);
+    for name in &names {
+        fs::write(root.join(name), "other\n").unwrap();
+    }
+    run(&root, &["commit", "-am", "other"]);
+    run(&root, &["checkout", "main"]);
+    for name in &names {
+        fs::write(root.join(name), "main\n").unwrap();
+    }
+    run(&root, &["commit", "-am", "main"]);
+    assert!(!run_output(&root, &["merge", "other"]).status.success());
+    let git = Git::new(&root);
+    let snapshot = git.conflict_snapshot(64 * 1024).unwrap();
+    assert_eq!(snapshot.files.len(), names.len());
+    for name in &names {
+        assert!(snapshot.files.iter().any(|path| path == name));
+    }
+    let files = git
+        .conflict_file_contents(&snapshot.files, 64 * 1024)
+        .unwrap();
+    for file in files {
+        assert!(file.content.contains("<<<<<<<"));
+        git.write_file(&file.path, "resolved\n").unwrap();
+        git.add_file(&file.path).unwrap();
+    }
+    assert!(git.conflict_snapshot(64 * 1024).unwrap().files.is_empty());
+    run(&root, &["commit", "--no-edit"]);
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn run(root: &Path, args: &[&str]) {
     let output = run_output(root, args);
     assert!(
