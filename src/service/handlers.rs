@@ -139,9 +139,16 @@ pub(crate) async fn start_scheduled_advisories(State(state): State<ServiceState>
         Ok(config) => config,
         Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, error),
     };
-    let advisories = match crate::protection::scan_osv_advisories(&config) {
-        Ok(advisories) => advisories,
-        Err(error) => return api_error(StatusCode::BAD_GATEWAY, error),
+    // OSV 使用阻塞 HTTP 客户端，放到 Tokio 阻塞线程池执行。
+    let scan_config = config.clone();
+    let advisories = match tokio::task::spawn_blocking(move || {
+        crate::protection::scan_osv_advisories(&scan_config)
+    })
+    .await
+    {
+        Ok(Ok(advisories)) => advisories,
+        Ok(Err(error)) => return api_error(StatusCode::BAD_GATEWAY, error),
+        Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, error.into()),
     };
     if advisories.is_empty() {
         return Json(serde_json::json!({ "job_ids": [] })).into_response();
@@ -288,9 +295,16 @@ pub(crate) async fn publish_protection_issue(
             anyhow::anyhow!("Token 环境变量名非法"),
         );
     }
-    match crate::protection::publish_github_issue(&state.data_dir, &id, &request.token_env, true) {
-        Ok(receipt) => Json(receipt).into_response(),
-        Err(error) => api_error(StatusCode::CONFLICT, error),
+    let data_dir = state.data_dir.clone();
+    let token_env = request.token_env;
+    match tokio::task::spawn_blocking(move || {
+        crate::protection::publish_github_issue(&data_dir, &id, &token_env, true)
+    })
+    .await
+    {
+        Ok(Ok(receipt)) => Json(receipt).into_response(),
+        Ok(Err(error)) => api_error(StatusCode::CONFLICT, error),
+        Err(error) => api_error(StatusCode::INTERNAL_SERVER_ERROR, error.into()),
     }
 }
 
@@ -349,12 +363,16 @@ pub(crate) async fn add_message(
             anyhow::anyhow!("指导内容必须为 1 到 4000 个字符"),
         );
     }
-    match state.add_message_and_refresh_options(&id, request.message.trim()) {
-        Ok(()) => Json(ApiMessage {
+    let message = request.message.trim().to_string();
+    match tokio::task::spawn_blocking(move || state.add_message_and_refresh_options(&id, &message))
+        .await
+    {
+        Ok(Ok(())) => Json(ApiMessage {
             message: "已更新冲突方案".to_string(),
         })
         .into_response(),
-        Err(err) => api_error(StatusCode::CONFLICT, err),
+        Ok(Err(err)) => api_error(StatusCode::CONFLICT, err),
+        Err(err) => api_error(StatusCode::INTERNAL_SERVER_ERROR, err.into()),
     }
 }
 

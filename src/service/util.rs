@@ -5,6 +5,7 @@ use similar::TextDiff;
 use crate::{
     command::CommandOutput,
     config::{BranchConfig, Config, SyncStrategy},
+    conflict::{ConflictResolution, extract_conflict_blocks, resolve_conflict_files},
     git::{ConflictFileContent, ConflictSnapshot, Git},
     llm::{ConflictProposal, ResolvedFile},
     protection::{
@@ -160,6 +161,7 @@ pub(super) fn validate_files(
             return Err(format!("候选文件不属于冲突文件：{}", file.path));
         }
         if file.content.contains("<<<<<<<")
+            || file.content.contains("|||||||")
             || file.content.contains("=======")
             || file.content.contains(">>>>>>>")
         {
@@ -218,48 +220,29 @@ pub(super) fn deterministic_proposal(
 }
 
 pub(super) fn resolve_conflict_side(content: &str, side: ConflictSide) -> Result<String> {
-    enum Mode {
-        Normal,
-        Ours,
-        Theirs,
-    }
-
-    let mut mode = Mode::Normal;
-    let mut output = String::new();
-    let mut ours = String::new();
-    let mut theirs = String::new();
-    let mut saw_conflict = false;
-
-    for segment in content.split_inclusive('\n') {
-        let marker = segment.trim_end_matches(['\r', '\n']);
-        if marker.starts_with("<<<<<<<") {
-            anyhow::ensure!(matches!(mode, Mode::Normal), "冲突标记嵌套或顺序错误");
-            saw_conflict = true;
-            ours.clear();
-            theirs.clear();
-            mode = Mode::Ours;
-        } else if marker.starts_with("=======") {
-            anyhow::ensure!(matches!(mode, Mode::Ours), "冲突分隔符顺序错误");
-            mode = Mode::Theirs;
-        } else if marker.starts_with(">>>>>>>") {
-            anyhow::ensure!(matches!(mode, Mode::Theirs), "冲突结束标记顺序错误");
-            output.push_str(match side {
-                ConflictSide::Ours => &ours,
-                ConflictSide::Theirs => &theirs,
-            });
-            mode = Mode::Normal;
-        } else {
-            match mode {
-                Mode::Normal => output.push_str(segment),
-                Mode::Ours => ours.push_str(segment),
-                Mode::Theirs => theirs.push_str(segment),
-            }
-        }
-    }
-
-    anyhow::ensure!(matches!(mode, Mode::Normal), "冲突标记未闭合");
-    anyhow::ensure!(saw_conflict, "文件不包含 Git 冲突标记");
-    Ok(output)
+    // 与模型局部替换共用解析器，确保 diff3 祖先段不会混入任一侧。
+    let file = ConflictFileContent {
+        path: "conflict".to_string(),
+        content: content.to_string(),
+    };
+    let blocks = extract_conflict_blocks(std::slice::from_ref(&file), 0)?;
+    let resolutions = blocks
+        .into_iter()
+        .map(|block| ConflictResolution {
+            path: block.path,
+            conflict_id: block.id,
+            expected_sha256: block.expected_sha256,
+            replacement: match side {
+                ConflictSide::Ours => block.ours,
+                ConflictSide::Theirs => block.theirs,
+            },
+        })
+        .collect::<Vec<_>>();
+    Ok(resolve_conflict_files(&[file], &resolutions)?
+        .into_iter()
+        .next()
+        .context("冲突解析后没有文件")?
+        .content)
 }
 
 pub(super) fn path_is_allowed(path: &str, allowed_paths: &[String]) -> bool {
@@ -437,6 +420,29 @@ branches:
                 .unwrap()
                 .unwrap();
         assert_eq!(proposal.files[0].content, "keep\nupstream\nend\n");
+    }
+
+    #[test]
+    fn deterministic_accept_upstream_ignores_diff3_base() {
+        let files = vec![ConflictFileContent {
+            path: "src/main.py".to_string(),
+            content: "head\n<<<<<<< HEAD\nupstream\n||||||| base\noriginal\n=======\nbranch\n>>>>>>> my/branch\ntail\n".to_string(),
+        }];
+        let proposal =
+            deterministic_proposal(&files, "accept-theirs", crate::config::SyncStrategy::Rebase)
+                .unwrap()
+                .unwrap();
+        assert_eq!(proposal.files[0].content, "head\nupstream\ntail\n");
+        assert!(validate_files(&proposal.files, &["src/main.py".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn proposal_validation_rejects_diff3_base_marker() {
+        let files = vec![ResolvedFile {
+            path: "src/main.py".to_string(),
+            content: "||||||| base\noriginal\n".to_string(),
+        }];
+        assert!(validate_files(&files, &["src/main.py".to_string()]).is_err());
     }
 
     #[test]
