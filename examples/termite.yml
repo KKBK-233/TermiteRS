@@ -67,6 +67,12 @@ watch:
 
 # 新自治流程的动作权限。总开关默认关闭；deny 禁止，ask 停下等待确认，allow 允许自动执行。
 # 这不会改变已有 sync、daemon、watch 等显式命令的行为。
+linear:
+  enabled: false
+  # 本机环境变量名；不要把实际 API key 写入 YAML。
+  api_key_env: LINEAR_API_KEY
+  max_issues: 20
+
 autonomy:
   enabled: false
   scope:
