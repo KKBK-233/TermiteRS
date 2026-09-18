@@ -22,7 +22,7 @@ const SANDBOX_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 #[cfg(unix)]
 const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 
-/// 在不继承宿主凭证、网络和根文件系统的 Bubblewrap 沙箱中执行项目命令。
+/// 在不继承宿主凭证、网络和根文件系统的临时副本中执行项目命令。
 #[cfg(unix)]
 pub fn run_sandboxed(command: &str, worktree: impl AsRef<Path>) -> Result<CommandOutput> {
     let worktree = worktree.as_ref();
@@ -164,11 +164,40 @@ fn bubblewrap_args(worktree: &Path, command: &str) -> Result<Vec<OsString>> {
     .map(OsString::from)
     .collect::<Vec<_>>();
     append_rust_toolchain_mounts(&mut args)?;
-    args.push(OsString::from("--bind"));
+    // 宿主源码只读挂载，测试仅修改 tmpfs 副本，避免 Git 元数据或源码成为逃逸载体。
+    args.push(OsString::from("--ro-bind"));
     args.push(worktree.as_os_str().to_os_string());
-    args.push(OsString::from("/workspace"));
+    args.push(OsString::from("/sandbox-source"));
+    match fs::symlink_metadata(worktree.join(".git")) {
+        Ok(metadata) if metadata.is_dir() => {
+            push_args(
+                &mut args,
+                &[
+                    "--tmpfs",
+                    "/sandbox-source/.git",
+                    "--remount-ro",
+                    "/sandbox-source/.git",
+                ],
+            );
+        }
+        Ok(metadata) if metadata.is_file() => {
+            push_args(
+                &mut args,
+                &["--ro-bind", "/dev/null", "/sandbox-source/.git"],
+            );
+        }
+        Ok(_) => bail!("沙箱拒绝非常规 .git 路径"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    push_args(&mut args, &["--tmpfs", "/workspace"]);
     args.extend(
-        ["--chdir", "/workspace", "/usr/bin/sh", "-lc"]
+        [
+            "--chdir", "/workspace", "/usr/bin/sh", "-c",
+            // 用位置参数传递测试命令，避免将命令插入复制脚本造成二次解析。
+            "for entry in /sandbox-source/* /sandbox-source/.[!.]* /sandbox-source/..?*; do [ -e \"$entry\" ] || [ -L \"$entry\" ] || continue; [ \"$entry\" = /sandbox-source/.git ] && continue; cp -a -- \"$entry\" /workspace/ || exit; done; exec /usr/bin/sh -lc \"$1\"",
+            "termiters-sandbox",
+        ]
             .into_iter()
             .map(OsString::from),
     );
@@ -303,7 +332,9 @@ mod tests {
         assert!(text.contains("--unshare-all"));
         assert!(text.contains("--clearenv"));
         assert!(text.contains("--cap-drop ALL"));
-        assert!(text.contains("--bind /tmp/worktree /workspace"));
+        assert!(text.contains("--ro-bind /tmp/worktree /sandbox-source"));
+        assert!(text.contains("--tmpfs /workspace"));
+        assert!(!text.contains("--bind "));
         assert!(!text.contains("/.ssh"));
         assert!(!text.contains("/etc/termiters"));
         assert!(!text.contains("--bind / /"));
@@ -324,11 +355,76 @@ test -z "${DEEPSEEK_API_KEY+x}"
 "#;
         let output = run_sandboxed(command, &root).unwrap();
         assert!(output.success(), "{}", output.stderr);
-        assert_eq!(
-            std::fs::read_to_string(root.join("sandbox-write.txt")).unwrap(),
-            "sandboxed"
-        );
+        assert!(!root.join("sandbox-write.txt").exists());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// 主仓库和 linked worktree 均不能被测试植入宿主 hook 或修改源码。
+    #[test]
+    #[ignore = "需要 Linux Bubblewrap，用于验证 Git 元数据隔离"]
+    fn live_sandbox_cannot_poison_host_git() {
+        let root = env::temp_dir().join(format!("termiters-git-isolation-{}", Uuid::new_v4()));
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let git = crate::git::Git::new(&repo);
+        for args in [
+            vec!["init"],
+            vec!["config", "user.name", "TermiteRS Test"],
+            vec!["config", "user.email", "termite@example.com"],
+        ] {
+            assert!(git.run_git(&args).unwrap().success());
+        }
+        fs::write(repo.join("source.txt"), "original\n").unwrap();
+        fs::write(repo.join(".hidden"), "hidden\n").unwrap();
+        assert!(git.run_git(&["add", "."]).unwrap().success());
+        assert!(git.run_git(&["commit", "-m", "base"]).unwrap().success());
+        let linked = root.join("linked");
+        assert!(
+            git.run_git(&[
+                "worktree",
+                "add",
+                "--detach",
+                linked.to_str().unwrap(),
+                "HEAD"
+            ])
+            .unwrap()
+            .success()
+        );
+        let original_head = git.head().unwrap();
+        let original_config = fs::read(repo.join(".git/config")).unwrap();
+        let original_pointer = fs::read(linked.join(".git")).unwrap();
+        for directory in [&repo, &linked] {
+            let output = run_sandboxed(
+                r#"
+set -eu
+test ! -e .git
+test "$(cat .hidden)" = hidden
+test ! -s /sandbox-source/.git/config
+! sh -c 'printf poisoned > /sandbox-source/source.txt'
+! sh -c 'printf poisoned > /sandbox-source/.git'
+! mkdir /sandbox-source/.git/hooks/poisoned
+printf changed > source.txt
+mkdir -p .git/hooks
+printf '#!/bin/sh\nexit 77\n' > .git/hooks/pre-push
+chmod +x .git/hooks/pre-push
+ln -s /sandbox-source/source.txt source-link
+! sh -c 'printf poisoned > source-link'
+"#,
+                directory,
+            )
+            .unwrap();
+            assert!(output.success(), "{}", output.stderr);
+            assert_eq!(
+                fs::read_to_string(directory.join("source.txt")).unwrap(),
+                "original\n"
+            );
+            assert!(!directory.join("source-link").exists());
+        }
+        assert!(!repo.join(".git/hooks/pre-push").exists());
+        assert_eq!(fs::read(repo.join(".git/config")).unwrap(), original_config);
+        assert_eq!(fs::read(linked.join(".git")).unwrap(), original_pointer);
+        assert_eq!(git.head().unwrap(), original_head);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
