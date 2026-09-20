@@ -1,12 +1,11 @@
 //! 本机 Linear 只读客户端：固定 GraphQL 查询，仅返回令牌持有者本人分配的事项。
 
 use anyhow::{Context, Result, bail, ensure};
-use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{env, time::Duration};
 
-use crate::config::LinearConfig;
+use crate::{config::LinearConfig, http::client_builder_for};
 
 const LINEAR_ENDPOINT: &str = "https://api.linear.app/graphql";
 const ASSIGNED_ISSUES_QUERY: &str = r#"query TermiteAssignedIssues($first: Int!) {
@@ -128,7 +127,7 @@ impl<'a> LinearClient<'a> {
         api_key: &str,
     ) -> Result<Vec<LinearIssueSummary>> {
         ensure!(!api_key.trim().is_empty(), "Linear API key 为空");
-        let client = Client::builder()
+        let client = client_builder_for(self.endpoint)
             .timeout(Duration::from_secs(20))
             .build()
             .context("无法初始化 Linear HTTP 客户端")?;

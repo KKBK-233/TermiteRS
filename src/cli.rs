@@ -2,9 +2,12 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+use crate::version::LONG_VERSION;
+
 #[derive(Debug, Parser)]
 #[command(name = "TermiteRS")]
 #[command(about = "Maintain long-lived fork branches against upstream updates.")]
+#[command(version, long_version = LONG_VERSION)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,

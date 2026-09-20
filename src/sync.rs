@@ -643,21 +643,34 @@ impl SyncRunner {
         let mut entry = BranchReport::new(&branch.name, branch.kind, BranchStatus::Skipped);
         entry.push_detail("status only: fetch completed, sync/test/push skipped");
 
-        if !self.git.local_branch_exists(&branch.name)? {
+        let local_exists = self.git.local_branch_exists(&branch.name)?;
+        let remote_branch = format!("{}/{}", self.config.repo.fork_remote, branch.name);
+        let remote_exists = self
+            .git
+            .remote_branch_exists(&self.config.repo.fork_remote, &branch.name)?;
+        let authoritative_ref = if remote_exists {
+            entry.push_detail(format!("authoritative ref: {remote_branch}"));
+            remote_branch.as_str()
+        } else if local_exists {
+            entry.push_detail("fork remote branch missing; using local branch as fallback");
+            branch.name.as_str()
+        } else {
             return Ok(
-                BranchReport::new(&branch.name, branch.kind, BranchStatus::Failed)
-                    .detail("local branch not found"),
+                BranchReport::new(&branch.name, branch.kind, BranchStatus::Failed).detail(format!(
+                    "branch not found: {} or {remote_branch}",
+                    branch.name
+                )),
             );
-        }
+        };
 
-        entry.head = Some(self.git.short_ref(&branch.name)?);
+        entry.head = Some(self.git.short_ref(authoritative_ref)?);
 
         let base = format!(
             "{}/{}",
             self.config.repo.upstream_remote, self.config.repo.base_branch
         );
         if self.git.ref_exists(&base)? {
-            let count = self.git.ahead_behind(&branch.name, &base)?;
+            let count = self.git.ahead_behind(authoritative_ref, &base)?;
             entry.push_detail(format!(
                 "vs {base}: ahead {}, behind {}",
                 count.ahead, count.behind
@@ -666,20 +679,11 @@ impl SyncRunner {
             entry.push_detail(format!("base ref not found: {base}"));
         }
 
-        if self
-            .git
-            .remote_branch_exists(&self.config.repo.fork_remote, &branch.name)?
-        {
-            let remote_branch = format!("{}/{}", self.config.repo.fork_remote, branch.name);
+        if local_exists && remote_exists {
             let count = self.git.ahead_behind(&branch.name, &remote_branch)?;
             entry.push_detail(format!(
-                "vs {remote_branch}: ahead {}, behind {}",
+                "local cache vs {remote_branch}: ahead {}, behind {}",
                 count.ahead, count.behind
-            ));
-        } else {
-            entry.push_detail(format!(
-                "remote branch not found: {}/{}",
-                self.config.repo.fork_remote, branch.name
             ));
         }
 
@@ -773,6 +777,12 @@ mod tests {
         assert_eq!(
             git.remote_head("fork", "main").unwrap().as_deref(),
             Some(new_remote.as_str())
+        );
+        assert!(
+            git.push_remote_ref_dry_run_with_lease("fork", "main", &new_remote)
+                .unwrap()
+                .success(),
+            "远端引用的精确 lease 检查不应被落后的本地分支干扰"
         );
         fs::remove_dir_all(root).unwrap();
     }

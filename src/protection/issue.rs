@@ -2,7 +2,6 @@ use std::{env, path::Path, time::Duration};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use reqwest::blocking::Client;
 use ring::digest::{SHA256, digest};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -210,15 +209,15 @@ fn publish_github_issue_at(
     validate_repository(&draft.destination)?;
     let token =
         env::var(token_env).with_context(|| format!("缺少 GitHub Token 环境变量：{token_env}"))?;
-    let client = Client::builder()
-        .user_agent("TermiteRS-security-delivery/1")
-        .timeout(Duration::from_secs(30))
-        .build()?;
     let endpoint = format!(
         "{}/repos/{}/issues",
         api_base.trim_end_matches('/'),
         draft.destination
     );
+    let client = crate::http::client_builder_for(&endpoint)
+        .user_agent("TermiteRS-security-delivery/1")
+        .timeout(Duration::from_secs(30))
+        .build()?;
     let marker = format!("<!-- TermiteRS:{} -->", draft.id);
     let owner = Uuid::new_v4().to_string();
     anyhow::ensure!(
