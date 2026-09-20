@@ -5,6 +5,7 @@ use tokio::sync::broadcast;
 
 use crate::git::{ConflictFileContent, ConflictSnapshot};
 use crate::llm::{ConflictOptionsDecision, ResolvedFile};
+use crate::version::BuildInfo;
 
 pub(crate) const ACTIVE_STATES: &[&str] = &[
     "queued",
@@ -40,6 +41,7 @@ pub struct CleanupReport {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct Dashboard {
+    pub(crate) build: BuildInfo,
     pub(crate) repository: String,
     pub(crate) fork_url: String,
     pub(crate) upstream_url: String,
@@ -50,6 +52,7 @@ pub(crate) struct Dashboard {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct StatusView {
+    pub(crate) build: BuildInfo,
     pub(crate) repository: String,
     pub(crate) upstream_url: String,
     pub(crate) fork_url: String,

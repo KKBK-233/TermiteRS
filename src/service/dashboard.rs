@@ -1,6 +1,7 @@
 use anyhow::Result;
 
 use crate::git::Git;
+use crate::version::build_info;
 
 use super::state::ServiceState;
 use super::types::{BranchDashboard, Dashboard, StatusView};
@@ -22,10 +23,10 @@ impl ServiceState {
             let local_head = optional_short_ref(&git, &branch.name);
             let remote_ref = format!("{}/{}", config.repo.fork_remote, branch.name);
             let remote_head = optional_short_ref(&git, &remote_ref);
-            let compare_ref = if local_head.is_some() {
-                Some(branch.name.clone())
-            } else if remote_head.is_some() {
+            let compare_ref = if remote_head.is_some() {
                 Some(remote_ref.clone())
+            } else if local_head.is_some() {
+                Some(branch.name.clone())
             } else {
                 None
             };
@@ -47,6 +48,7 @@ impl ServiceState {
             });
         }
         Ok(Dashboard {
+            build: build_info(),
             repository: config.repo.path.display().to_string(),
             fork_url: config.repo.fork.clone(),
             upstream_url: config.repo.upstream.clone(),
@@ -60,6 +62,7 @@ impl ServiceState {
         let config = self.config()?;
         let active_jobs = self.active_job_summaries()?.len();
         Ok(StatusView {
+            build: build_info(),
             repository: config.repo.path.display().to_string(),
             upstream_url: config.repo.upstream,
             fork_url: config.repo.fork,

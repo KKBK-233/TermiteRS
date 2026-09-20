@@ -10,7 +10,10 @@ use serde::Serialize;
 use serde_json::Value;
 use tracing::warn;
 
-use crate::config::{LlmConfig, LlmProvider};
+use crate::{
+    config::{LlmConfig, LlmProvider},
+    http::client_builder_for,
+};
 
 #[derive(Debug, Serialize)]
 struct ChatRequest<'a> {
@@ -84,7 +87,7 @@ fn call_chat_once(config: &LlmConfig, system_prompt: &str, user_prompt: &str) ->
         ],
     };
 
-    let client = llm_client(config)?;
+    let client = llm_client(config, &endpoint)?;
     let response: Value = client
         .post(endpoint)
         .bearer_auth(api_key)
@@ -103,8 +106,8 @@ fn call_chat_once(config: &LlmConfig, system_prompt: &str, user_prompt: &str) ->
     Ok(content.trim().to_string())
 }
 
-fn llm_client(config: &LlmConfig) -> Result<Client> {
-    Client::builder()
+fn llm_client(config: &LlmConfig, endpoint: &str) -> Result<Client> {
+    client_builder_for(endpoint)
         .timeout(Duration::from_secs(config.timeout_seconds.max(1)))
         .build()
         .context("failed to build LLM HTTP client")
@@ -152,7 +155,7 @@ where
         ],
     };
 
-    let mut response = llm_client(config)?
+    let mut response = llm_client(config, &endpoint)?
         .post(endpoint)
         .bearer_auth(api_key)
         .json(&body)

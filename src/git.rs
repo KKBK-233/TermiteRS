@@ -160,6 +160,19 @@ impl Git {
         self.git(&["push", "--dry-run", remote, &refspec])
     }
 
+    /// 使用远端当前提交作为精确 lease 验证受管分支权限，不受本地缓存分支是否落后影响。
+    pub fn push_remote_ref_dry_run_with_lease(
+        &self,
+        remote: &str,
+        branch: &str,
+        expected_remote_head: &str,
+    ) -> Result<CommandOutput> {
+        let lease = format!("--force-with-lease=refs/heads/{branch}:{expected_remote_head}");
+        let source = format!("refs/remotes/{remote}/{branch}");
+        let refspec = format!("{source}:refs/heads/{branch}");
+        self.git(&["push", "--dry-run", &lease, remote, &refspec])
+    }
+
     pub fn run_test(&self, command: &str) -> Result<CommandOutput> {
         crate::command::run_shell(command, &self.root)
     }

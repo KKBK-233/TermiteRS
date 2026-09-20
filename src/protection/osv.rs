@@ -95,7 +95,7 @@ fn scan_osv_advisories_at(config: &Config, api_base: &str) -> Result<Vec<OsvAdvi
     }
     fs::create_dir_all(&config.service.data_dir)?;
     let store = ProtectionStore::open(config.service.data_dir.join("termite.db"))?;
-    let client = Client::builder()
+    let client = crate::http::client_builder_for(api_base)
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(60))
         .redirect(Policy::none())
