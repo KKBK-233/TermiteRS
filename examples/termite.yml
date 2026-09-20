@@ -201,7 +201,7 @@ notify:
 
 # 协作看板服务仅监听 Unix Socket，操作密码必须使用 Argon2id 哈希。
 service:
-  socket_path: /run/termiters/termiters.sock
+  socket_path: /run/termiters-control/termiters.sock
+  public_socket_path: /run/termiters-public/termiters.sock
   data_dir: /var/lib/termiters
   public_dashboard_url: https://blog.example.com/admin/termite
-  operation_password_hash: "REPLACE_WITH_ARGON2ID_HASH"

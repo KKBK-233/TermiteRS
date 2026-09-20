@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 User=termiters
 Group=termite-control
-SupplementaryGroups=termiters
+SupplementaryGroups=termiters termite-public
 WorkingDirectory=/opt/termiters
 EnvironmentFile=-/etc/termiters/termiters.env
 Environment=HOME=/var/lib/termiters
@@ -15,16 +15,29 @@ Environment=RUST_LOG=TermiteRS=info
 ExecStart=/opt/termiters/TermiteRS serve --config /etc/termiters/termite.yml
 Restart=on-failure
 RestartSec=5
-UMask=0007
+UMask=0027
 
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/termiters /run/termiters
+ReadWritePaths=/var/lib/termiters /run/termiters-control /run/termiters-public
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LockPersonality=true
 MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target
