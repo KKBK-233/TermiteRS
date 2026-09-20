@@ -67,19 +67,15 @@ pub fn cleanup_old_jobs(config_path: PathBuf, days: u32) -> Result<CleanupReport
 
 #[cfg(unix)]
 async fn run_unix(config_path: PathBuf) -> Result<()> {
-    use hyperlocal::UnixListenerExt;
     use tokio::net::UnixListener;
-    use tower::ServiceExt;
 
     let config = Config::read_from(&config_path)?;
     validate_service_config(&config)?;
     fs::create_dir_all(&config.service.data_dir)?;
     fs::create_dir_all(config.service.data_dir.join("worktrees"))?;
-    if let Some(parent) = config.service.socket_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    if config.service.socket_path.exists() {
-        fs::remove_file(&config.service.socket_path)?;
+    prepare_socket_path(&config.service.socket_path)?;
+    if let Some(path) = &config.service.public_socket_path {
+        prepare_socket_path(path)?;
     }
 
     let database_path = config.service.data_dir.join("termite.db");
@@ -94,7 +90,8 @@ async fn run_unix(config_path: PathBuf) -> Result<()> {
     state.initialize_database()?;
     state.recover_interrupted_jobs()?;
 
-    let app = Router::new()
+    // 控制接口包含所有写操作，只允许 daemon 和受信任管理员访问。
+    let control_app = Router::new()
         .route("/v1/status", get(handlers::status))
         .route("/v1/stats", get(handlers::stats))
         .route("/v1/dashboard", get(handlers::dashboard))
@@ -136,12 +133,51 @@ async fn run_unix(config_path: PathBuf) -> Result<()> {
         .route("/v1/events", get(handlers::events))
         .with_state(state.clone());
 
-    let listener = UnixListener::bind(&config.service.socket_path)?;
+    let control_listener = UnixListener::bind(&config.service.socket_path)?;
     set_socket_permissions(&config.service.socket_path)?;
     info!(
-        "TermiteRS service listening on {}",
+        "TermiteRS control service listening on {}",
         config.service.socket_path.display()
     );
+
+    if let Some(public_socket_path) = &config.service.public_socket_path {
+        // 只读接口只暴露查询与事件流，不注册任何 POST 写路由。
+        let public_app = read_only_router(state);
+        let public_listener = UnixListener::bind(public_socket_path)?;
+        set_socket_permissions(public_socket_path)?;
+        info!(
+            "TermiteRS read-only service listening on {}",
+            public_socket_path.display()
+        );
+        tokio::try_join!(
+            serve_socket(control_listener, control_app),
+            serve_socket(public_listener, public_app)
+        )?;
+    } else {
+        serve_socket(control_listener, control_app).await?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_only_router(state: ServiceState) -> Router {
+    Router::new()
+        .route("/v1/status", get(handlers::status))
+        .route("/v1/stats", get(handlers::stats))
+        .route("/v1/dashboard", get(handlers::dashboard))
+        .route("/v1/branches", get(handlers::branches))
+        .route("/v1/branches/:name", get(handlers::branch))
+        .route("/v1/config/summary", get(handlers::config_summary))
+        .route("/v1/jobs", get(handlers::jobs))
+        .route("/v1/jobs/:id", get(handlers::job))
+        .route("/v1/events", get(handlers::events))
+        .with_state(state)
+}
+
+#[cfg(unix)]
+async fn serve_socket(listener: tokio::net::UnixListener, app: Router) -> Result<()> {
+    use hyperlocal::UnixListenerExt;
+    use tower::ServiceExt;
 
     listener
         .serve(move || {
@@ -149,7 +185,16 @@ async fn run_unix(config_path: PathBuf) -> Result<()> {
             move |request| app.clone().oneshot(request)
         })
         .await
-        .map_err(|err| anyhow::anyhow!("Unix Socket 服务异常：{err}"))?;
+        .map_err(|err| anyhow::anyhow!("Unix Socket 服务异常：{err}"))
+}
+
+fn prepare_socket_path(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
     Ok(())
 }
 
@@ -163,6 +208,11 @@ fn validate_service_config(config: &Config) -> Result<()> {
             bail!("维护分支重复：{}", branch.name);
         }
     }
+    if let Some(public_socket_path) = &config.service.public_socket_path {
+        if public_socket_path == &config.service.socket_path {
+            bail!("service.public_socket_path 必须与控制 socket_path 不同");
+        }
+    }
     Ok(())
 }
 
@@ -171,4 +221,32 @@ fn set_socket_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o660))?;
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod socket_tests {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn read_only_router_rejects_control_posts() {
+        let (events, _) = broadcast::channel(1);
+        let state = ServiceState {
+            config_path: PathBuf::from("unused.yml"),
+            data_dir: PathBuf::from("unused"),
+            database_path: PathBuf::from("unused.db"),
+            events,
+            repository_lock: Arc::new(Mutex::new(())),
+        };
+        let response = read_only_router(state)
+            .oneshot(Request::post("/v1/jobs/sync").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
 }

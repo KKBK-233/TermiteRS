@@ -118,8 +118,12 @@ pub enum ProtectionAutomation {
 /// 协作服务只接受本机 Unix Socket 请求，敏感凭证仍由 TermiteRS 独占。
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServiceConfig {
+    /// 完整控制接口；daemon 和受信任管理员使用。
     #[serde(default = "default_service_socket_path")]
     pub socket_path: PathBuf,
+    /// 可选只读接口；适合博客看板等低权限进程。
+    #[serde(default)]
+    pub public_socket_path: Option<PathBuf>,
     #[serde(default = "default_service_data_dir")]
     pub data_dir: PathBuf,
     #[serde(default)]
@@ -528,6 +532,7 @@ impl Default for ServiceConfig {
     fn default() -> Self {
         Self {
             socket_path: default_service_socket_path(),
+            public_socket_path: None,
             data_dir: default_service_data_dir(),
             public_dashboard_url: String::new(),
         }
