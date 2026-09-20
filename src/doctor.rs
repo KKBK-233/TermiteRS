@@ -181,12 +181,26 @@ impl Doctor {
             if matches!(branch.push, PushStrategy::None) {
                 continue;
             }
-            match git.local_branch_exists(&branch.name) {
-                Ok(true) => {}
-                _ => continue,
-            }
+            let remote_head = match git.remote_head(&self.config.repo.fork_remote, &branch.name) {
+                Ok(Some(head)) => head,
+                Ok(None) => {
+                    report.warn(format!(
+                        "fork 远端分支尚不存在，未验证现有分支 lease：{}",
+                        branch.name
+                    ));
+                    continue;
+                }
+                Err(err) => {
+                    report.fail(format!("无法读取 fork 远端分支 {}：{err:#}", branch.name));
+                    continue;
+                }
+            };
 
-            match git.push_dry_run(&self.config.repo.fork_remote, &branch.name) {
+            match git.push_remote_ref_dry_run_with_lease(
+                &self.config.repo.fork_remote,
+                &branch.name,
+                &remote_head,
+            ) {
                 Ok(output) if output.success() => {
                     report.ok(format!("fork 推送权限可用：{}", branch.name));
                 }
