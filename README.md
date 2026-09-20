@@ -644,15 +644,18 @@ termiters serve --config /etc/termiters/termite.yml
 
 ```yaml
 service:
-  socket_path: /run/termiters/termiters.sock
+  socket_path: /run/termiters-control/termiters.sock
+  public_socket_path: /run/termiters-public/termiters.sock
   data_dir: /var/lib/termiters
   public_dashboard_url: https://blog.example.com/admin/termite
 ```
 
 - GitHub Deploy Key、DeepSeek Key 和 SMTP 凭证只能由 `termiters` 用户读取。
-- 博客只通过 Unix Socket 调用固定动作，不读取仓库或密钥。
+- `socket_path` 是完整控制接口，只允许 daemon 和受信任管理员访问。
+- `public_socket_path` 只注册 GET 查询与事件流，博客等低权限进程使用该接口；不配置时保持单 socket 兼容模式。
+- 博客只通过只读 Unix Socket 查询状态，不读取仓库或密钥。
 - Dashboard 和任务接口会返回仓库路径、远端地址、任务输出、人工对话、候选 diff 和冲突上下文，只能提供给可信后台，不要直接暴露到公网。
-- TermiteRS API 只能通过本机 Unix Socket 访问；博客后台使用自己的管理员会话和 CSRF 校验代理固定动作，不要把 `/v1/*` 直接代理到公网。
+- TermiteRS API 只能通过本机 Unix Socket 访问；不要把 `/v1/*` 直接代理到公网。
 - `deploy/` 提供 systemd、tmpfiles 和 Nginx 示例。
 - 如果测试命令本身需要特殊环境，需要在配置里写清楚。
 
