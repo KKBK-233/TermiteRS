@@ -616,7 +616,7 @@ mod tests {
         let task = store
             .save_task(WatchTask {
                 id: Uuid::new_v4().to_string(),
-                name: "个人 DEMO".to_string(),
+                name: "个人事项".to_string(),
                 prompt: "持续追踪".to_string(),
                 owner: "example-org".to_string(),
                 author: "example-user".to_string(),
@@ -631,7 +631,7 @@ mod tests {
                 updated_at: now,
             })
             .unwrap();
-        assert_eq!(task.name, "个人 DEMO");
+        assert_eq!(task.name, "个人事项");
         assert_eq!(store.tasks().unwrap().len(), 1);
         let mut store = store;
         assert_eq!(store.claim_due_tasks().unwrap().len(), 1);

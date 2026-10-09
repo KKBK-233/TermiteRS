@@ -1,14 +1,36 @@
+x-termiters-common: &termiters-common
+  build: .
+  image: termiters:local
+  working_dir: /app
+  init: true
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  env_file:
+    - .env
+  environment:
+    GIT_SSH_COMMAND: ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/tmp/termiters-known-hosts
+  tmpfs:
+    - /tmp:rw,nosuid,nodev,size=512m
+    - /run:rw,nosuid,nodev,size=32m
+  command: ["assistant", "--config", "/app/termite.yml"]
+
 services:
+  # 默认入口只读项目且不接触 SSH 私钥，适合查看、分析和报告。
   termiters:
-    build: .
-    image: termiters:local
-    working_dir: /app
-    env_file:
-      - .env
-    environment:
-      GIT_SSH_COMMAND: ssh -o StrictHostKeyChecking=accept-new
+    <<: *termiters-common
+    volumes:
+      - ./termite.docker.yml:/app/termite.yml:ro
+      - ${TERMITE_PROJECT_DIR:-../project}:/workspace/project:ro
+
+  # 写仓库和使用 SSH 必须显式选择 maintainer 服务。
+  termiters-maintainer:
+    <<: *termiters-common
+    profiles:
+      - maintainer
     volumes:
       - ./termite.docker.yml:/app/termite.yml:ro
       - ${TERMITE_PROJECT_DIR:-../project}:/workspace/project
       - ${TERMITE_SSH_DIR:-./.ssh-not-configured}:/root/.ssh:ro
-    command: ["assistant", "--config", "/app/termite.yml"]
