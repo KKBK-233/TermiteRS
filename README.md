@@ -64,7 +64,7 @@ TermiteRS 的主场景是个人自用定制分支长期跟随上游，不是多�
 Copy-Item .env.example .env
 ```
 
-然后编辑 `.env`，填入 DeepSeek、QQ SMTP 或 Cloudflare 的密钥，并设置 SSH key 目录：
+然后编辑 `.env`，按需填入 DeepSeek、QQ SMTP 或 Cloudflare 的密钥。只有需要同步或推送时才设置 SSH key 目录：
 
 ```env
 TERMITE_SSH_DIR=C:\Users\your-name\.ssh
@@ -73,9 +73,12 @@ TERMITE_SSH_DIR=C:\Users\your-name\.ssh
 说明：
 
 - Docker 镜像内置 `git`、`ssh`、`python3` 和 TermiteRS。
-- `TERMITE_SSH_DIR` 会只读挂载到容器的 `/root/.ssh`。
+- 默认 `termiters` 服务只读挂载项目，不挂载 SSH 目录；它适合查看、分析和报告。
+- `termiters-maintainer` 服务才会读写项目，并把 `TERMITE_SSH_DIR` 只读挂载到容器的 `/root/.ssh`。
+- 两个服务都使用只读容器根文件系统、丢弃 Linux capabilities，并启用 `no-new-privileges`；maintainer 对项目和 SSH 的额外访问是显式授权边界。
 - 这个 SSH key 必须已经授权到你的 GitHub 账号，或者是有 fork 推送权限的 deploy key。
 - `.env` 已加入 `.gitignore`，不要提交到仓库。
+- Git、SSH、`gh` 和普通测试脚本统一最多运行 2 小时；到期会终止进程树并报告失败。
 
 构建镜像：
 
@@ -86,7 +89,7 @@ docker compose build
 一键检查运行环境：
 
 ```powershell
-docker compose run --rm termiters doctor --config /app/termite.yml
+docker compose --profile maintainer run --rm termiters-maintainer doctor --config /app/termite.yml
 ```
 
 查看状态：
@@ -98,31 +101,37 @@ docker compose run --rm termiters status --config /app/termite.yml
 试运行同步：
 
 ```powershell
-docker compose run --rm termiters sync --config /app/termite.yml --dry-run
+docker compose --profile maintainer run --rm termiters-maintainer sync --config /app/termite.yml --dry-run
 ```
 
 实际同步：
 
 ```powershell
-docker compose run --rm termiters sync --config /app/termite.yml
+docker compose --profile maintainer run --rm termiters-maintainer sync --config /app/termite.yml
 ```
 
 后台常驻：
 
 ```powershell
-docker compose run --rm termiters daemon --config /app/termite.yml
+docker compose --profile maintainer run --rm termiters-maintainer daemon --config /app/termite.yml
 ```
 
-无参数启动会进入交互式 AI 助理入口：
+无参数启动会进入只读边界内的交互式 AI 助理入口：
 
 ```powershell
 docker compose run --rm termiters
 ```
 
+需要让交互窗口执行 `/doctor`、`/sync` 或其他仓库维护动作时，显式进入 maintainer 边界：
+
+```powershell
+docker compose --profile maintainer run --rm termiters-maintainer
+```
+
 只同步某个分支：
 
 ```powershell
-docker compose run --rm termiters sync --config /app/termite.yml --branch my/project
+docker compose --profile maintainer run --rm termiters-maintainer sync --config /app/termite.yml --branch my/project
 ```
 
 测试通知通道：
@@ -206,7 +215,7 @@ cargo run
 
 在助理内可以输入 `/check` 执行 `doctor` 和 `sync --dry-run`，输入 `/sync` 执行 `doctor` 和正式同步，输入 `/daemon` 启动常驻核心，输入 `/once` 运行一次同步；个人事项使用 `/watch`、`/watch-status`、`/watch-events` 和 `/watch-tasks`；输入 `/permissions` 查看自治动作的有效权限，`/task <需求>` 启动本地受限任务。启用任务报告后，使用 `/reports` 查看最近报告，用 `/report <ID>` 回看请求、执行轨迹、状态和模型结论；输入 `/exit` 退出。
 
-原有命令保持兼容。助理窗口现在也接受“持续盯着我的 DEMO PR，CI 或审查状态变化时记录下来，每十分钟检查一次”这样的自然语言。模型只生成受限任务计划，Rust 核心校验 GitHub 范围、间隔并持久化；窗口保持打开时，调度器会自动执行到期任务。状态变化会按需补取有限的新评论、审查线程和失败日志，并进入只读评估队列；外部正文始终按不可信证据处理，限制总量且清理终端控制字符。使用 `/watch-decisions` 查看评估；需要改代码、推送、回复、合并或写 Linear 的建议一定标为“待判断”。可使用 `/watch-pause <名称>` 和 `/watch-resume <名称>` 控制任务，不会写入 GitHub 或触发分支同步。
+原有命令保持兼容。助理窗口现在也接受“持续盯着我的 PR，CI 或审查状态变化时记录下来，每十分钟检查一次”这样的自然语言。模型只生成受限任务计划，Rust 核心校验 GitHub 范围、间隔并持久化；窗口保持打开时，调度器会自动执行到期任务。状态变化会按需补取有限的新评论、审查线程和失败日志，并进入只读评估队列；外部正文始终按不可信证据处理，限制总量且清理终端控制字符。使用 `/watch-decisions` 查看评估；需要改代码、推送、回复、合并或写 Linear 的建议一定标为“待判断”。可使用 `/watch-pause <名称>` 和 `/watch-resume <名称>` 控制任务，不会写入 GitHub 或触发分支同步。
 
 显式启动助理：
 
@@ -285,8 +294,9 @@ watch:
   data_dir: .termite/watch
   interval_seconds: 600
   github:
-    owner: example-org
-    author: example-user
+    # 以下为占位符；实际组织与账号只填入本机未提交的配置。
+    owner: your-org
+    author: your-name
     repositories: []
 
 linear:
@@ -300,9 +310,9 @@ autonomy:
     enabled: false
     data_dir: .termite/reports
   scope:
-    github_owners: [example-org]
+    github_owners: [your-org]
     github_repositories: []
-    github_author: example-user
+    github_author: your-name
     local_repositories: []
     linear_assignee: ""
   permissions:

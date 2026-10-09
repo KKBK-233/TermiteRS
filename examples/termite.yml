@@ -60,8 +60,9 @@ watch:
   data_dir: .termite/watch
   interval_seconds: 600
   github:
-    owner: example-org
-    author: example-user
+    # 以下为占位符；实际组织与账号只填入本机未提交的配置。
+    owner: your-org
+    author: your-name
     # 留空时动态发现 owner 下的未归档仓库。
     repositories: []
 
@@ -80,9 +81,9 @@ autonomy:
     enabled: false
     data_dir: .termite/reports
   scope:
-    github_owners: [example-org]
+    github_owners: [your-org]
     github_repositories: []
-    github_author: example-user
+    github_author: your-name
     # 只列出允许自治处理的现有仓库绝对路径；空列表表示不授权本地仓库动作。
     local_repositories: []
     # 建议填写 Linear 用户 ID，而不是可能重名的显示名。

@@ -20,6 +20,7 @@ use crate::watch::{
 };
 
 const MAX_HISTORY_MESSAGES: usize = 12;
+const AGENT_PROMPT: &str = include_str!("../agents/termite-config/system.md");
 
 pub struct Assistant {
     config_path: PathBuf,
@@ -45,7 +46,7 @@ impl Assistant {
         println!("默认进入交互式配置助理。输入自然语言描述需求，或输入 /help 查看命令。");
         println!("配置文件：{}", self.config_path.display());
         println!();
-        print_agent_summary(Path::new("agents/termite-config/system.md"))?;
+        print_agent_summary();
         println!();
 
         // 交互窗口存活期间持续执行用户已保存的个人事项任务。
@@ -403,13 +404,12 @@ impl Assistant {
 
     fn reply_to_user(&self, input: &str, history: &mut Vec<ConversationMessage>) -> Result<()> {
         let config = Config::read_from(&self.config_path)?;
-        let system_prompt = read_agent_prompt(Path::new("agents/termite-config/system.md"))?;
         let user_prompt = build_user_prompt(input, &config, history);
         let llm = LlmService::new(config.llm.clone());
 
         println!("AI 正在回复...");
         io::stdout().flush()?;
-        match llm.assistant_reply_streaming(&system_prompt, &user_prompt, |delta| {
+        match llm.assistant_reply_streaming(AGENT_PROMPT, &user_prompt, |delta| {
             print!("{}", clean_stream_delta(delta));
             io::stdout().flush()?;
             Ok(())
@@ -579,7 +579,7 @@ fn print_help() {
     println!();
     println!("自然语言示例：");
     println!("  我只想维护 my/project，自用分支，允许改远端历史，每小时检查一次。");
-    println!("  持续盯着我的 DEMO PR，CI 或审查状态变化时记录下来，每十分钟检查一次。");
+    println!("  持续盯着我的 PR，CI 或审查状态变化时记录下来，每十分钟检查一次。");
 }
 
 fn report_redactions(config: &Config) -> Vec<String> {
@@ -605,35 +605,21 @@ fn wants_watch_task(input: &str) -> bool {
     let continuous = ["持续", "一直", "定时", "盯着", "监控", "追踪"]
         .iter()
         .any(|keyword| input.contains(keyword));
-    let subject = [
-        "PR", "pr", "CI", "ci", "GitHub", "github", "审查", "评论", "DEMO",
-    ]
-    .iter()
-    .any(|keyword| input.contains(keyword));
+    let subject = ["PR", "pr", "CI", "ci", "GitHub", "github", "审查", "评论"]
+        .iter()
+        .any(|keyword| input.contains(keyword));
     continuous && subject
 }
 
-fn print_agent_summary(path: &Path) -> Result<()> {
-    if !path.exists() {
-        println!("未找到助理资料：{}", path.display());
-        return Ok(());
-    }
-
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("failed to read agent prompt {}", path.display()))?;
+fn print_agent_summary() {
     println!("助理规则摘要：");
-    for line in raw
+    for line in AGENT_PROMPT
         .lines()
         .filter(|line| line.starts_with("- ") || line.starts_with("TermiteRS "))
         .take(12)
     {
         println!("{line}");
     }
-    Ok(())
-}
-
-fn read_agent_prompt(path: &Path) -> Result<String> {
-    fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))
 }
 
 fn build_user_prompt(input: &str, config: &Config, history: &[ConversationMessage]) -> String {
@@ -975,7 +961,7 @@ mod tests {
 
     #[test]
     fn natural_language_watch_request_is_routed_locally() {
-        assert!(wants_watch_task("持续盯着我的 DEMO PR，CI 出问题时记录下来"));
+        assert!(wants_watch_task("持续盯着我的 PR，CI 出问题时记录下来"));
         assert!(!wants_watch_task("帮我解释这个 CI 为什么失败"));
     }
 }

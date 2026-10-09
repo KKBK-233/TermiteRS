@@ -16,9 +16,9 @@ use anyhow::Context;
 use anyhow::{Result, bail};
 
 use crate::command::CommandOutput;
-
 #[cfg(unix)]
-const SANDBOX_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+use crate::command::DEFAULT_TOOL_TIMEOUT;
+
 #[cfg(unix)]
 const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 
@@ -52,10 +52,10 @@ pub fn run_sandboxed(command: &str, worktree: impl AsRef<Path>) -> Result<Comman
         if let Some(status) = child.try_wait()? {
             break status;
         }
-        if started.elapsed() >= SANDBOX_TIMEOUT {
+        if started.elapsed() >= DEFAULT_TOOL_TIMEOUT {
             let _ = child.kill();
             let _ = child.wait();
-            bail!("沙箱命令超过 {} 秒，已终止", SANDBOX_TIMEOUT.as_secs());
+            bail!("沙箱命令超过 {} 秒，已终止", DEFAULT_TOOL_TIMEOUT.as_secs());
         }
         thread::sleep(Duration::from_millis(100));
     };

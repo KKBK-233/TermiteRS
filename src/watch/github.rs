@@ -1,5 +1,3 @@
-use std::process::{Command, Stdio};
-
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::Value;
@@ -379,35 +377,21 @@ fn normalize_checks(checks: &[Value]) -> Vec<CheckSnapshot> {
 }
 
 fn run_gh_json(args: &[&str]) -> Result<Value> {
-    let output = Command::new("gh")
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
+    let output = crate::command::run("gh", args, std::env::current_dir()?)
         .context("无法启动 gh；请先安装 GitHub CLI 并完成登录")?;
-    if !output.status.success() {
-        bail!(
-            "gh {} 失败：{}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+    if !output.success() {
+        bail!("gh {} 失败：{}", args.join(" "), output.stderr.trim());
     }
-    serde_json::from_slice(&output.stdout).context("gh 输出不是有效 JSON")
+    serde_json::from_str(&output.stdout).context("gh 输出不是有效 JSON")
 }
 
 fn run_gh_text(args: &[&str]) -> Result<String> {
-    let output = Command::new("gh")
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
+    let output = crate::command::run("gh", args, std::env::current_dir()?)
         .context("无法启动 gh；请先安装 GitHub CLI 并完成登录")?;
-    if !output.status.success() {
-        bail!(
-            "gh {} 失败：{}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+    if !output.success() {
+        bail!("gh {} 失败：{}", args.join(" "), output.stderr.trim());
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(output.stdout)
 }
 
 #[cfg(test)]
