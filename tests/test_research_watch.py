@@ -199,6 +199,35 @@ class ResearchTests(unittest.TestCase):
         self.assertFalse(self.cycle()["errors"])
         self.assertTrue(self.repo.published)
 
+    def test_null_optional_object_is_treated_as_unspecified(self):
+        self.assertIsNone(research.claim({'value': None, 'quote': None}, BODY, required=False))
+        with self.assertRaises(ValueError):
+            research.claim({'value': 'invented', 'quote': None}, BODY, required=False)
+
+    def test_invalid_quote_is_sent_back_for_one_bounded_correction(self):
+        calls = []
+        def model(phase, evidence):
+            calls.append(evidence)
+            return {'value': 'exact' if 'correction' in evidence else 'invented'}
+        def validate(result):
+            if result['value'] != 'exact':
+                raise ValueError('引用不在原文')
+            return result
+        self.assertEqual(research.validated_model(model, 'classify', {'article': BODY}, validate), {'value': 'exact'})
+        self.assertEqual(len(calls), 2)
+        self.assertIn('引用不在原文', calls[1]['correction']['validation_error'])
+
+    def test_correction_stops_after_second_invalid_result(self):
+        calls = []
+        def model(phase, evidence):
+            calls.append(phase)
+            return {}
+        def validate(result):
+            raise ValueError('原文不支持')
+        with self.assertRaises(ValueError):
+            research.validated_model(model, 'classify', {}, validate)
+        self.assertEqual(len(calls), 2)
+
     def test_failed_fetch_does_not_count_as_completed(self):
         self.web.fail = True
         self.assertTrue(self.cycle()["errors"])

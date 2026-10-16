@@ -458,6 +458,8 @@ class Model:
 
 
 def claim(value, body, required=True):
+    if not required and isinstance(value, dict) and value == {"value": None, "quote": None}:
+        return None
     if value is None and not required:
         return None
     if not isinstance(value, dict) or set(value) != {"value", "quote"}:
@@ -580,16 +582,32 @@ def update_homepage(original, section):
     return original.rstrip() + "\n\n" + section + "\n"
 
 
+def validated_model(model, phase, evidence, validator):
+    """校验失败时将明确错误退回模型修正一次，不能由执行器补造或修改研究结论。"""
+    result = model(phase, evidence)
+    try:
+        return validator(result)
+    except ValueError as error:
+        corrected = model(phase, {**evidence, "correction": {
+            "validation_error": str(error), "previous_response": result,
+            "instruction": "原文引用必须是原文中逐字连续片段，不要去掉引用中的符号或把多处内容拼接。未说明的日期/版本输出 null。网页发布日期本身不证明发现日期；不得以发布日期推断发现或引入。请修正有错误的字段，仍按本阶段原定 JSON 协议返回完整结果，不要为了通过校验改变事实。"}})
+        return validator(corrected)
+
+
 def investigate(article, repository, model, ledger, topic):
     known = [{"id": key, "mechanisms": [r["finding"]["mechanism"]["value"] for r in rows.values()]} for key, rows in ledger.items()]
-    classification = model("classify", {"topic": topic, "article": article, "files": repository.sources, "known_mechanisms": known})
-    findings = classify_result(classification, article)
+    classification_evidence = {"topic": topic, "article": article, "files": repository.sources, "known_mechanisms": known,
+                              "date_policy": "网页发布日期不等于发现时间；正文明确说明发现日期时才能填写，否则 discovered=null；introduced 同理，只能依据原文明确说明。"}
+    def validate_classification(result):
+        return result, classify_result(result, article)
+    classification, findings = validated_model(model, "classify", classification_evidence, validate_classification)
     if not findings:
         return {"status": "rejected", "reason": classification["reason"], "findings": []}
     files, unavailable = repository.code(classification.get("code_paths", []))
     evidence = {"findings": findings, "files": files, "unavailable_files": unavailable, "commit": repository.commit}
-    assessments = assess_result(model("evaluate", evidence), findings, files, unavailable)
-    assessments = apply_verification(model("verify", {**evidence, "article": article, "assessments": assessments}), assessments)
+    assessments = validated_model(model, "evaluate", evidence, lambda result: assess_result(result, findings, files, unavailable))
+    assessments = validated_model(model, "verify", {**evidence, "article": article, "assessments": assessments},
+                                  lambda result: apply_verification(result, json.loads(json.dumps(assessments))))
     records = [{"finding": finding, "assessment": assessments[finding["id"]], "code_hash": repository.code_hash,
                 "commit": repository.commit, "checked_at": now()} for finding in findings]
     return {"status": "accepted", "reason": classification["reason"], "findings": records}
