@@ -279,6 +279,22 @@ class ResearchTests(unittest.TestCase):
         self.assertEqual(self.state["articles"][URL + "-original"]["status"], "accepted")
         self.assertNotIn(URL, self.state["articles"])
 
+    def test_search_can_be_disabled_for_seed_report_acceptance(self):
+        web = research.Web(research.Budget(10))
+        with patch.object(web, "get", side_effect=AssertionError("不应请求搜索引擎")):
+            self.assertEqual(web.search({"enabled": False}), ([], []))
+
+    def test_model_stage_cache_avoids_repeated_provider_requests(self):
+        config = self.root / "llm.yml"
+        config.write_text("llm: test", encoding="utf-8")
+        model = research.Model("mock", str(config), research.Budget(10), cache_dir=self.root / "cache")
+        with patch.object(research, "run_command", return_value='{"accepted":false}') as command:
+            self.assertEqual(model("classify", {"article": "one"}), {"accepted": False})
+            self.assertEqual(model("classify", {"article": "one"}), {"accepted": False})
+            self.assertEqual(command.call_count, 1)
+            model("classify", {"article": "changed"})
+            self.assertEqual(command.call_count, 2)
+
     def test_example_remains_opt_in_and_active_config_resolves_paths(self):
         config = json.loads((ROOT / "examples/research.json").read_text(encoding="utf-8"))
         path = self.root / "research.json"

@@ -250,6 +250,8 @@ class Web:
                 browser.close()
 
     def search(self, config):
+        if not config.get("enabled", True):
+            return [], []
         links, errors = [], []
         for query in config["queries"]:
             try:
@@ -397,10 +399,22 @@ class Repository:
 class Model:
     """复用 TermiteRS 的模型配置，凭证不经过网页抓取器或研究状态库。"""
 
-    def __init__(self, executable, config, budget, timeout=600):
+    def __init__(self, executable, config, budget, timeout=600, cache_dir=None):
         self.executable, self.config, self.budget, self.timeout = executable, config, budget, timeout
+        self.cache_dir = Path(cache_dir) if cache_dir else None
+        if self.cache_dir:
+            self.cache_dir.mkdir(mode=0o700, exist_ok=True)
 
     def __call__(self, phase, evidence):
+        cached = None
+        if self.cache_dir:
+            fingerprint = digest(json.dumps({"protocol": 1, "phase": phase, "evidence": evidence,
+                                             "llm_config": Path(self.config).read_text(encoding="utf-8")}, sort_keys=True, ensure_ascii=False))
+            cached = self.cache_dir / (fingerprint + '.json')
+            if cached.exists():
+                print(f"研究阶段 {phase}：复用本机缓存", flush=True)
+                return json.loads(cached.read_text(encoding="utf-8"))
+        print(f"研究阶段 {phase}：请求模型", flush=True)
         with tempfile.TemporaryDirectory(prefix="termiters-evidence-") as temporary:
             input_path = Path(temporary) / "input.json"
             with input_path.open("x", encoding="utf-8") as output:
@@ -409,7 +423,12 @@ class Model:
                 input_path.chmod(0o600)
             result = run_command([self.executable, "research", "analyze", "--config", self.config,
                                   "--input", input_path], self.budget, self.timeout)
-            return json.loads(result)
+            parsed = json.loads(result)
+            if cached:
+                with cached.open('x', encoding='utf-8') as output:
+                    json.dump(parsed, output, ensure_ascii=False)
+                cached.chmod(0o600)
+            return parsed
 
 
 def claim(value, body, required=True):
@@ -592,8 +611,9 @@ def cycle(config, state, repository, web, model, state_dir, preview=False):
             for record in decision["findings"]:
                 state["ledger"].setdefault(record["finding"]["id"], {})[url] = record
         except Exception as error:
-            state["articles"][url] = {**state["articles"].get(url, {}), "status": "pending", "last_attempt": now(), "last_error": type(error).__name__}
-            run["errors"].append(f"报告 {url}: {type(error).__name__}")
+            detail = f"{type(error).__name__}: {str(error)[:240]}"
+            state["articles"][url] = {**state["articles"].get(url, {}), "status": "pending", "last_attempt": now(), "last_error": detail}
+            run["errors"].append(f"报告 {url}: {detail}")
             remaining.append(url)
     state["queue"] = list(dict.fromkeys(remaining))
     if state["ledger"]:
@@ -619,6 +639,8 @@ def load_config(path):
         raise ValueError("请显式启用 research.enabled")
     text(config.get("topic"), "研究主题", 2000)
     search = config.get("search", {})
+    if type(search.get("enabled", True)) is not bool:
+        raise ValueError("search.enabled 必须为布尔值")
     if search.get("provider", "bing_rss") not in {"google", "bing_rss", "brave"}:
         raise ValueError("不支持的搜索提供方")
     if type(search.get("browser_enabled", False)) is not bool:
@@ -695,7 +717,7 @@ def main():
         try:
             repository = Repository(config["target"], state_dir, budget).refresh()
             web = Web(budget, config["http_timeout_seconds"])
-            model = Model(args.termiters, config["llm_config"], budget, config["model_timeout_seconds"])
+            model = Model(args.termiters, config["llm_config"], budget, config["model_timeout_seconds"], state_dir / "model-cache")
             result = cycle(config, state, repository, web, model, state_dir, args.preview)
         except Exception as error:
             result = {"finished_at": now(), "errors": [type(error).__name__ + ": " + str(error)]}
