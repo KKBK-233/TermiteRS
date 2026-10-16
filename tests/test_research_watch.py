@@ -101,7 +101,7 @@ class ResearchTests(unittest.TestCase):
         result = self.cycle()
         self.assertFalse(result["errors"])
         self.assertEqual(self.model.calls, ["classify", "evaluate", "verify"])
-        self.assertIn("| 隐写机制 | 过滤状态 | 触发条件 | 发现／引入时间", self.repo.original)
+        self.assertIn("| 报告版本 | 机制 | 过滤 | 触发条件（摘要） | 发现／引入 |", self.repo.original)
         self.assertIn("未过滤", self.repo.original)
         self.assertIn("引入：报告未说明", self.repo.original)
         self.assertTrue(self.repo.original.startswith("# 项目\n\n原有首页内容。"))
@@ -275,6 +275,45 @@ class ResearchTests(unittest.TestCase):
     def test_render_marks_old_code_as_pending(self):
         self.cycle()
         self.assertIn("代码已变化", research.render(self.state["ledger"], "another-hash"))
+
+    def test_render_orders_versions_numerically_and_unknown_last(self):
+        self.cycle()
+        template = self.state["ledger"]["date-mark"][URL]
+        ledger = {}
+        for identifier, version in (("a", "2.1.9"), ("b", "2.1.10"), ("c", None), ("d", "2.1.90 / 2.1.92")):
+            record = json.loads(json.dumps(template))
+            record["finding"].update(label="机制" + identifier, version={"value": version, "quote": ""} if version else None)
+            ledger[identifier] = {URL: record}
+        rendered = research.render(ledger, self.repo.code_hash)
+        table = rendered.split("<details>")[0]
+        self.assertLess(table.index("机制d"), table.index("机制b"))
+        self.assertLess(table.index("机制b"), table.index("机制a"))
+        self.assertLess(table.index("机制a"), table.index("机制c"))
+
+    def test_render_keeps_full_evidence_folded_and_links_fixed_commit(self):
+        self.cycle()
+        record = self.state["ledger"]["date-mark"][URL]
+        full = "前置条件" * 40 + "且只有自定义端点才触发"
+        record["finding"]["trigger"]["value"] = full
+        rendered = research.render(self.state["ledger"], self.repo.code_hash, "git@github.com:example/adapter.git")
+        self.assertNotIn(full, rendered.split("<details>")[0])
+        self.assertIn(full, rendered.split("<details>")[1])
+        self.assertIn("https://github.com/example/adapter/blob/" + self.repo.commit + "/src/relay.mjs#L1", rendered)
+        self.assertIn("[详情](#termiters-evidence-1)", rendered)
+        self.assertIn('id="termiters-evidence-1"', rendered)
+        self.assertTrue(rendered.endswith("此追踪由 [TermiteRS](https://github.com/KKBK-233/TermiteRS) 进行在线追踪更新。\n\n" + research.END))
+
+    def test_classification_validates_compact_labels_and_categories(self):
+        item = finding()
+        item.update(category="协议指纹", label="版本指纹", trigger_summary="使用自定义端点")
+        result = {"accepted": True, "reason": "原始报告", "findings": [item]}
+        self.assertEqual(research.classify_result(result, {"body": BODY})[0]["category"], "协议指纹")
+        item["label"] = "长" * 37
+        with self.assertRaises(ValueError):
+            research.classify_result(result, {"body": BODY})
+        item["label"], item["category"] = "短名", "未经许可的分类"
+        with self.assertRaises(ValueError):
+            research.classify_result(result, {"body": BODY})
 
     def test_private_dns_and_non_https_targets_are_blocked(self):
         for url in ("http://example.org", "https://user:pass@example.org", "file:///etc/passwd"):
