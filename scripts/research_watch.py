@@ -284,6 +284,14 @@ class Web:
         return list(dict.fromkeys(links)), errors
 
 
+class ToolFailure(RuntimeError):
+    """工具失败默认只暴露退出码，由模型入口单独脱敏处理诊断。"""
+
+    def __init__(self, program, code, stderr):
+        super().__init__(f"{Path(program).name} 退出码 {code}")
+        self.stderr = stderr
+
+
 def run_command(args, budget, timeout=120, data=None, env=None):
     options = {"stdin": subprocess.PIPE if data is not None else subprocess.DEVNULL,
                "stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "env": env}
@@ -305,7 +313,7 @@ def run_command(args, budget, timeout=120, data=None, env=None):
         raise
     if process.returncode:
         # 工具输出可能含凭证，错误只保留程序名和退出码。
-        raise RuntimeError(f"{Path(args[0]).name} 退出码 {process.returncode}")
+        raise ToolFailure(args[0], process.returncode, stderr)
     return stdout.decode("utf-8")
 
 
@@ -421,13 +429,24 @@ class Model:
                 json.dump({"phase": phase, "evidence": evidence}, output, ensure_ascii=False)
             if os.name != "nt":
                 input_path.chmod(0o600)
-            result = run_command([self.executable, "research", "analyze", "--config", self.config,
-                                  "--input", input_path], self.budget, self.timeout)
+            try:
+                result = run_command([self.executable, "research", "analyze", "--config", self.config,
+                                      "--input", input_path], self.budget, self.timeout)
+            except ToolFailure as error:
+                detail = error.stderr.decode('utf-8', errors='replace')
+                for key, value in os.environ.items():
+                    if any(word in key.upper() for word in ('KEY', 'TOKEN', 'SECRET', 'PASSWORD', 'CREDENTIAL')) and len(value) >= 8:
+                        detail = detail.replace(value, '[REDACTED]')
+                raise RuntimeError('模型调用失败：' + detail.strip()[-1800:]) from None
             parsed = json.loads(result)
             if cached:
-                with cached.open('x', encoding='utf-8') as output:
+                with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=self.cache_dir, prefix='.stage-', delete=False) as output:
                     json.dump(parsed, output, ensure_ascii=False)
-                cached.chmod(0o600)
+                    output.flush()
+                    os.fsync(output.fileno())
+                    temporary_cache = output.name
+                os.chmod(temporary_cache, 0o600)
+                os.replace(temporary_cache, cached)
             return parsed
 
 
