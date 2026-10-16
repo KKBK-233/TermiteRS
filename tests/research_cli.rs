@@ -31,6 +31,7 @@ fn research_calls_existing_provider_and_returns_machine_readable_json() {
                 Err(error) => panic!("未收到研究模型请求：{error}"),
             }
         };
+        stream.set_nonblocking(false).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();

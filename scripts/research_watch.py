@@ -19,7 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from urllib.parse import quote, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qs, quote, urlencode, urljoin, urlsplit, urlunsplit
 import xml.etree.ElementTree as ET
 
 
@@ -102,6 +102,52 @@ class PageText(HTMLParser):
             self.parts.append(data)
 
 
+class GoogleLinks(HTMLParser):
+    """读取普通 Google 网页结果链接，忽略站内导航与验证页。"""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.current = None
+        self.parts = []
+        self.results = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            self.current = dict(attrs).get("href", "")
+            self.parts = []
+
+    def handle_data(self, data):
+        if self.current is not None:
+            self.parts.append(data)
+
+    def handle_endtag(self, tag):
+        if tag != "a" or self.current is None:
+            return
+        href = self.current
+        self.current = None
+        if href.startswith("/url?"):
+            values = parse_qs(urlsplit(href).query)
+            href = (values.get("q") or values.get("url") or [""])[0]
+        try:
+            href = normalized_url(href)
+        except ValueError:
+            return
+        host = urlsplit(href).hostname
+        if host == "google.com" or host.endswith(".google.com") or host.endswith(".google.com.hk"):
+            return
+        title = " ".join(self.parts).strip()
+        if title:
+            self.results.append((href, title))
+
+
+def google_results(body):
+    parser = GoogleLinks()
+    parser.feed(body)
+    if not parser.results and not any(marker in body.lower() for marker in ("did not match any documents", "no results found")):
+        raise ValueError("Google 未提供可解析的网页结果，可能要求 JavaScript 或验证码")
+    return parser.results
+
+
 class Web:
     """逐跳核对公网地址并固定连接 IP，阻止重定向和 DNS 重绑定读取内网。"""
 
@@ -170,29 +216,69 @@ class Web:
             raise ValueError("报告正文为空或不足")
         return {"url": final_url, "body": body, "hash": digest(body)}
 
+    def google(self, query, config):
+        endpoint = "https://www.google.com/search?" + urlencode({"q": query, "num": config.get("max_results", 10), "hl": "en", "udm": 14})
+        _, body, _ = self.get(endpoint)
+        try:
+            return google_results(body)
+        except ValueError:
+            if not config.get("browser_enabled", False):
+                raise
+        # 正常渲染 Google 的 JavaScript 页面；不处理或绕过验证码。
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as playwright:
+            browser_env = {key: value for key, value in os.environ.items()
+                           if key in {"PATH", "HOME", "LANG", "TMPDIR", "TEMP", "TMP", "PLAYWRIGHT_BROWSERS_PATH", "SystemRoot", "WINDIR"}}
+            browser = playwright.chromium.launch(headless=True, env=browser_env)
+            try:
+                page = browser.new_page()
+                def route_request(route):
+                    host = urlsplit(route.request.url).hostname or ""
+                    allowed = any(host == domain or host.endswith("." + domain)
+                                  for domain in ("google.com", "google.com.hk", "gstatic.com", "googleusercontent.com"))
+                    if allowed and route.request.resource_type not in {"image", "font", "media"}:
+                        route.continue_()
+                    else:
+                        route.abort()
+                page.route("**/*", route_request)
+                page.goto(endpoint, wait_until="domcontentloaded", timeout=int(self.budget.timeout(45) * 1000))
+                page.wait_for_function("document.querySelector('a h3') || location.pathname.startsWith('/sorry/')", timeout=int(self.budget.timeout(20) * 1000))
+                if "/sorry/" in page.url:
+                    raise ValueError("Google 返回验证码，未继续搜索")
+                return google_results(page.content())
+            finally:
+                browser.close()
+
     def search(self, config):
         links, errors = [], []
         for query in config["queries"]:
             try:
-                if config.get("provider", "bing_rss") == "brave":
+                if config.get("provider", "bing_rss") == "google":
+                    results = self.google(query, config)
+                elif config.get("provider", "bing_rss") == "brave":
                     key = os.environ[config.get("api_key_env", "BRAVE_SEARCH_API_KEY")]
                     endpoint = "https://api.search.brave.com/res/v1/web/search?" + urlencode({"q": query, "count": config.get("max_results", 10)})
                     _, body, _ = self.get(endpoint, {"X-Subscription-Token": key})
-                    results = [item["url"] for item in json.loads(body).get("web", {}).get("results", [])]
+                    results = [(item["url"], item.get("title", "") + " " + item.get("description", ""))
+                               for item in json.loads(body).get("web", {}).get("results", [])]
                 else:
                     endpoint = "https://www.bing.com/search?" + urlencode({"format": "rss", "q": query})
                     _, body, _ = self.get(endpoint)
                     root = ET.fromstring(body)
                     if root.tag != "rss" or root.find("channel") is None:
                         raise ValueError("搜索未返回 RSS，可能需要验证码或接口已变化")
-                    results = [item.findtext("link", "") for item in root.findall("./channel/item")]
-                for value in results[:config.get("max_results", 10)]:
+                    results = [(item.findtext("link", ""), item.findtext("title", "") + " " + item.findtext("description", ""))
+                               for item in root.findall("./channel/item")]
+                for value, description in results[:config.get("max_results", 10)]:
+                    keywords = config.get("required_keywords", [])
+                    if keywords and not any(term.casefold() in (value + " " + description).casefold() for term in keywords):
+                        continue
                     try:
                         links.append(normalized_url(value))
                     except ValueError:
                         continue
             except Exception as error:
-                errors.append(f"搜索 {query}: {type(error).__name__}")
+                errors.append(f"搜索 {query}: {type(error).__name__}: {str(error)[:180]}")
         return list(dict.fromkeys(links)), errors
 
 
@@ -472,7 +558,7 @@ def cycle(config, state, repository, web, model, state_dir, preview=False):
     candidates, errors = web.search(config["search"])
     run["errors"].extend(errors)
     # 已核验的报告持续追踪，覆盖报告修订和代码升级，不依赖搜索排序始终命中。
-    candidates += config["search"].get("seed_urls", [])
+    candidates = config["search"].get("seed_urls", []) + candidates
     candidates += [url for url, value in state["articles"].items() if value.get("status") in {"accepted", "pending"}]
     candidates = list(dict.fromkeys(candidates))
     # 超过每日上限的候选落盘排队，下一轮优先处理，避免搜索首页长期饿死后续条目。
@@ -533,13 +619,20 @@ def load_config(path):
         raise ValueError("请显式启用 research.enabled")
     text(config.get("topic"), "研究主题", 2000)
     search = config.get("search", {})
-    if search.get("provider", "bing_rss") not in {"bing_rss", "brave"}:
+    if search.get("provider", "bing_rss") not in {"google", "bing_rss", "brave"}:
         raise ValueError("不支持的搜索提供方")
+    if type(search.get("browser_enabled", False)) is not bool:
+        raise ValueError("browser_enabled 必须为布尔值")
     queries = search.get("queries")
     if not isinstance(queries, list) or not 1 <= len(queries) <= 12:
         raise ValueError("需要配置 1 至 12 个关键词查询")
     for query in queries:
         text(query, "搜索词", 500)
+    keywords = search.get("required_keywords", [])
+    if not isinstance(keywords, list) or len(keywords) > 30:
+        raise ValueError("required_keywords 必须为最多30项的列表")
+    for keyword in keywords:
+        text(keyword, "预筛选关键词", 100)
     if type(search.get("max_results", 10)) is not int or not 1 <= search.get("max_results", 10) <= 20:
         raise ValueError("搜索结果数量应在 1 至 20 之间")
     for url in search.get("seed_urls", []):
