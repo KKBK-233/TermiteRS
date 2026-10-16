@@ -250,6 +250,35 @@ class ResearchTests(unittest.TestCase):
         self.assertFalse(links)
         self.assertTrue(errors)
 
+    def test_search_keyword_gate_excludes_generic_product_pages(self):
+        web = research.Web(research.Budget(10))
+        rss = ('<rss><channel><item><title>Claude download</title><link>https://example.org/product</link></item>'
+               '<item><title>Claude prompt steganography</title><link>https://example.org/report</link></item></channel></rss>')
+        with patch.object(web, "get", return_value=("https://www.bing.com/", rss, "application/rss+xml")):
+            links, errors = web.search({"queries": ["CLI"], "required_keywords": ["stegan", "隐写"]})
+        self.assertEqual(links, ["https://example.org/report"])
+        self.assertFalse(errors)
+
+    def test_google_extracts_direct_and_redirected_results(self):
+        body = ('<a href="https://support.google.com/websearch">Help</a>'
+                '<a href="/url?q=https%3A%2F%2Fresearch.example%2Fpost&amp;sa=U"><h3>Hidden markers</h3></a>'
+                '<a href="https://another.example/post"><h3>Original reverse engineering</h3></a>')
+        self.assertEqual([url for url, _ in research.google_results(body)], ["https://research.example/post", "https://another.example/post"])
+
+    def test_google_javascript_gate_is_not_reported_as_no_results(self):
+        web = research.Web(research.Budget(10))
+        with patch.object(web, "get", return_value=("https://www.google.com/", "<html>Please enable JavaScript</html>", "text/html")):
+            links, errors = web.search({"provider": "google", "queries": ["reverse engineering"]})
+        self.assertFalse(links)
+        self.assertIn("JavaScript", errors[0])
+
+    def test_known_original_is_processed_before_generic_search_hits(self):
+        self.config["max_reports"] = 1
+        self.config["search"]["seed_urls"] = [URL + "-original"]
+        self.cycle()
+        self.assertEqual(self.state["articles"][URL + "-original"]["status"], "accepted")
+        self.assertNotIn(URL, self.state["articles"])
+
     def test_example_remains_opt_in_and_active_config_resolves_paths(self):
         config = json.loads((ROOT / "examples/research.json").read_text(encoding="utf-8"))
         path = self.root / "research.json"

@@ -10,13 +10,15 @@
     "source_prefixes": ["model-gateway/"]
   },
   "search": {
-    "provider": "bing_rss",
+    "provider": "google",
+    "browser_enabled": false,
     "queries": [
       "\"Claude Code\" steganography reverse engineering",
       "\"Claude Code\" 隐写 逆向",
       "\"Claude Code\" hidden markers watermark reverse engineering"
     ],
     "max_results": 10,
+    "required_keywords": ["stegan", "隐写", "reverse engineering", "逆向", "watermark", "hidden marker", "fingerprint"],
     "seed_urls": ["https://thereallo.dev/blog/claude-code-prompt-steganography"]
   },
   "max_reports": 6,
