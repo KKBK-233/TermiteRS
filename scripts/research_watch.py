@@ -25,6 +25,7 @@ import xml.etree.ElementTree as ET
 
 START = "<!-- termiters:research:start -->"
 END = "<!-- termiters:research:end -->"
+RESEARCH_PROTOCOL = 3
 STATUSES = {"filtered": "已过滤", "unfiltered": "未过滤", "partial": "部分过滤", "unknown": "待核实"}
 SUFFIXES = {".rs", ".go", ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".java", ".kt"}
 
@@ -423,7 +424,7 @@ class Model:
     def __call__(self, phase, evidence):
         cached = None
         if self.cache_dir:
-            fingerprint = digest(json.dumps({"protocol": 2, "phase": phase, "evidence": evidence,
+            fingerprint = digest(json.dumps({"protocol": RESEARCH_PROTOCOL, "phase": phase, "evidence": evidence,
                                              "llm_config": Path(self.config).read_text(encoding="utf-8")}, sort_keys=True, ensure_ascii=False))
             cached = self.cache_dir / (fingerprint + '.json')
             if cached.exists():
@@ -485,8 +486,17 @@ def classify_result(result, article):
         if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", identifier) or identifier in ids:
             raise ValueError("机制ID非法或重复")
         ids.add(identifier)
-        validated.append({"id": identifier, **{key: claim(item.get(key), article["body"], key in {"mechanism", "trigger"})
-                                               for key in ("mechanism", "trigger", "version", "discovered", "introduced")}})
+        entry = {"id": identifier, **{key: claim(item.get(key), article["body"], key in {"mechanism", "trigger"})
+                                      for key in ("mechanism", "trigger", "version", "discovered", "introduced")}}
+        # 简表摘要同样进入独立复核；旧状态没有摘要时仍可完整展示证据。
+        for key, limit in (("label", 36), ("trigger_summary", 90)):
+            if key in item:
+                entry[key] = text(item[key], key, limit)
+        if "category" in item:
+            if item["category"] not in {"隐写", "环境标记", "协议指纹", "模型水印"}:
+                raise ValueError("机制分类非法")
+            entry["category"] = item["category"]
+        validated.append(entry)
     return validated
 
 
@@ -545,29 +555,56 @@ def report_link(url):
     return quote(normalized_url(url), safe="/:?=&%+~-._")
 
 
-def render(ledger, current_hash):
-    lines = [START, "## 隐写机制跟踪", "",
-             "由公开逆向报告与本仓库代码对照生成，过滤状态属于静态代码分析，未经真实流量复现。日期与引入版本沿用报告口径；旧版报告不代表当前 CLI 仍生成同类标记。", "",
-             "| 隐写机制 | 过滤状态 | 触发条件 | 发现／引入时间（报告口径） |", "| --- | --- | --- | --- |"]
-    for identifier, records in sorted(ledger.items()):
-        for url, item in sorted(records.items()):
-            finding, assessment = item["finding"], item["assessment"]
-            stale = item["code_hash"] != current_hash
-            status = "待核实（代码已变化）" if stale else STATUSES[assessment["status"]]
-            if item.get("revised"):
-                status = "待核实（来源已修订）"
-            dates = "；".join(label + "：" + (finding[key]["value"] if finding.get(key) else "报告未说明")
-                              for label, key in (("发现", "discovered"), ("引入", "introduced")))
-            version = finding.get("version")
-            name = escape(finding["mechanism"]["value"])
-            if version:
-                name += "<br>报告分析版本：" + escape(version["value"])
-            evidence = "、".join(escape(e["path"]) + ":" + str(e["line"]) for e in assessment["code_evidence"])
-            explanation = escape(assessment["reason"])
-            if evidence:
-                explanation += "<br>代码：" + evidence + "；提交 " + escape(item["commit"][:12])
-            lines.append(f"| {name} [报告]({report_link(url)}) | {status}<br>{explanation} | {escape(finding['trigger']['value'])} | {escape(dates)} |")
-    lines += ["", END]
+def version_rank(value):
+    """按报告版本数值倒序；范围取上界，未说明版本统一置后。"""
+    versions = re.findall(r"(?<!\d)(\d+)\.(\d+)\.(\d+)(?!\d)", value or "")
+    return max((tuple(map(int, version)) for version in versions), default=(-1, -1, -1))
+
+
+def compact(value, maximum):
+    """只缩短展示，不改证据；省略部分可在对应折叠项查看。"""
+    value = " ".join(value.split())
+    return escape(value if len(value) <= maximum else value[:maximum - 1] + "…")
+
+
+def render(ledger, current_hash, remote=""):
+    lines = [START, "## 隐写与指纹跟踪", "",
+             "按报告分析版本新→旧排列；过滤状态仅指本仓库可见路径的静态判断，非真实流量验证，亦不证明新版 CLI 仍生成该标记。时间依原报告，未说明不推断。", "",
+             "| 报告版本 | 机制 | 过滤 | 触发条件（摘要） | 发现／引入 |", "| --- | --- | --- | --- | --- |"]
+    rows = [(identifier, url, item) for identifier, records in ledger.items() for url, item in records.items()]
+    rows.sort(key=lambda row: (tuple(-part for part in version_rank((row[2]["finding"].get("version") or {}).get("value"))), row[0], row[1]))
+    details = []
+    github = re.fullmatch(r"(?:git@github\.com:|https://github\.com/)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?", remote)
+    for number, (identifier, url, item) in enumerate(rows, 1):
+        finding, assessment = item["finding"], item["assessment"]
+        stale = item["code_hash"] != current_hash
+        status = "待核实（代码已变化）" if stale else STATUSES[assessment["status"]]
+        if item.get("revised"):
+            status = "待核实（来源已修订）"
+        dates = "；".join(label + "：" + (finding[key]["value"] if finding.get(key) else "报告未说明")
+                          for label, key in (("发现", "discovered"), ("引入", "introduced")))
+        version = finding.get("version")
+        label = finding.get("label", finding["mechanism"]["value"])
+        category = finding.get("category")
+        name = (escape(category) + " · " if category else "") + compact(label, 36)
+        trigger = compact(finding.get("trigger_summary", finding["trigger"]["value"]), 90)
+        version_text = re.sub(r"^Claude Code\s*", "", version["value"]) if version else "未说明"
+        short_dates = "／".join(escape(finding[key]["value"]) if finding.get(key) else "未说明" for key in ("discovered", "introduced"))
+        anchor = f"termiters-evidence-{number}"
+        lines.append(f"| {escape(version_text)} | {name} [↗]({report_link(url)}) | {status} | {trigger} [详情](#{anchor}) | {short_dates} |")
+        evidence = []
+        for entry in assessment["code_evidence"]:
+            location = escape(entry["path"]) + ":" + str(entry["line"])
+            if github and re.fullmatch(r"[0-9a-f]{40,64}", item["commit"]):
+                location = f"[{location}](https://github.com/{github[1]}/blob/{item['commit']}/{quote(entry['path'], safe='/')}#L{entry['line']})"
+            evidence.append(location)
+        details += [f'<a id="{anchor}"></a>', f"**{number}. {compact(label, 36)}** · {escape(version_text)} · [原报告]({report_link(url)})", "",
+                    f"机制：{escape(finding['mechanism']['value'])}", "",
+                    f"完整触发条件：{escape(finding['trigger']['value'])}", "",
+                    f"{status}：{escape(assessment['reason'])}", "",
+                    f"代码：{'、'.join(evidence) or '证据不足'}；审阅提交 {escape(item['commit'][:12])}。{escape(dates)}。", ""]
+    lines += ["", "<details>", "<summary>展开完整条件与代码证据</summary>", "", *details, "</details>", "",
+              "此追踪由 [TermiteRS](https://github.com/KKBK-233/TermiteRS) 进行在线追踪更新。", "", END]
     return "\n".join(lines)
 
 
@@ -638,7 +675,7 @@ def cycle(config, state, repository, web, model, state_dir, preview=False):
         try:
             article = web.article(url)
             previous = state["articles"].get(url, {})
-            report_fingerprint = digest(article["hash"] + config["topic"])
+            report_fingerprint = digest(str(RESEARCH_PROTOCOL) + article["hash"] + config["topic"])
             fingerprint = digest(report_fingerprint + repository.code_hash)
             same_rejected = previous.get("status") == "rejected" and previous.get("report_fingerprint") == report_fingerprint
             if same_rejected or (previous.get("fingerprint") == fingerprint and previous.get("status") == "accepted"):
@@ -662,7 +699,7 @@ def cycle(config, state, repository, web, model, state_dir, preview=False):
     state["queue"] = list(dict.fromkeys(remaining))
     if state["ledger"]:
         original = repository.read(repository.homepage)
-        updated = update_homepage(original, render(state["ledger"], repository.code_hash))
+        updated = update_homepage(original, render(state["ledger"], repository.code_hash, config.get("target", {}).get("remote", "")))
         (state_dir / "README.preview.md").write_text(updated, encoding="utf-8")
         if config.get("publish", False) and not preview:
             try:
