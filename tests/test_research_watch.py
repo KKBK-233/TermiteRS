@@ -295,6 +295,15 @@ class ResearchTests(unittest.TestCase):
             model("classify", {"article": "changed"})
             self.assertEqual(command.call_count, 2)
 
+    def test_model_diagnostic_redacts_environment_credentials(self):
+        model = research.Model('mock', 'mock.yml', research.Budget(10))
+        error = research.ToolFailure('mock', 1, b'HTTP failed: synthetic-secret-key')
+        with patch.dict(research.os.environ, {'DS_API_KEY': 'synthetic-secret-key'}), patch.object(research, 'run_command', side_effect=error):
+            with self.assertRaises(RuntimeError) as raised:
+                model('classify', {})
+        self.assertNotIn('synthetic-secret-key', str(raised.exception))
+        self.assertIn('[REDACTED]', str(raised.exception))
+
     def test_example_remains_opt_in_and_active_config_resolves_paths(self):
         config = json.loads((ROOT / "examples/research.json").read_text(encoding="utf-8"))
         path = self.root / "research.json"
