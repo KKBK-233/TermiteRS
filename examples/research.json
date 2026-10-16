@@ -7,7 +7,9 @@
     "remote": "https://github.com/your-name/your-project.git",
     "branch": "main",
     "homepage": "README.md",
-    "source_prefixes": ["model-gateway/"]
+    "source_prefixes": ["model-gateway/"],
+    "required_code_paths": ["model-gateway/engine.mjs", "model-gateway/context.mjs", "model-gateway/anthropic.mjs", "model-gateway/cli-events.mjs"],
+    "max_code_bytes": 96000
   },
   "search": {
     "provider": "google",

@@ -361,11 +361,18 @@ class Repository:
             raise ValueError("源文件过大")
         return self.git("cat-file", "blob", self.entries[path][1])
 
-    def code(self, paths, maximum=48000):
+    def code(self, paths, maximum=None):
+        maximum = maximum or self.config.get("max_code_bytes", 96000)
         if not isinstance(paths, list) or len(paths) > 12:
             raise ValueError("代码选择超过上限")
         files, unavailable, used = {}, [], 0
-        for path in dict.fromkeys(paths):
+        required = self.config.get("required_code_paths", [])
+        combined = list(dict.fromkeys(required + paths))
+        if len(combined) > 20:
+            raise ValueError("必读代码与所选文件合计超过20项")
+        # 配置指定的关键实现优先，随后实现文件优先于测试文件。
+        ordered = required + sorted([p for p in combined if p not in required], key=lambda p: (bool(re.search(r"(?:[./_-])(?:test|tests|spec)(?:[./_-])", p)), combined.index(p)))
+        for path in dict.fromkeys(ordered):
             if path not in self.sources:
                 raise ValueError("模型选择了未授权代码文件")
             content = self.read(path)
@@ -416,7 +423,7 @@ class Model:
     def __call__(self, phase, evidence):
         cached = None
         if self.cache_dir:
-            fingerprint = digest(json.dumps({"protocol": 1, "phase": phase, "evidence": evidence,
+            fingerprint = digest(json.dumps({"protocol": 2, "phase": phase, "evidence": evidence,
                                              "llm_config": Path(self.config).read_text(encoding="utf-8")}, sort_keys=True, ensure_ascii=False))
             cached = self.cache_dir / (fingerprint + '.json')
             if cached.exists():
@@ -518,7 +525,7 @@ def apply_verification(result, assessments):
             raise ValueError("复核结果格式非法")
         reason = text(verdict.get("reason"), "复核理由")
         if not verdict["report_supported"]:
-            raise ValueError("报告机制或日期复核未通过，本轮不发布")
+            raise ValueError("报告机制或日期复核未通过：" + reason)
         if not verdict["supported"]:
             assessments[verdict["id"]].update(status="unknown", reason="复核未通过：" + reason)
     return assessments
@@ -691,6 +698,14 @@ def load_config(path):
         raise ValueError("source_prefixes 必须为非空目录列表")
     for prefix in prefixes:
         safe_path(prefix.rstrip("/"))
+    required = target.get("required_code_paths", [])
+    if not isinstance(required, list) or len(required) > 8:
+        raise ValueError("required_code_paths 必须为最多8项的列表")
+    for required_path in required:
+        safe_path(required_path)
+    code_limit = target.get("max_code_bytes", 96000)
+    if type(code_limit) is not int or not 1024 <= code_limit <= 128000:
+        raise ValueError("max_code_bytes 超出允许范围")
     for key, default, ceiling in (("max_reports", 6, 30), ("timeout_seconds", 7200, 7200),
                                   ("http_timeout_seconds", 30, 120), ("model_timeout_seconds", 600, 1800),
                                   ("max_queue", 1000, 10000)):

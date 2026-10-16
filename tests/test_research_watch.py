@@ -135,6 +135,35 @@ class ResearchTests(unittest.TestCase):
         self.assertTrue(self.cycle()["errors"])
         self.assertFalse(self.repo.published)
 
+    def test_unspecified_report_dates_are_published_without_inventing_them(self):
+        original = self.model.__call__
+        def model(phase, evidence):
+            result = original(phase, evidence)
+            if phase == 'classify':
+                result['findings'][0]['discovered'] = None
+                result['findings'][0]['introduced'] = None
+            return result
+        self.model = model
+        self.assertFalse(self.cycle()['errors'])
+        self.assertIn('发现：报告未说明；引入：报告未说明', self.repo.original)
+
+    def test_required_implementation_is_read_before_large_tests(self):
+        repo = research.Repository.__new__(research.Repository)
+        repo.config = {'required_code_paths': ['src/engine.mjs'], 'max_code_bytes': 40}
+        repo.sources = ['src/engine.mjs', 'src/engine.test.mjs', 'src/context.mjs']
+        files = {'src/engine.mjs': 'entry' * 4, 'src/engine.test.mjs': 'test' * 10, 'src/context.mjs': 'context'}
+        repo.read = files.__getitem__
+        selected, unavailable = repo.code(['src/engine.test.mjs', 'src/context.mjs'])
+        self.assertEqual(list(selected), ['src/engine.mjs', 'src/context.mjs'])
+        self.assertEqual(unavailable, ['src/engine.test.mjs'])
+
+    def test_required_path_cannot_escape_authorized_source_files(self):
+        repo = research.Repository.__new__(research.Repository)
+        repo.config = {'required_code_paths': ['secret.env']}
+        repo.sources = ['src/engine.mjs']
+        with self.assertRaises(ValueError):
+            repo.code([])
+
     def test_untrusted_prose_cannot_inject_markdown_links(self):
         self.assertNotIn("[click]", research.escape("[click](https://example.org)"))
 
