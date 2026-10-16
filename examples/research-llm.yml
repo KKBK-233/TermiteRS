@@ -1,0 +1,15 @@
+# 仅供研究任务调用模型；不启动同步、不读取工作区或个人事项。
+repo:
+  path: .
+  upstream: unused
+  fork: unused
+llm:
+  enabled: true
+  provider: deep-seek
+  model: deepseek-v4-pro
+  api_key_env: DEEPSEEK_API_KEY
+  temperature: 0.1
+  # 复核同时提供报告原文、代码与候选判断。
+  max_prompt_bytes: 196608
+  timeout_seconds: 180
+  max_retries: 1

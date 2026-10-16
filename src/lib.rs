@@ -14,6 +14,7 @@ pub mod notify;
 pub mod protection;
 pub mod release;
 pub mod report;
+pub mod research;
 pub mod sandbox;
 pub mod service;
 pub mod sync;

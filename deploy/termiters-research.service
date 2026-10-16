@@ -1,0 +1,21 @@
+[Unit]
+Description=TermiteRS daily research and homepage update
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=termiters
+Group=termiters
+WorkingDirectory=/var/lib/termiters
+EnvironmentFile=/etc/termiters/research.env
+Environment=GIT_TERMINAL_PROMPT=0
+ExecStart=/usr/local/bin/TermiteRS research run-once --config /etc/termiters/research.json
+TimeoutStartSec=2h
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/termiters

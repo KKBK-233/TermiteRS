@@ -1,0 +1,32 @@
+{
+  "enabled": false,
+  "topic": "Claude Code 客户端隐写、环境标记与模型输出水印的原创逆向报告；评估目标适配器代码的过滤情况",
+  "llm_config": "research-llm.yml",
+  "state_dir": ".termite/research",
+  "target": {
+    "remote": "https://github.com/your-name/your-project.git",
+    "branch": "main",
+    "homepage": "README.md",
+    "source_prefixes": ["model-gateway/"]
+  },
+  "search": {
+    "provider": "bing_rss",
+    "queries": [
+      "\"Claude Code\" steganography reverse engineering",
+      "\"Claude Code\" 隐写 逆向",
+      "\"Claude Code\" hidden markers watermark reverse engineering"
+    ],
+    "max_results": 10,
+    "seed_urls": ["https://thereallo.dev/blog/claude-code-prompt-steganography"]
+  },
+  "max_reports": 6,
+  "max_queue": 1000,
+  "timeout_seconds": 7200,
+  "http_timeout_seconds": 30,
+  "model_timeout_seconds": 600,
+  "publish": false,
+  "author": {
+    "name": "TermiteRS Research",
+    "email": "research@example.invalid"
+  }
+}

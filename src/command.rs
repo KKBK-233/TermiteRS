@@ -65,7 +65,7 @@ pub fn run_shell(command: &str, cwd: impl AsRef<Path>) -> Result<CommandOutput> 
 }
 
 /// 启动工具后并行读取输出、轮询截止时间，并在超时时终止整棵进程树。
-fn run_prepared(
+pub(crate) fn run_prepared(
     command: &mut Command,
     label: &str,
     cwd: &Path,
