@@ -528,6 +528,10 @@ def assess_result(result, findings, files, unavailable):
     return validated
 
 
+class ReportEvidenceFailure(ValueError):
+    """复核否定报告声明时必须重提机制，不能只让复核改口。"""
+
+
 def apply_verification(result, assessments):
     verdicts = result.get("verdicts") if isinstance(result, dict) else None
     if not isinstance(verdicts, list) or len(verdicts) != len(assessments) or {v.get("id") for v in verdicts} != set(assessments):
@@ -537,7 +541,7 @@ def apply_verification(result, assessments):
             raise ValueError("复核结果格式非法")
         reason = text(verdict.get("reason"), "复核理由")
         if not verdict["report_supported"]:
-            raise ValueError("报告机制或日期复核未通过：" + reason)
+            raise ReportEvidenceFailure("报告机制或日期复核未通过：" + reason)
         if not verdict["supported"]:
             assessments[verdict["id"]].update(status="unknown", reason="复核未通过：" + reason)
     return assessments
@@ -569,7 +573,7 @@ def compact(value, maximum):
 
 def render(ledger, current_hash, remote=""):
     lines = [START, "## 隐写与指纹跟踪", "",
-             "按报告分析版本新→旧排列；过滤状态仅指本仓库可见路径的静态判断，非真实流量验证，亦不证明新版 CLI 仍生成该标记。时间依原报告，未说明不推断。", "",
+             "按报告分析版本新→旧排列。过滤仅对折叠证据列明的路径成立，不是端到端保证；未经真实流量验证，旧版标记不推定新版仍有。时间依原报告。", "",
              "| 报告版本 | 机制 | 过滤 | 触发条件（摘要） | 发现／引入 |", "| --- | --- | --- | --- | --- |"]
     rows = [(identifier, url, item) for identifier, records in ledger.items() for url, item in records.items()]
     rows.sort(key=lambda row: (tuple(-part for part in version_rank((row[2]["finding"].get("version") or {}).get("value"))), row[0], row[1]))
@@ -588,7 +592,10 @@ def render(ledger, current_hash, remote=""):
         category = finding.get("category")
         name = (escape(category) + " · " if category else "") + compact(label, 36)
         trigger = compact(finding.get("trigger_summary", finding["trigger"]["value"]), 90)
-        version_text = re.sub(r"^Claude Code\s*", "", version["value"]) if version else "未说明"
+        full_version = version["value"] if version else "未说明"
+        # 简表只展示版本号；架构、包名等附注留在证据区，不推造版本区间。
+        numbers = list(dict.fromkeys(re.findall(r"(?<!\d)\d+\.\d+\.\d+(?!\d)", full_version)))
+        version_text = " / ".join(numbers) if numbers else compact(full_version, 24)
         short_dates = "／".join(escape(finding[key]["value"]) if finding.get(key) else "未说明" for key in ("discovered", "introduced"))
         anchor = f"termiters-evidence-{number}"
         lines.append(f"| {escape(version_text)} | {name} [↗]({report_link(url)}) | {status} | {trigger} [详情](#{anchor}) | {short_dates} |")
@@ -598,7 +605,7 @@ def render(ledger, current_hash, remote=""):
             if github and re.fullmatch(r"[0-9a-f]{40,64}", item["commit"]):
                 location = f"[{location}](https://github.com/{github[1]}/blob/{item['commit']}/{quote(entry['path'], safe='/')}#L{entry['line']})"
             evidence.append(location)
-        details += [f'<a id="{anchor}"></a>', f"**{number}. {compact(label, 36)}** · {escape(version_text)} · [原报告]({report_link(url)})", "",
+        details += [f'<a id="{anchor}"></a>', f"**{number}. {compact(label, 36)}** · {escape(full_version)} · [原报告]({report_link(url)})", "",
                     f"机制：{escape(finding['mechanism']['value'])}", "",
                     f"完整触发条件：{escape(finding['trigger']['value'])}", "",
                     f"{status}：{escape(assessment['reason'])}", "",
@@ -624,6 +631,8 @@ def validated_model(model, phase, evidence, validator):
     result = model(phase, evidence)
     try:
         return validator(result)
+    except ReportEvidenceFailure:
+        raise
     except ValueError as error:
         corrected = model(phase, {**evidence, "correction": {
             "validation_error": str(error), "previous_response": result,
@@ -637,17 +646,27 @@ def investigate(article, repository, model, ledger, topic):
                               "date_policy": "网页发布日期不等于发现时间；正文明确说明发现日期时才能填写，否则 discovered=null；introduced 同理，只能依据原文明确说明。"}
     def validate_classification(result):
         return result, classify_result(result, article)
-    classification, findings = validated_model(model, "classify", classification_evidence, validate_classification)
-    if not findings:
-        return {"status": "rejected", "reason": classification["reason"], "findings": []}
-    files, unavailable = repository.code(classification.get("code_paths", []))
-    evidence = {"findings": findings, "files": files, "unavailable_files": unavailable, "commit": repository.commit}
-    assessments = validated_model(model, "evaluate", evidence, lambda result: assess_result(result, findings, files, unavailable))
-    assessments = validated_model(model, "verify", {**evidence, "article": article, "assessments": assessments},
-                                  lambda result: apply_verification(result, json.loads(json.dumps(assessments))))
-    records = [{"finding": finding, "assessment": assessments[finding["id"]], "code_hash": repository.code_hash,
-                "commit": repository.commit, "checked_at": now()} for finding in findings]
-    return {"status": "accepted", "reason": classification["reason"], "findings": records}
+    # 语义复核失败后最多回到提取阶段一次，重读原文、重评代码并再次独立复核。
+    for attempt in range(2):
+        classification, findings = validated_model(model, "classify", classification_evidence, validate_classification)
+        if not findings:
+            return {"status": "rejected", "reason": classification["reason"], "findings": []}
+        files, unavailable = repository.code(classification.get("code_paths", []))
+        evidence = {"findings": findings, "files": files, "unavailable_files": unavailable, "commit": repository.commit}
+        assessments = validated_model(model, "evaluate", evidence, lambda result: assess_result(result, findings, files, unavailable))
+        try:
+            assessments = validated_model(model, "verify", {**evidence, "article": article, "assessments": assessments},
+                                          lambda result: apply_verification(result, json.loads(json.dumps(assessments))))
+        except ReportEvidenceFailure as error:
+            if attempt:
+                raise
+            classification_evidence = {**classification_evidence, "review_feedback": {
+                "reason": str(error), "previous_findings": findings,
+                "instruction": "重新核对原报告，修正错误的机制、版本或触发条件，再给出完整提取结果。未知开关不得自行补成确定前置条件。不得只要求复核改口，也不能为了通过而补造证据。"}}
+            continue
+        records = [{"finding": finding, "assessment": assessments[finding["id"]], "code_hash": repository.code_hash,
+                    "commit": repository.commit, "checked_at": now()} for finding in findings]
+        return {"status": "accepted", "reason": classification["reason"], "findings": records}
 
 
 def cycle(config, state, repository, web, model, state_dir, preview=False):
