@@ -133,7 +133,27 @@ class ResearchTests(unittest.TestCase):
     def test_report_verification_failure_prevents_publication(self):
         self.model.report_supported = False
         self.assertTrue(self.cycle()["errors"])
+        self.assertEqual(self.model.calls.count("classify"), 2)
+        self.assertEqual(self.model.calls.count("verify"), 2)
         self.assertFalse(self.repo.published)
+
+    def test_semantic_review_returns_feedback_to_extraction_before_rechecking(self):
+        original_model = self.model
+        requests = []
+        def model(phase, evidence):
+            requests.append((phase, evidence))
+            result = original_model(phase, evidence)
+            if phase == "verify" and original_model.calls.count("verify") == 1:
+                result['verdicts'][0].update(report_supported=False, reason='触发条件错误，需要重新提取')
+            return result
+        self.model = model
+        result = self.cycle()
+        self.assertFalse(result['errors'])
+        self.assertEqual([phase for phase, _ in requests], ['classify', 'evaluate', 'verify'] * 2)
+        feedback = requests[3][1]['review_feedback']
+        self.assertIn('触发条件错误', feedback['reason'])
+        self.assertEqual(feedback['previous_findings'][0]['id'], 'date-mark')
+        self.assertEqual(len(self.repo.published), 1)
 
     def test_unspecified_report_dates_are_published_without_inventing_them(self):
         original = self.model.__call__
@@ -289,6 +309,15 @@ class ResearchTests(unittest.TestCase):
         self.assertLess(table.index("机制d"), table.index("机制b"))
         self.assertLess(table.index("机制b"), table.index("机制a"))
         self.assertLess(table.index("机制a"), table.index("机制c"))
+
+    def test_render_keeps_version_annotations_out_of_compact_table(self):
+        self.cycle()
+        record = self.state['ledger']['date-mark'][URL]
+        record['finding']['version']['value'] = 'v2.1.169（npm 包，native win32-x64）'
+        rendered = research.render(self.state['ledger'], self.repo.code_hash)
+        self.assertIn('| 2.1.169 |', rendered.split('<details>')[0])
+        self.assertNotIn('win32', rendered.split('<details>')[0])
+        self.assertIn('native win32-x64', rendered.split('<details>')[1])
 
     def test_render_keeps_full_evidence_folded_and_links_fixed_commit(self):
         self.cycle()
