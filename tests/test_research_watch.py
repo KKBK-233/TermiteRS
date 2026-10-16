@@ -38,7 +38,7 @@ class FakeModel:
         if phase == "classify":
             item = finding()
             if self.forged:
-                item["introduced"] = {"value": "2026-01-01", "quote": "invented introduction date"}
+                item["version"] = {"value": "2.0.0", "quote": "invented version"}
             return {"accepted": self.accepted, "reason": "存在原创技术分析", "code_paths": ["src/relay.mjs"], "findings": [item]}
         if phase == "evaluate":
             return {"assessments": [{"id": "date-mark", "status": "unfiltered", "reason": "实现直接返回输入。",
@@ -101,9 +101,10 @@ class ResearchTests(unittest.TestCase):
         result = self.cycle()
         self.assertFalse(result["errors"])
         self.assertEqual(self.model.calls, ["classify", "evaluate", "verify"])
-        self.assertIn("| 报告版本 | 机制 | 过滤 | 触发条件（摘要） | 发现／引入 |", self.repo.original)
+        self.assertIn("| 报告版本 | 机制 | 过滤 | 触发条件（摘要） | 发现时间 |", self.repo.original)
         self.assertIn("未过滤", self.repo.original)
-        self.assertIn("引入：报告未说明", self.repo.original)
+        self.assertIn("发现时间：未说明", self.repo.original)
+        self.assertNotIn("引入：", self.repo.original)
         self.assertTrue(self.repo.original.startswith("# 项目\n\n原有首页内容。"))
         self.cycle()
         self.assertEqual(len(self.model.calls), 3)
@@ -165,7 +166,51 @@ class ResearchTests(unittest.TestCase):
             return result
         self.model = model
         self.assertFalse(self.cycle()['errors'])
-        self.assertIn('发现：报告未说明；引入：报告未说明', self.repo.original)
+        self.assertIn('发现时间：未说明（以来源首发时间为准）', self.repo.original)
+
+    def test_publication_updates_without_reanalyzing_mechanisms(self):
+        self.cycle()
+        article = self.web.article
+        self.web.article = lambda url: {**article(url), 'published': {'value': '2026-07-01', 'quote': '2026-07-01', 'kind': '首发元数据'}}
+        self.cycle()
+        self.assertEqual(len(self.model.calls), 3)
+        self.assertIn('| 2026-07-01 |', self.repo.original)
+        self.assertNotIn('2026-06-30', self.repo.original)
+        self.assertNotIn('引入：', self.repo.original)
+
+    def test_readme_instructions_can_change_without_reanalysis_or_overwrite(self):
+        self.cycle()
+        self.repo.original = '# New deployment guide\n\n' + self.repo.original + '\nManual installation notes\n'
+        before = self.repo.original
+        self.cycle()
+        self.assertEqual(self.repo.original, before)
+        self.assertEqual(len(self.model.calls), 3)
+
+    def test_publication_uses_explicit_first_publication_not_update_or_research(self):
+        parser = research.Publication()
+        parser.feed('<meta property="article:published_time" content="2026-06-30T23:00:00-07:00"><meta property="article:modified_time" content="2026-10-16"><h1>Research</h1><p>Research was done in February 2026.</p>')
+        self.assertEqual(parser.result()['value'], '2026-06-30')
+        self.assertEqual(parser.result()['kind'], '首发元数据')
+
+    def test_publication_jsonld_ignores_comment_dates(self):
+        parser = research.Publication()
+        parser.feed('<script type="application/ld+json">' + json.dumps({'@type': 'DiscussionForumPosting', 'datePublished': '2026-06-10T17:25:06Z', 'dateModified': '2026-10-16', 'comment': [{'@type': 'Comment', 'datePublished': '2026-07-02'}]}) + '</script><h1>Issue</h1>')
+        self.assertEqual(parser.result()['value'], '2026-06-10')
+
+    def test_title_date_is_allowed_but_dates_in_body_are_not_publication(self):
+        parser = research.Publication()
+        parser.feed('<div>June 30, 2026</div><h1>Report</h1><p>Research done February 2026; date example 2026-06-29.</p>')
+        self.assertEqual(parser.result()['value'], '2026-06-30')
+        parser = research.Publication()
+        parser.feed('<h1>Report</h1><p>June 30, 2026</p>')
+        self.assertIsNone(parser.result())
+
+    def test_conflicting_or_invalid_publication_dates_remain_unknown(self):
+        parser = research.Publication()
+        parser.feed('<meta property="article:published_time" content="2026-06-30"><meta name="datePublished" content="2026-07-01"><h1>Report</h1>')
+        self.assertIsNone(parser.result())
+        for value in ('2026-02-30', 'June 31, 2026', 'not a date'):
+            self.assertIsNone(research.publication_day(value))
 
     def test_required_implementation_is_read_before_large_tests(self):
         repo = research.Repository.__new__(research.Repository)
@@ -210,7 +255,7 @@ class ResearchTests(unittest.TestCase):
         self.cycle()
         self.assertEqual(self.state["articles"][URL + "-new"]["status"], "accepted")
 
-    def test_fabricated_date_does_not_publish_and_is_retried(self):
+    def test_fabricated_quote_does_not_publish_and_is_retried(self):
         self.model.forged = True
         self.assertTrue(self.cycle()["errors"])
         self.assertFalse(self.repo.published)
@@ -492,6 +537,22 @@ class GitPublishTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.repo.publish(self.repo.read("README.md"), "# New\n", self.publish_config)
         self.assertEqual(self.git("-C", str(self.remote), "rev-parse", "refs/heads/main"), newer)
+
+    def test_concurrent_readme_deployment_edit_survives_refresh_and_retry(self):
+        original = self.repo.read('README.md')
+        manual = '# Deploy guide\n\nNew installation instructions.\n'
+        (self.work / 'README.md').write_text(manual, encoding='utf-8')
+        self.git('-C', str(self.work), 'add', 'README.md')
+        self.git('-C', str(self.work), 'commit', '-m', '1.0.1 deployment guide')
+        self.git('-C', str(self.work), 'push', 'origin', 'main')
+        with self.assertRaises(RuntimeError):
+            self.repo.publish(original, research.update_homepage(original, research.START + '\nOld research\n' + research.END), self.publish_config)
+        self.repo.refresh()
+        updated = research.update_homepage(self.repo.read('README.md'), research.START + '\nNew research\n' + research.END)
+        commit = self.repo.publish(manual, updated, self.publish_config)
+        published = self.git('-C', str(self.remote), 'show', commit + ':README.md')
+        self.assertTrue(published.startswith(manual))
+        self.assertEqual((self.work / 'README.md').read_text(encoding='utf-8'), manual)
 
 
 if __name__ == "__main__":

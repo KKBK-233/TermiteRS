@@ -2,6 +2,7 @@
 
 import argparse
 import contextlib
+from datetime import date, datetime
 import hashlib
 import html
 from html.parser import HTMLParser
@@ -26,6 +27,7 @@ import xml.etree.ElementTree as ET
 START = "<!-- termiters:research:start -->"
 END = "<!-- termiters:research:end -->"
 RESEARCH_PROTOCOL = 3
+MODEL_PROTOCOL = 4
 STATUSES = {"filtered": "已过滤", "unfiltered": "未过滤", "partial": "部分过滤", "unknown": "待核实"}
 SUFFIXES = {".rs", ".go", ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".java", ".kt"}
 
@@ -101,6 +103,87 @@ class PageText(HTMLParser):
     def handle_data(self, data):
         if not self.hidden:
             self.parts.append(data)
+
+
+def publication_day(value):
+    """只规范化来源明确给出的日期，不把研究日期、更新日期或抓取时间补成首发。"""
+    try:
+        return datetime.fromisoformat(value.strip().replace("Z", "+00:00")).date().isoformat()
+    except (ValueError, TypeError):
+        months = "January February March April May June July August September October November December".split()
+        match = re.fullmatch(r"([A-Za-z]+)\s+(\d{1,2}),\s+(\d{4})", value.strip())
+        if match and match[1].title() in months:
+            try:
+                return date(int(match[3]), months.index(match[1].title()) + 1, int(match[2])).isoformat()
+            except ValueError:
+                pass
+    return None
+
+
+class Publication(PageText):
+    """读取首发元数据及标题前的独立日期；忽略正文研究日期、修订时间和评论日期。"""
+
+    def __init__(self):
+        super().__init__()
+        self.candidates, self.prefix, self.structured = [], None, None
+
+    def add(self, value, quote, kind):
+        day = publication_day(value) if isinstance(value, str) else None
+        if day:
+            self.candidates.append({"value": day, "quote": quote[:1000], "kind": kind})
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        if not self.hidden:
+            if tag == "h1" and self.prefix is None:
+                self.prefix = "".join(self.parts)
+            if tag == "meta" and (attributes.get("property") or attributes.get("name", "")).lower() in {
+                "article:published_time", "datepublished", "pubdate", "dc.date.issued", "dcterms.issued"
+            }:
+                self.add(attributes.get("content"), self.get_starttag_text(), "首发元数据")
+            if tag == "time" and (attributes.get("itemprop") == "datePublished" or "published" in attributes.get("class", "").split()):
+                self.add(attributes.get("datetime"), self.get_starttag_text(), "首发时间标签")
+            if tag == "script" and attributes.get("type", "").lower() == "application/ld+json":
+                self.structured = []
+        super().handle_starttag(tag, attrs)
+
+    def handle_data(self, data):
+        if self.structured is not None:
+            self.structured.append(data)
+        super().handle_data(data)
+
+    def handle_endtag(self, tag):
+        if tag == "script" and self.structured is not None:
+            raw = "".join(self.structured)
+            self.structured = None
+            try:
+                data = json.loads(raw)
+                nodes = data if isinstance(data, list) else [data]
+                for node in list(nodes):
+                    if isinstance(node, dict) and isinstance(node.get("@graph"), list):
+                        nodes += node["@graph"]
+                for node in nodes:
+                    if not isinstance(node, dict):
+                        continue
+                    types = node.get("@type", [])
+                    types = [types] if isinstance(types, str) else types
+                    if isinstance(types, list) and any(kind in types for kind in ("Article", "BlogPosting", "NewsArticle", "TechArticle", "DiscussionForumPosting")):
+                        value = node.get("datePublished")
+                        if isinstance(value, str) and value in raw:
+                            self.add(value, value, "结构化首发时间")
+            except (ValueError, RecursionError):
+                pass
+        super().handle_endtag(tag)
+
+    def result(self):
+        if not self.candidates and self.prefix is not None:
+            # 有些博客未提供元数据，但在文章标题前单列首发日期。只读标题前，不扫正文样例。
+            for line in self.prefix.splitlines():
+                value = line.strip()
+                if re.fullmatch(r"[A-Za-z]+\s+\d{1,2},\s+\d{4}|\d{4}-\d{2}-\d{2}", value):
+                    self.add(value, value, "文章标题日期")
+        days = {item["value"] for item in self.candidates}
+        return self.candidates[0] if len(days) == 1 else None
 
 
 class GoogleLinks(HTMLParser):
@@ -203,7 +286,11 @@ class Web:
 
     def article(self, url):
         final_url, body, content_type = self.get(url)
+        published = None
         if "html" in content_type:
+            publication = Publication()
+            publication.feed(body)
+            published = publication.result()
             parser = PageText()
             parser.feed(body)
             body = "".join(parser.parts)
@@ -215,7 +302,7 @@ class Web:
             raise ValueError("报告正文超过 48KB，需分段处理；本轮不做截断判断")
         if len(body) < 80:
             raise ValueError("报告正文为空或不足")
-        return {"url": final_url, "body": body, "hash": digest(body)}
+        return {"url": final_url, "body": body, "hash": digest(body), "published": published}
 
     def google(self, query, config):
         endpoint = "https://www.google.com/search?" + urlencode({"q": query, "num": config.get("max_results", 10), "hl": "en", "udm": 14})
@@ -424,7 +511,7 @@ class Model:
     def __call__(self, phase, evidence):
         cached = None
         if self.cache_dir:
-            fingerprint = digest(json.dumps({"protocol": RESEARCH_PROTOCOL, "phase": phase, "evidence": evidence,
+            fingerprint = digest(json.dumps({"protocol": MODEL_PROTOCOL, "phase": phase, "evidence": evidence,
                                              "llm_config": Path(self.config).read_text(encoding="utf-8")}, sort_keys=True, ensure_ascii=False))
             cached = self.cache_dir / (fingerprint + '.json')
             if cached.exists():
@@ -487,7 +574,7 @@ def classify_result(result, article):
             raise ValueError("机制ID非法或重复")
         ids.add(identifier)
         entry = {"id": identifier, **{key: claim(item.get(key), article["body"], key in {"mechanism", "trigger"})
-                                      for key in ("mechanism", "trigger", "version", "discovered", "introduced")}}
+                                      for key in ("mechanism", "trigger", "version")}}
         # 简表摘要同样进入独立复核；旧状态没有摘要时仍可完整展示证据。
         for key, limit in (("label", 36), ("trigger_summary", 90)):
             if key in item:
@@ -573,8 +660,8 @@ def compact(value, maximum):
 
 def render(ledger, current_hash, remote=""):
     lines = [START, "## 隐写与指纹跟踪", "",
-             "按报告分析版本新→旧排列。过滤仅对折叠证据列明的路径成立，不是端到端保证；未经真实流量验证，旧版标记不推定新版仍有。时间依原报告。", "",
-             "| 报告版本 | 机制 | 过滤 | 触发条件（摘要） | 发现／引入 |", "| --- | --- | --- | --- | --- |"]
+             "按报告分析版本新→旧排列。过滤仅对折叠证据列明的路径成立，不是端到端保证；未经真实流量验证，旧版标记不推定新版仍有。发现时间以原报告首发时间为准，不推断引入时间。", "",
+             "| 报告版本 | 机制 | 过滤 | 触发条件（摘要） | 发现时间 |", "| --- | --- | --- | --- | --- |"]
     rows = [(identifier, url, item) for identifier, records in ledger.items() for url, item in records.items()]
     rows.sort(key=lambda row: (tuple(-part for part in version_rank((row[2]["finding"].get("version") or {}).get("value"))), row[0], row[1]))
     details = []
@@ -585,8 +672,8 @@ def render(ledger, current_hash, remote=""):
         status = "待核实（代码已变化）" if stale else STATUSES[assessment["status"]]
         if item.get("revised"):
             status = "待核实（来源已修订）"
-        dates = "；".join(label + "：" + (finding[key]["value"] if finding.get(key) else "报告未说明")
-                          for label, key in (("发现", "discovered"), ("引入", "introduced")))
+        published = item.get("published")
+        discovered = published["value"] if published else "未说明"
         version = finding.get("version")
         label = finding.get("label", finding["mechanism"]["value"])
         category = finding.get("category")
@@ -596,9 +683,8 @@ def render(ledger, current_hash, remote=""):
         # 简表只展示版本号；架构、包名等附注留在证据区，不推造版本区间。
         numbers = list(dict.fromkeys(re.findall(r"(?<!\d)\d+\.\d+\.\d+(?!\d)", full_version)))
         version_text = " / ".join(numbers) if numbers else compact(full_version, 24)
-        short_dates = "／".join(escape(finding[key]["value"]) if finding.get(key) else "未说明" for key in ("discovered", "introduced"))
         anchor = f"termiters-evidence-{number}"
-        lines.append(f"| {escape(version_text)} | {name} [↗]({report_link(url)}) | {status} | {trigger} [详情](#{anchor}) | {short_dates} |")
+        lines.append(f"| {escape(version_text)} | {name} [↗]({report_link(url)}) | {status} | {trigger} [详情](#{anchor}) | {escape(discovered)} |")
         evidence = []
         for entry in assessment["code_evidence"]:
             location = escape(entry["path"]) + ":" + str(entry["line"])
@@ -609,7 +695,7 @@ def render(ledger, current_hash, remote=""):
                     f"机制：{escape(finding['mechanism']['value'])}", "",
                     f"完整触发条件：{escape(finding['trigger']['value'])}", "",
                     f"{status}：{escape(assessment['reason'])}", "",
-                    f"代码：{'、'.join(evidence) or '证据不足'}；审阅提交 {escape(item['commit'][:12])}。{escape(dates)}。", ""]
+                    f"代码：{'、'.join(evidence) or '证据不足'}；审阅提交 {escape(item['commit'][:12])}。发现时间：{escape(discovered)}（以来源首发时间为准）。", ""]
     lines += ["", "<details>", "<summary>展开完整条件与代码证据</summary>", "", *details, "</details>", "",
               "此追踪由 [TermiteRS](https://github.com/KKBK-233/TermiteRS) 进行在线追踪更新。", "", END]
     return "\n".join(lines)
@@ -636,14 +722,14 @@ def validated_model(model, phase, evidence, validator):
     except ValueError as error:
         corrected = model(phase, {**evidence, "correction": {
             "validation_error": str(error), "previous_response": result,
-            "instruction": "原文引用必须是原文中逐字连续片段，不要去掉引用中的符号或把多处内容拼接。未说明的日期/版本输出 null。网页发布日期本身不证明发现日期；不得以发布日期推断发现或引入。请修正有错误的字段，仍按本阶段原定 JSON 协议返回完整结果，不要为了通过校验改变事实。"}})
+            "instruction": "原文引用必须是原文中逐字连续片段，不要去掉引用中的符号或把多处内容拼接。未说明的版本输出 null。发现时间由执行器读取来源首发时间，不需要提取发现或引入日期。请修正有错误的字段，仍按本阶段原定 JSON 协议返回完整结果，不要为了通过校验改变事实。"}})
         return validator(corrected)
 
 
 def investigate(article, repository, model, ledger, topic):
     known = [{"id": key, "mechanisms": [r["finding"]["mechanism"]["value"] for r in rows.values()]} for key, rows in ledger.items()]
     classification_evidence = {"topic": topic, "article": article, "files": repository.sources, "known_mechanisms": known,
-                              "date_policy": "网页发布日期不等于发现时间；正文明确说明发现日期时才能填写，否则 discovered=null；introduced 同理，只能依据原文明确说明。"}
+                              "date_policy": "发现时间按来源首发时间记录，由执行器单独读取，不提取研究日期和引入时间。"}
     def validate_classification(result):
         return result, classify_result(result, article)
     # 语义复核失败后最多回到提取阶段一次，重读原文、重评代码并再次独立复核。
@@ -665,7 +751,7 @@ def investigate(article, repository, model, ledger, topic):
                 "instruction": "重新核对原报告，修正错误的机制、版本或触发条件，再给出完整提取结果。未知开关不得自行补成确定前置条件。不得只要求复核改口，也不能为了通过而补造证据。"}}
             continue
         records = [{"finding": finding, "assessment": assessments[finding["id"]], "code_hash": repository.code_hash,
-                    "commit": repository.commit, "checked_at": now()} for finding in findings]
+                    "commit": repository.commit, "checked_at": now(), "published": article.get("published")} for finding in findings]
         return {"status": "accepted", "reason": classification["reason"], "findings": records}
 
 
@@ -698,6 +784,10 @@ def cycle(config, state, repository, web, model, state_dir, preview=False):
             fingerprint = digest(report_fingerprint + repository.code_hash)
             same_rejected = previous.get("status") == "rejected" and previous.get("report_fingerprint") == report_fingerprint
             if same_rejected or (previous.get("fingerprint") == fingerprint and previous.get("status") == "accepted"):
+                # 日期口径独立迁移，不重跑已经核验的机制与代码结论，不沿用旧的研究日期。
+                for records in state["ledger"].values():
+                    if url in records:
+                        records[url]["published"] = article.get("published")
                 run["skipped"] += 1
                 continue
             run["processed"] += 1
