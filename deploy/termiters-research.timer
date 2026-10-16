@@ -1,0 +1,11 @@
+[Unit]
+Description=Run TermiteRS research once per day
+
+[Timer]
+OnCalendar=*-*-* 03:00:00 UTC
+RandomizedDelaySec=15m
+Persistent=true
+Unit=termiters-research.service
+
+[Install]
+WantedBy=timers.target

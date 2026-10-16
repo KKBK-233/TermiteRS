@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
 use TermiteRS::assistant::Assistant;
-use TermiteRS::cli::{Cli, Commands, ProtectionCommands, WatchCommands};
+use TermiteRS::cli::{Cli, Commands, ProtectionCommands, ResearchCommands, WatchCommands};
 use TermiteRS::config::Config;
 use TermiteRS::daemon::Daemon;
 use TermiteRS::doctor::Doctor;
@@ -24,6 +24,7 @@ fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
 
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse()?))
         .init();
 
@@ -35,6 +36,18 @@ fn main() -> Result<()> {
         Commands::Assistant { config } => {
             Assistant::new(config).run()?;
         }
+        Commands::Research { action } => match action {
+            ResearchCommands::RunOnce {
+                config,
+                preview,
+                python,
+            } => {
+                TermiteRS::research::run_once(&config, preview, python.as_deref())?;
+            }
+            ResearchCommands::Analyze { config, input } => {
+                TermiteRS::research::analyze(&config, &input)?;
+            }
+        },
         Commands::Daemon { config, once } => {
             let config = Config::read_from(config)?;
             Daemon::new(config, once, once).run()?;

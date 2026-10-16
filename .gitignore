@@ -6,3 +6,8 @@ termite.yml
 !examples/termite.yml
 .termite/
 .ssh-not-configured
+__pycache__/
+research.json
+research-llm.yml
+!examples/research.json
+!examples/research-llm.yml

@@ -115,6 +115,34 @@ pub enum Commands {
         #[command(subcommand)]
         action: WatchCommands,
     },
+
+    /// 检索公开研究报告、核验代码并更新指定的首页文档。
+    Research {
+        #[command(subcommand)]
+        action: ResearchCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ResearchCommands {
+    /// 执行一轮研究后退出；每日调度交给系统定时任务。
+    RunOnce {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// 仅保存预览，不提交或推送首页。
+        #[arg(long)]
+        preview: bool,
+        #[arg(long)]
+        python: Option<String>,
+    },
+    /// 供研究执行器复用已配置的模型接口，返回结构化判断。
+    #[command(hide = true)]
+    Analyze {
+        #[arg(short, long)]
+        config: PathBuf,
+        #[arg(long)]
+        input: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
