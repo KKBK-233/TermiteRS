@@ -250,6 +250,28 @@ class UpstreamTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "不触发结论必须引用"):
             research.assess_result(result, [finding()], {"src/relay.mjs": CODE}, [], sources)
 
+    def test_report_evidence_accepts_only_exact_provided_url(self):
+        sources = {self.path: {"body": BODY, "url": URL}}
+        result = {"assessments": [{"id": "date-mark", "status": "not_triggered", "reason": "默认关闭",
+            "code_evidence": [{"path": "src/relay.mjs", "quote": "return input;"}],
+            "report_evidence": [{"path": URL, "quote": BODY[:30]}]}]}
+        checked = research.assess_result(result, [finding()], {"src/relay.mjs": CODE}, [], sources)
+        self.assertEqual(checked["date-mark"]["report_evidence"][0]["path"], self.path)
+        result["assessments"][0]["report_evidence"][0]["path"] = URL + "?other-version=1"
+        with self.assertRaisesRegex(ValueError, "报告控制引用路径无效"):
+            research.assess_result(result, [finding()], {"src/relay.mjs": CODE}, [], sources)
+
+    def test_report_quote_error_identifies_mechanism_and_report(self):
+        sources = {self.path: {"body": BODY, "url": URL}}
+        result = {"assessments": [{"id": "date-mark", "status": "not_triggered", "reason": "默认关闭",
+            "code_evidence": [{"path": "src/relay.mjs", "quote": "return input;"}],
+            "report_evidence": [{"path": URL, "quote": "fabricated quote"}]}]}
+        with self.assertRaises(ValueError) as caught:
+            research.assess_result(result, [finding()], {"src/relay.mjs": CODE}, [], sources)
+        self.assertIn("date-mark", str(caught.exception))
+        self.assertIn(self.path, str(caught.exception))
+        self.assertIn("fabricated quote", str(caught.exception))
+
     def test_default_summary_keeps_history_folded_and_stale_claims_out_of_table(self):
         article = {"url": URL, "body": BODY, "tracked_upstream": {"path": self.path, "version": "2.1.300", "repository": self.config["repository"]}}
         record = research.investigate(article, FakeRepository(), FakeModel(), {}, "研究", "unbundle_defaults")["findings"][0]

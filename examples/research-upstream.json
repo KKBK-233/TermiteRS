@@ -57,9 +57,10 @@
     "max_report_bytes": 192000,
     "context_reports": [
       "telemetry.md",
-      "environment-variables.md"
+      "environment-variables.md",
+      "feature-flags.md"
     ],
-    "max_context_bytes": 128000
+    "max_context_bytes": 256000
   },
   "evaluation_profile": "unbundle_defaults"
 }

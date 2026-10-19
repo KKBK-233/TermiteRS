@@ -754,8 +754,15 @@ def assess_result(result, findings, files, unavailable, report_sources=None):
         for entry in references:
             path = entry.get("path")
             snippet = text(entry.get("quote"), "报告控制证据", 2000)
-            if report_sources is None or path not in report_sources or snippet not in report_sources[path]["body"]:
-                raise ValueError("报告控制引用未在主报告或关联报告中找到")
+            # 模型偶尔填写报告链接；仅接受本轮证据中唯一匹配的精确链接。
+            if report_sources is not None and path not in report_sources:
+                matches = [key for key, source in report_sources.items() if source["url"] == path]
+                if len(matches) == 1:
+                    path = matches[0]
+            if report_sources is None or path not in report_sources:
+                raise ValueError(f"报告控制引用路径无效：{item['id']}；允许路径：{list(report_sources or {})}")
+            if snippet not in report_sources[path]["body"]:
+                raise ValueError(f"报告控制引用不匹配：{item['id']}，{path}，引用={snippet!r}；须逐字连续引用，不能添加反引号或改写空白")
             report_evidence.append({"path": path, "quote": snippet, "url": report_sources[path]["url"]})
         if status == "not_triggered" and report_sources is not None and not report_evidence:
             raise ValueError("不触发结论必须引用报告的触发条件或禁用控制依据")
