@@ -917,6 +917,7 @@ def validated_model(model, phase, evidence, validator):
             if attempt == limit:
                 raise
             result = model(phase, {**evidence, "correction": {
+                **({"feedback_protocol": 2} if phase == "evaluate" else {}),
                 "validation_error": str(error), "previous_response": result,
                 "instruction": "原文引用必须是原文中逐字连续片段，不要去掉引用中的符号或把多处内容拼接。未说明的版本输出 null。发现时间由执行器读取来源首发时间，不需要提取发现或引入日期。请修正有错误的字段，仍按本阶段原定 JSON 协议返回完整结果，不要为了通过校验改变事实。"}})
 
