@@ -609,6 +609,24 @@ class ResearchTests(unittest.TestCase):
             research.validated_model(model, 'classify', {}, validate)
         self.assertEqual(len(calls), 2)
 
+    def test_evaluation_correction_reuses_latest_response_and_is_bounded(self):
+        calls = []
+        def model(phase, evidence):
+            calls.append(evidence)
+            return {"round": len(calls)}
+        def validate(result):
+            if result["round"] < 3:
+                raise ValueError("remaining quote error")
+            return result
+        self.assertEqual(research.validated_model(model, "evaluate", {}, validate), {"round": 3})
+        self.assertEqual(calls[2]["correction"]["previous_response"], {"round": 2})
+        calls.clear()
+        def reject(result):
+            raise ValueError("still invalid")
+        with self.assertRaisesRegex(ValueError, "still invalid"):
+            research.validated_model(model, "evaluate", {}, reject)
+        self.assertEqual(len(calls), 3)
+
     def test_failed_fetch_does_not_count_as_completed(self):
         self.web.fail = True
         self.assertTrue(self.cycle()["errors"])
