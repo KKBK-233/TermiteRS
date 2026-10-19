@@ -1,6 +1,6 @@
 # 每日逆向报告研究
 
-一次启动完成“关键词检索 → DeepSeek 核验报告 → 对照代码 → 独立复核 → 更新首页”，随后退出。系统定时任务负责次日重新启动。旧命令保持兼容，研究功能单独配置。
+一次启动完成“指定上游报告或关键词检索 → DeepSeek 核验报告 → 对照代码 → 独立复核 → 更新首页”，随后退出。系统定时任务负责次日重新启动。旧命令保持兼容，研究功能单独配置。
 
 ## 单次运行
 
@@ -14,6 +14,16 @@ TermiteRS research run-once --config /etc/termiters/research.json
 需要 Git、Python 3.10+ 和目标仓库的推送凭据。Windows 可以用 `--python C:/path/to/python.exe` 指定解释器。模型使用现有 TermiteRS HTTP 传输、重试与超时逻辑；模型输出不能执行 shell 命令。
 
 `state_dir` 和 `llm_config` 相对研究 JSON 所在目录解析。服务器建议将 `state_dir` 设置为 `/var/lib/termiters/research`。各轮状态在 `state.sqlite3`，最近执行结果在 `last-run.json`，待发布首页在 `README.preview.md`。预览不会推送，也不会更新用户工作区。
+
+## 固定研究上游（当前推荐）
+
+复制 `examples/research-upstream.json`。该模式明确追踪 `wtfwhs/tengu-decoded`，关闭关键词搜索并清空旧种子列表，每天通过 GitHub API 读取分支提交和版本目录。按数值选择最新报告版本（默认1个目录，可配1至3个），只下载其中 Markdown，不下载或执行 bundle。默认优先指纹、遥测、API 和系统提示词，其余 Markdown 按名称进入队列；也可用 `report_files` 限定文件名。每日默认最多4篇，未处理项落盘，已完成且正文、目标源码未变时不调用模型。
+
+每轮先锁定上游提交，再读取该提交的报告，并核对 Git blob SHA；不能在一轮中混用变化中的分支内容。上游仓库、固定提交、报告路径及报告版本明确传入 DeepSeek 的提取、代码评估和独立复核阶段，同时说明它是用户指定的研究来源，不是 Claude 官方仓库，不能仅凭来源身份认定报告结论正确，也不能把最新报告目录当作官方最新发布版本。README 标明追踪来源与本轮读取提交，具体结论链接到被核验的固定提交。
+
+`tracked_upstream.max_report_bytes` 默认96000，上限128000；超过上限明确失败，不截断原文后给确定判断。其他来源默认仍使用48000字节限制。来源未明确公开首发日期则记录未说明，不用 Git 最近提交时间充当报告首次发布时间。
+
+既有历史来源和证据保留，但固定上游模式只自动调度本轮选中的上游报告。发现或抓取失败、模型复核失败、README 推送失败会记录错误；不能把成功读取 GitHub 当作整轮研究成功。切换模式后沿用原状态与模型缓存，不清空已有核验记录。
 
 ## 检索与证据
 
@@ -70,34 +80,3 @@ cargo test --test research_cli
 ```
 
 测试使用本机模拟模型与临时 Git remote，覆盖证据伪造、重复轮次、报告修订、代码更新、发布并发及未提交工作保护，不调用真实模型。
-
-## Google 人工验证与手机接手
-
-`TermiteRS research verify-google --config /etc/termiters/research.json --python /path/to/python` 只打开断点中的一个关键词，不调用模型、抓取报告或发布首页。需要安装 Playwright 完整 Chromium、TigerVNC 和 noVNC/websockify；原来的 headless shell 不支持显示验证窗口。
-
-在 `search` 中设置 `browser_enabled: true`、`browser_persistent: true`、`browser_headless: false`、`verification_wait_seconds: 1200`。浏览器配置固定保存在 `state_dir/google-profile`，自动与人工入口通过独立 SQLite 事务锁互斥。每个关键词复用同一浏览器；完整搜索结束后下一轮重新检索。验证码中断前的成功结果和未完成关键词保存在 `google-search-progress.json`，恢复不重复已完成查询。修改搜索配置会使旧断点失效。
-
-部署 `deploy/termiters-research-display.service`、`-novnc.service`、`-verify.service`，把 `termiters-research-browser.conf` 安装为研究服务的 drop-in。根据实际环境替换用户、二进制、配置、状态目录、Python 和 Playwright 浏览器路径。显示服务的 `PrivateTmp` 命名空间由研究和人工服务共享；显示和网页服务随依赖任务结束停止。不需要新增定时任务。
-
-手机访问需要已有 HTTPS 域名。设置 `search.verification_public_url: https://your-domain.example/termite-google/` 和 `search.notification_config: /etc/termiters/termite.yml`，研究服务环境文件提供原邮件通道所需的环境变量。验证码出现后生成随机访问令牌，通过现有 TermiteRS 通知通道发送限时链接。默认20分钟内有效，完成验证、等待超时或浏览器正常关闭时撤销。邮件被提交到 SMTP 不代表收件箱已收到；应由收件人确认。手机打开链接即可查看和操作服务器浏览器，支持缩放。无需导出 Cookie 或登录 Google 账号。浏览器子进程只继承白名单环境，不继承邮件和模型密钥。
-
-HTTPS 入口的 Nginx location 示例（加入已有 HTTPS 站点；若 TLS 由已有 CDN 终止，加入对应回源站点）：
-
-```nginx
-location ^~ /termite-google/ {
-    access_log off;
-    add_header Referrer-Policy no-referrer always;
-    add_header Cache-Control no-store always;
-    proxy_pass http://127.0.0.1:6080/;
-    proxy_http_version 1.1;
-    proxy_set_header Upgrade $http_upgrade;
-    proxy_set_header Connection "upgrade";
-    proxy_set_header Host $host;
-    proxy_buffering off;
-    proxy_read_timeout 1300s;
-}
-```
-
-VNC 与 websockify 仅监听回环地址；WebSocket 通过 `TokenFile` 校验令牌，静态 noVNC 文件不含访问凭据。接手链接不得转发，反向代理关闭该入口的访问日志，避免记录令牌。若进程被强制终止来不及清理令牌，依赖服务结束会关闭会话；每次服务启动应清空遗留令牌。
-
-也可用 SSH 转发 `127.0.0.1:16080:127.0.0.1:6080`，把邮件链接的主机改成本地入口并移除反代路径前缀。页面验证完成后，程序只接受原关键词的 Google 搜索结果；验证码页、首页或其他查询不会冒充成功。人工操作期间程序不点击、不刷新、不跳转；超时保留断点并退出，不自动解决验证码。

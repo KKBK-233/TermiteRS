@@ -125,21 +125,6 @@ pub enum Commands {
 
 #[derive(Debug, Subcommand)]
 pub enum ResearchCommands {
-    /// 供人工验证入口复用现有邮件配置，不输出接手链接或通知凭据。
-    #[command(hide = true)]
-    NotifyGoogle {
-        #[arg(short, long)]
-        config: PathBuf,
-        #[arg(long)]
-        input: PathBuf,
-    },
-    /// 打开持久浏览器供人工验证，仅检查一个 Google 查询，不调用模型。
-    VerifyGoogle {
-        #[arg(short, long)]
-        config: PathBuf,
-        #[arg(long)]
-        python: Option<String>,
-    },
     /// 执行一轮研究后退出；每日调度交给系统定时任务。
     RunOnce {
         #[arg(short, long)]

@@ -12,7 +12,6 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
-import secrets
 import signal
 import socket
 import sqlite3
@@ -233,223 +232,13 @@ def google_results(body):
     return parser.results
 
 
-class GoogleVerificationRequired(ValueError):
-    """人工验证未完成时停止本轮后续查询，保留断点。"""
-
-
-class GoogleBrowser:
-    """复用专用浏览器配置；验证码只交给人工操作，不自动点击。"""
-
-    def __init__(self, directory, budget, notifier_executable=None):
-        self.directory, self.budget = Path(directory), budget
-        self.context = self.playwright = self.lock = None
-        self.notifier_executable = notifier_executable
-        self.access_active = False
-
-    def status(self, status, query, **extra):
-        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        record = {"status": status, "query": query, "updated_at": now(), **extra}
-        target = self.directory / "google-verification.json"
-        temporary = target.with_suffix(".tmp")
-        temporary.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(target)
-
-    def revoke_access(self):
-        """撤销手机接手令牌；只允许创建令牌的浏览器实例撤销。"""
-        if self.access_active:
-            (self.directory / "google-vnc-tokens").write_text("", encoding="utf-8")
-            access = self.directory / "google-verification-access.json"
-            access.unlink(missing_ok=True)
-            self.access_active = False
-
-    def notify(self, query, config):
-        """生成限时手机入口，复用现有邮件通道；不在日志中输出访问令牌。"""
-        base = config.get("verification_public_url")
-        if not base:
-            return
-        seconds = config.get("verification_wait_seconds", 1200)
-        token = secrets.token_urlsafe(32)
-        # websockify 只接受随机令牌映射的回环 VNC 目标，令牌在浏览器关闭时撤销。
-        (self.directory / "google-vnc-tokens").write_text(token + ": 127.0.0.1:5977\n", encoding="utf-8")
-        self.access_active = True
-        path = urlsplit(base).path.strip("/") + "/websockify?token=" + token
-        url = base.rstrip("/") + "/vnc.html?" + urlencode(
-            {"autoconnect": "true", "resize": "scale", "path": path, "show_dot": "true"})
-        expires_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + seconds))
-        request = {"query": query, "url": url, "expires_at": expires_at}
-        target = self.directory / "google-verification-access.json"
-        target.write_text(json.dumps(request, ensure_ascii=False, indent=2), encoding="utf-8")
-        if os.name != "nt":
-            target.chmod(0o600)
-            (self.directory / "google-vnc-tokens").chmod(0o600)
-        if not config.get("notification_config") or not self.notifier_executable:
-            return
-        try:
-            result = subprocess.run(
-                [self.notifier_executable, "research", "notify-google", "--config", config["notification_config"],
-                 "--input", str(target)], capture_output=True, timeout=self.budget.timeout(30))
-            if result.returncode:
-                raise RuntimeError("邮件命令未成功，请检查通知服务配置")
-            print("Google 人工验证邮件已交给现有通知通道发送。", flush=True)
-        except Exception as error:
-            # 邮件失败不销毁已经打开的验证窗口，也不泄露 URL 或 SMTP 凭据。
-            print("Google 人工验证通知失败：" + type(error).__name__, flush=True)
-
-    def start(self, config):
-        if self.context is not None:
-            return self.context
-        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if os.name != "nt":
-            self.directory.chmod(0o700)
-        # 独立事务锁覆盖浏览器整个生命周期，人工与定时入口不能同时占用配置。
-        self.lock = sqlite3.connect(self.directory / "google-browser-lock.sqlite3", timeout=0, isolation_level=None)
-        try:
-            self.lock.execute("BEGIN IMMEDIATE")
-            from playwright.sync_api import sync_playwright
-            self.playwright = sync_playwright().start()
-            allowed = {"PATH", "HOME", "LANG", "TMPDIR", "TEMP", "TMP", "PLAYWRIGHT_BROWSERS_PATH",
-                       "SystemRoot", "WINDIR", "DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR"}
-            browser_env = {key: value for key, value in os.environ.items() if key in allowed}
-            self.context = self.playwright.chromium.launch_persistent_context(
-                str(self.directory / "google-profile"), headless=config.get("browser_headless", True),
-                env=browser_env, viewport={"width": 1280, "height": 850},
-                args=["--window-size=1280,950", "--no-first-run"])
-            return self.context
-        except BaseException:
-            self.close()
-            raise
-
-    @staticmethod
-    def results(page, query):
-        # 仅接受原查询的 Google 搜索页；验证页、首页和手动跳转页面均不算成功。
-        parsed = urlsplit(page.url)
-        if parsed.scheme != "https" or parsed.hostname not in {"www.google.com", "google.com"}:
-            return None
-        if parsed.path != "/search" or parse_qs(parsed.query).get("q") != [query]:
-            return None
-        rows = page.locator("a:has(h3)").evaluate_all(
-            "elements => elements.map(a => [a.href, a.innerText])")
-        links = []
-        for href, title in rows:
-            if href.startswith("https://www.google.com/url?"):
-                values = parse_qs(urlsplit(href).query)
-                href = (values.get("q") or values.get("url") or [""])[0]
-            try:
-                url = normalized_url(href)
-            except ValueError:
-                continue
-            host = urlsplit(url).hostname
-            if host != "google.com" and not host.endswith(".google.com"):
-                links.append((url, title))
-        if links:
-            return links
-        body = page.locator("body").inner_text().lower()
-        if any(marker in body for marker in ("did not match any documents", "no results found")):
-            return []
-        return None
-
-    def search(self, query, config):
-        context = self.start(config)
-        page = context.pages[0] if context.pages else context.new_page()
-        endpoint = "https://www.google.com/search?" + urlencode(
-            {"q": query, "num": config.get("max_results", 10), "hl": "en", "udm": 14})
-        self.status("searching", query)
-        page.goto(endpoint, wait_until="domcontentloaded", timeout=int(self.budget.timeout(45) * 1000))
-        page.wait_for_function(
-            "document.querySelector('a h3') || location.pathname.startsWith('/sorry/') || "
-            "/did not match any documents|no results found/i.test(document.body.innerText)",
-            timeout=int(self.budget.timeout(30) * 1000))
-        if urlsplit(page.url).path.startswith("/sorry/"):
-            seconds = config.get("verification_wait_seconds", 1200)
-            deadline = time.monotonic() + self.budget.timeout(max(seconds, 0.01))
-            self.status("needs_verification", query, wait_seconds=seconds)
-            self.notify(query, config)
-            print("Google 需要人工验证，请通过 SSH 隧道接手服务器浏览器；程序暂停页面操作。", flush=True)
-            if config.get("browser_headless", True) or seconds == 0:
-                raise GoogleVerificationRequired("Google 需要人工验证；请运行 research verify-google")
-            while time.monotonic() < deadline:
-                if page.is_closed():
-                    self.status("interrupted", query)
-                    raise GoogleVerificationRequired("人工验证页面已关闭，下次从断点继续")
-                # 此处只观察页面，不点击、刷新或跳转，避免与人工争抢控制权。
-                results = self.results(page, query)
-                if results is not None:
-                    self.status("verified", query, result_count=len(results))
-                    self.revoke_access()
-                    return results
-                page.wait_for_timeout(min(1000, max(1, (deadline - time.monotonic()) * 1000)))
-            self.status("verification_timeout", query)
-            raise GoogleVerificationRequired("人工验证等待超时，进度已保留")
-        results = self.results(page, query)
-        if results is None:
-            self.status("unrecognized_page", query)
-            raise ValueError("Google 页面未包含原查询的可解析结果，未视为验证成功")
-        self.status("ready", query, result_count=len(results))
-        return results
-
-    def close(self):
-        self.revoke_access()
-        try:
-            if self.context is not None:
-                self.context.close()
-        finally:
-            self.context = None
-            try:
-                if self.playwright is not None:
-                    self.playwright.stop()
-            finally:
-                self.playwright = None
-                if self.lock is not None:
-                    self.lock.close()
-                    self.lock = None
-
-
 class Web:
     """逐跳核对公网地址并固定连接 IP，阻止重定向和 DNS 重绑定读取内网。"""
 
-    def __init__(self, budget, timeout=30, max_bytes=1048576, browser_state_dir=None, notifier_executable=None):
+    def __init__(self, budget, timeout=30, max_bytes=1048576):
         self.budget, self.seconds, self.max_bytes = budget, timeout, max_bytes
-        self.browser = GoogleBrowser(browser_state_dir, budget, notifier_executable) if browser_state_dir else None
-        self.pending_queries = []
-
-    def close(self):
-        if self.browser:
-            self.browser.close()
-
-    def progress(self, config):
-        """搜索结果在验证码中断前落盘，恢复时不重搜已经完成的关键词。"""
-        fingerprint = digest(json.dumps(config, sort_keys=True, ensure_ascii=False))
-        record = {"fingerprint": fingerprint, "completed": {}}
-        if self.browser:
-            path = self.browser.directory / "google-search-progress.json"
-            if path.exists():
-                saved = json.loads(path.read_text(encoding="utf-8"))
-                if saved.get("fingerprint") == fingerprint and saved.get("pending_queries"):
-                    record = saved
-        return record
-
-    def save_progress(self, config, record):
-        self.pending_queries = [q for q in config["queries"] if q not in record["completed"]]
-        record.update(pending_queries=self.pending_queries, updated_at=now())
-        if self.browser:
-            self.browser.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-            target = self.browser.directory / "google-search-progress.json"
-            temporary = target.with_suffix(".tmp")
-            temporary.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-            temporary.replace(target)
-
-    def verify_google(self, config):
-        if not self.browser or not config.get("browser_persistent") or config.get("browser_headless", True):
-            raise ValueError("人工验证需要配置 browser_enabled=true、browser_persistent=true、browser_headless=false")
-        self.browser.start(config)
-        progress = self.progress(config)
-        query = next((q for q in config["queries"] if q not in progress["completed"]), config["queries"][0])
-        self.save_progress(config, progress)
-        results = self.google(query, config)
-        progress["completed"][query] = results
-        self.save_progress(config, progress)
-        return {"query": query, "result_count": len(results), "results": results,
-                "pending_queries": self.pending_queries, "model_calls": 0}
+        self.upstream_sources = {}
+        self.max_report_bytes = 48000
 
     def get(self, url, headers=None):
         url = normalized_url(url)
@@ -497,8 +286,64 @@ class Web:
                 connection.close()
         raise ValueError("网页重定向过多")
 
+    def upstream(self, config):
+        """只读取指定 GitHub 上游的版本目录与 Markdown，不下载或执行 CLI bundle。"""
+        repository = config["repository"].rstrip("/").removesuffix(".git")
+        slug = repository.removeprefix("https://github.com/")
+        api = "https://api.github.com/repos/" + slug
+        def read_json(path):
+            return json.loads(self.get(api + path, {"Accept": "application/vnd.github+json"})[1])
+        reference = read_json("/git/ref/heads/" + quote(config.get("branch", "main"), safe=""))
+        commit = reference.get("object", {}).get("sha", "")
+        if not re.fullmatch(r"[0-9a-f]{40}", commit) or reference.get("object", {}).get("type") != "commit":
+            raise ValueError("上游分支未指向有效 Git 提交")
+        directory = config.get("versions_dir", "versions")
+        entries = read_json("/contents/" + quote(directory, safe="/") + "?ref=" + commit)
+        versions = [entry["name"] for entry in entries
+                    if entry.get("type") == "dir" and re.fullmatch(r"\d+\.\d+\.\d+", entry.get("name", ""))]
+        versions.sort(key=version_rank, reverse=True)
+        versions = versions[:config.get("latest_versions", 1)]
+        if not versions:
+            raise ValueError("指定上游未公开可识别的版本报告目录")
+        sources = {}
+        selected = config.get("report_files", [])
+        for version in versions:
+            prefix = directory + "/" + version
+            files = read_json("/contents/" + quote(prefix, safe="/") + "?ref=" + commit)
+            for item in files:
+                name = item.get("name", "")
+                if item.get("type") != "file" or not name.endswith(".md") or (selected and name not in selected):
+                    continue
+                path = safe_path(item.get("path", ""))
+                if path != prefix + "/" + name or "target" in item:
+                    raise ValueError("上游报告路径与版本目录不一致")
+                blob = item.get("sha", "")
+                if not re.fullmatch(r"[0-9a-f]{40}", blob):
+                    raise ValueError("上游报告未提供有效内容指纹")
+                canonical = "https://raw.githubusercontent.com/" + slug + "/" + quote(config.get("branch", "main"), safe="/") + "/" + quote(path, safe="/")
+                sources[canonical] = {"repository": repository, "commit": commit, "path": path,
+                                      "version": version, "blob_sha": blob,
+                                      "raw_url": "https://raw.githubusercontent.com/" + slug + "/" + commit + "/" + quote(path, safe="/"),
+                                      "url": repository + "/blob/" + commit + "/" + quote(path, safe="/")}
+        if not sources:
+            raise ValueError("上游最新版本目录中没有匹配的 Markdown 报告")
+        self.upstream_sources = sources
+        self.max_report_bytes = config.get("max_report_bytes", 96000)
+        # 优先处理指纹与遥测，其余报告按用户配置顺序；不以 API 返回顺序决定优先级。
+        priority = selected or ["device-fingerprinting.md", "telemetry.md", "api-endpoints.md", "system-prompt.md"]
+        urls = sorted(sources, key=lambda url: (tuple(-p for p in version_rank(sources[url]["version"])),
+                      priority.index(Path(sources[url]["path"]).name) if Path(sources[url]["path"]).name in priority else len(priority), sources[url]["path"]))
+        return urls, {"repository": repository, "branch": config.get("branch", "main"), "commit": commit,
+                      "versions": versions, "report_paths": [sources[url]["path"] for url in urls]}
+
     def article(self, url):
-        final_url, body, content_type = self.get(url)
+        source = self.upstream_sources.get(url)
+        final_url, body, content_type = self.get(source["raw_url"] if source else url)
+        if source:
+            raw = body.encode("utf-8")
+            actual = hashlib.sha1(b"blob " + str(len(raw)).encode("ascii") + b"\0" + raw).hexdigest()
+            if actual != source["blob_sha"]:
+                raise ValueError("上游原文与固定提交的 Git 内容指纹不一致")
         published = None
         if "html" in content_type:
             publication = Publication()
@@ -511,17 +356,16 @@ class Web:
             raise ValueError("不支持的报告内容格式")
         body = re.sub(r"[ \t]+", " ", body)
         body = re.sub(r"\n\s*\n+", "\n\n", body).strip()
-        if len(body.encode("utf-8")) > 48000:
-            raise ValueError("报告正文超过 48KB，需分段处理；本轮不做截断判断")
+        if len(body.encode("utf-8")) > self.max_report_bytes:
+            raise ValueError(f"报告正文超过 {self.max_report_bytes} 字节，需分段处理；本轮不做截断判断")
         if len(body) < 80:
             raise ValueError("报告正文为空或不足")
-        return {"url": final_url, "body": body, "hash": digest(body), "published": published}
+        article = {"url": source["url"] if source else final_url, "body": body, "hash": digest(body), "published": published}
+        if source:
+            article["tracked_upstream"] = source
+        return article
 
     def google(self, query, config):
-        if config.get("browser_persistent", False):
-            if not self.browser:
-                raise ValueError("持久浏览器需要专用状态目录")
-            return self.browser.search(query, config)
         endpoint = "https://www.google.com/search?" + urlencode({"q": query, "num": config.get("max_results", 10), "hl": "en", "udm": 14})
         _, body, _ = self.get(endpoint)
         try:
@@ -558,22 +402,10 @@ class Web:
         if not config.get("enabled", True):
             return [], []
         links, errors = [], []
-        persistent = config.get("provider") == "google" and config.get("browser_persistent", False)
-        if persistent:
-            self.browser.start(config)
-        progress = self.progress(config) if persistent else None
-        if persistent:
-            self.save_progress(config, progress)
         for query in config["queries"]:
             try:
                 if config.get("provider", "bing_rss") == "google":
-                    if persistent and query in progress["completed"]:
-                        results = progress["completed"][query]
-                    else:
-                        results = self.google(query, config)
-                        if persistent:
-                            progress["completed"][query] = results
-                            self.save_progress(config, progress)
+                    results = self.google(query, config)
                 elif config.get("provider", "bing_rss") == "brave":
                     key = os.environ[config.get("api_key_env", "BRAVE_SEARCH_API_KEY")]
                     endpoint = "https://api.search.brave.com/res/v1/web/search?" + urlencode({"q": query, "count": config.get("max_results", 10)})
@@ -598,8 +430,6 @@ class Web:
                         continue
             except Exception as error:
                 errors.append(f"搜索 {query}: {type(error).__name__}: {str(error)[:180]}")
-                if isinstance(error, GoogleVerificationRequired):
-                    break
         return list(dict.fromkeys(links)), errors
 
 
@@ -889,16 +719,19 @@ def compact(value, maximum):
     return escape(value if len(value) <= maximum else value[:maximum - 1] + "…")
 
 
-def render(ledger, current_hash, remote=""):
+def render(ledger, current_hash, remote="", upstream=None):
     lines = [START, "## 隐写与指纹跟踪", "",
              "按报告分析版本新→旧排列。过滤仅对折叠证据列明的路径成立，不是端到端保证；未经真实流量验证，旧版标记不推定新版仍有。发现时间以原报告首发时间为准，不推断引入时间。", "",
              "| 报告版本 | 机制 | 过滤 | 触发条件（摘要） | 发现时间 |", "| --- | --- | --- | --- | --- |"]
+    if upstream:
+        lines[4:4] = [f"固定研究上游：[{escape(upstream['repository'].removeprefix('https://github.com/'))}]({report_link(upstream['repository'])})；本轮读取提交 [`{upstream['commit'][:12]}`]({upstream['repository']}/commit/{upstream['commit']})。报告目录版本：{escape('、'.join(upstream['versions']))}（不代表官方最新发布版本）。历史来源保留供查证。", ""]
     rows = [(identifier, url, item) for identifier, records in ledger.items() for url, item in records.items()]
     rows.sort(key=lambda row: (tuple(-part for part in version_rank((row[2]["finding"].get("version") or {}).get("value"))), row[0], row[1]))
     details = []
     github = re.fullmatch(r"(?:git@github\.com:|https://github\.com/)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?", remote)
     for number, (identifier, url, item) in enumerate(rows, 1):
         finding, assessment = item["finding"], item["assessment"]
+        url = item.get("tracked_upstream", {}).get("url", url)
         stale = item["code_hash"] != current_hash
         status = "待核实（代码已变化）" if stale else STATUSES[assessment["status"]]
         if item.get("revised"):
@@ -959,7 +792,9 @@ def validated_model(model, phase, evidence, validator):
 
 def investigate(article, repository, model, ledger, topic):
     known = [{"id": key, "mechanisms": [r["finding"]["mechanism"]["value"] for r in rows.values()]} for key, rows in ledger.items()]
-    classification_evidence = {"topic": topic, "article": article, "files": repository.sources, "known_mechanisms": known,
+    upstream_evidence = {"tracked_upstream": article.get("tracked_upstream"),
+                         "upstream_policy": "tracked_upstream 是用户明确指定的研究报告上游，不是 Claude 官方上游。只据该文件原文和目标网关源码核验，不把仓库身份当作结论正确的保证，不推断报告目录版本就是官方最新版本。"}
+    classification_evidence = {**upstream_evidence, "topic": topic, "article": article, "files": repository.sources, "known_mechanisms": known,
                               "date_policy": "发现时间按来源首发时间记录，由执行器单独读取，不提取研究日期和引入时间。"}
     def validate_classification(result):
         return result, classify_result(result, article)
@@ -969,7 +804,7 @@ def investigate(article, repository, model, ledger, topic):
         if not findings:
             return {"status": "rejected", "reason": classification["reason"], "findings": []}
         files, unavailable = repository.code(classification.get("code_paths", []))
-        evidence = {"findings": findings, "files": files, "unavailable_files": unavailable, "commit": repository.commit}
+        evidence = {**upstream_evidence, "findings": findings, "files": files, "unavailable_files": unavailable, "commit": repository.commit}
         assessments = validated_model(model, "evaluate", evidence, lambda result: assess_result(result, findings, files, unavailable))
         try:
             assessments = validated_model(model, "verify", {**evidence, "article": article, "assessments": assessments},
@@ -982,7 +817,8 @@ def investigate(article, repository, model, ledger, topic):
                 "instruction": "重新核对原报告，修正错误的机制、版本或触发条件，再给出完整提取结果。未知开关不得自行补成确定前置条件。不得只要求复核改口，也不能为了通过而补造证据。"}}
             continue
         records = [{"finding": finding, "assessment": assessments[finding["id"]], "code_hash": repository.code_hash,
-                    "commit": repository.commit, "checked_at": now(), "published": article.get("published")} for finding in findings]
+                    "commit": repository.commit, "checked_at": now(), "published": article.get("published"),
+                    "tracked_upstream": article.get("tracked_upstream") or {}} for finding in findings]
         return {"status": "accepted", "reason": classification["reason"], "findings": records}
 
 
@@ -991,15 +827,20 @@ def cycle(config, state, repository, web, model, state_dir, preview=False):
     run = {"started_at": now(), "errors": [], "processed": 0, "skipped": 0, "published_commit": None}
     state.setdefault("articles", {})
     state.setdefault("ledger", {})
-    candidates, errors = web.search(config["search"])
-    run["errors"].extend(errors)
-    run["pending_search_queries"] = getattr(web, "pending_queries", [])
-    # 已核验的报告持续追踪，覆盖报告修订和代码升级，不依赖搜索排序始终命中。
-    candidates = config["search"].get("seed_urls", []) + candidates
-    candidates += [url for url, value in state["articles"].items() if value.get("status") in {"accepted", "pending"}]
+    if config.get("tracked_upstream"):
+        candidates, upstream = web.upstream(config["tracked_upstream"])
+        run["tracked_upstream"] = state["tracked_upstream"] = upstream
+        # 固定上游模式只调度本轮选定报告，旧来源的历史证据保留但不继续抓取。
+        carried = [url for url in state.get("queue", []) if url in candidates]
+    else:
+        candidates, errors = web.search(config["search"])
+        run["errors"].extend(errors)
+        candidates = config["search"].get("seed_urls", []) + candidates
+        candidates += [url for url, value in state["articles"].items() if value.get("status") in {"accepted", "pending"}]
+        carried = state.get("queue", [])
     candidates = list(dict.fromkeys(candidates))
-    # 超过每日上限的候选落盘排队，下一轮优先处理，避免搜索首页长期饿死后续条目。
-    queue = list(dict.fromkeys(state.get("queue", []) + candidates))
+    # 超过每日上限的候选落盘排队，下一轮优先处理，避免后续条目长期饥饿。
+    queue = list(dict.fromkeys(carried + candidates))
     queue.sort(key=lambda url: state["articles"].get(url, {}).get("last_attempt", ""))
     if len(queue) > config.get("max_queue", 1000):
         run["errors"].append("候选队列达到上限，请收窄关键词或调整 max_queue")
@@ -1040,7 +881,7 @@ def cycle(config, state, repository, web, model, state_dir, preview=False):
     state["queue"] = list(dict.fromkeys(remaining))
     if state["ledger"]:
         original = repository.read(repository.homepage)
-        updated = update_homepage(original, render(state["ledger"], repository.code_hash, config.get("target", {}).get("remote", "")))
+        updated = update_homepage(original, render(state["ledger"], repository.code_hash, config.get("target", {}).get("remote", ""), state.get("tracked_upstream")))
         (state_dir / "README.preview.md").write_text(updated, encoding="utf-8")
         if config.get("publish", False) and not preview:
             try:
@@ -1065,20 +906,8 @@ def load_config(path):
         raise ValueError("search.enabled 必须为布尔值")
     if search.get("provider", "bing_rss") not in {"google", "bing_rss", "brave"}:
         raise ValueError("不支持的搜索提供方")
-    for key, default in (("browser_enabled", False), ("browser_persistent", False), ("browser_headless", True)):
-        if type(search.get(key, default)) is not bool:
-            raise ValueError(f"{key} 必须为布尔值")
-    wait = search.get("verification_wait_seconds", 1200)
-    if type(wait) is not int or not 0 <= wait <= 3600:
-        raise ValueError("verification_wait_seconds 应在 0 至 3600 之间")
-    if search.get("browser_persistent") and (not search.get("browser_enabled") or search.get("provider") != "google"):
-        raise ValueError("持久浏览器仅用于已启用浏览器的 Google 搜索")
-    if search.get("verification_public_url"):
-        normalized_url(search["verification_public_url"])
-        if not search.get("browser_persistent") or search.get("browser_headless", True):
-            raise ValueError("手机接手入口需要带界面的持久浏览器")
-    if search.get("notification_config"):
-        search["notification_config"] = str((path.parent / search["notification_config"]).resolve())
+    if type(search.get("browser_enabled", False)) is not bool:
+        raise ValueError("browser_enabled 必须为布尔值")
     queries = search.get("queries")
     if not isinstance(queries, list) or not 1 <= len(queries) <= 12:
         raise ValueError("需要配置 1 至 12 个关键词查询")
@@ -1093,6 +922,28 @@ def load_config(path):
         raise ValueError("搜索结果数量应在 1 至 20 之间")
     for url in search.get("seed_urls", []):
         normalized_url(url)
+    upstream = config.get("tracked_upstream")
+    if upstream is not None:
+        if not isinstance(upstream, dict) or not re.fullmatch(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?/?", upstream.get("repository", "")):
+            raise ValueError("tracked_upstream.repository 必须是明确的 GitHub 仓库")
+        if search.get("enabled", True) or search.get("seed_urls"):
+            raise ValueError("固定上游模式须关闭搜索并清空 seed_urls，避免混入其他来源")
+        branch = text(upstream.get("branch", "main"), "上游分支", 200)
+        if any(c in branch for c in "?#\\"):
+            raise ValueError("上游分支含非法字符")
+        safe_path(upstream.get("versions_dir", "versions"))
+        count = upstream.get("latest_versions", 1)
+        if type(count) is not int or not 1 <= count <= 3:
+            raise ValueError("latest_versions 应在 1 至 3 之间")
+        files = upstream.get("report_files", [])
+        if not isinstance(files, list) or len(files) > 20:
+            raise ValueError("report_files 必须为最多20项的 Markdown 文件名列表")
+        for filename in files:
+            if safe_path(filename) != PurePosixPath(filename).name or not filename.endswith(".md"):
+                raise ValueError("上游报告须为版本目录下的 Markdown 文件")
+        limit = upstream.get("max_report_bytes", 96000)
+        if type(limit) is not int or not 48000 <= limit <= 128000:
+            raise ValueError("max_report_bytes 应在 48000 至 128000 之间")
     target = config.get("target", {})
     for boolean in ("publish",):
         if type(config.get(boolean, False)) is not bool:
@@ -1132,26 +983,14 @@ def load_config(path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path)
-    parser.add_argument("--termiters")
+    parser.add_argument("--termiters", required=True)
     parser.add_argument("--preview", action="store_true")
-    parser.add_argument("--verify-google", action="store_true", help="仅人工验证一个 Google 查询，不调用模型或发布")
     args = parser.parse_args()
     config = load_config(args.config)
     state_dir = Path(config["state_dir"])
     state_dir.mkdir(parents=True, exist_ok=True)
     if os.name != "nt":
         state_dir.chmod(0o700)
-    if args.verify_google:
-        web = Web(Budget(min(7200, config["search"].get("verification_wait_seconds", 1200) + 120)),
-                  config["http_timeout_seconds"], browser_state_dir=state_dir, notifier_executable=args.termiters)
-        try:
-            print(json.dumps(web.verify_google(config["search"]), ensure_ascii=False, indent=2), flush=True)
-            return 0
-        finally:
-            web.close()
-    if not args.termiters:
-        parser.error("正常研究需要 --termiters")
-    web = None
     # SQLite 事务锁随进程退出自动释放，避免掉电遗留锁文件阻断后续调度。
     connection = sqlite3.connect(state_dir / "state.sqlite3", timeout=0, isolation_level=None)
     try:
@@ -1170,7 +1009,7 @@ def main():
             signal.setitimer(signal.ITIMER_REAL, max(0.1, config["timeout_seconds"] - 1))
         try:
             repository = Repository(config["target"], state_dir, budget).refresh()
-            web = Web(budget, config["http_timeout_seconds"], browser_state_dir=state_dir, notifier_executable=args.termiters)
+            web = Web(budget, config["http_timeout_seconds"])
             model = Model(args.termiters, config["llm_config"], budget, config["model_timeout_seconds"], state_dir / "model-cache")
             result = cycle(config, state, repository, web, model, state_dir, args.preview)
         except Exception as error:
@@ -1182,8 +1021,6 @@ def main():
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 1 if result["errors"] else 0
     finally:
-        if web is not None:
-            web.close()
         if os.name != "nt":
             signal.setitimer(signal.ITIMER_REAL, 0)
         connection.close()

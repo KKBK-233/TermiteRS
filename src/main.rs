@@ -37,12 +37,6 @@ fn main() -> Result<()> {
             Assistant::new(config).run()?;
         }
         Commands::Research { action } => match action {
-            ResearchCommands::NotifyGoogle { config, input } => {
-                TermiteRS::research::notify_google(&config, &input)?;
-            }
-            ResearchCommands::VerifyGoogle { config, python } => {
-                TermiteRS::research::verify_google(&config, python.as_deref())?;
-            }
             ResearchCommands::RunOnce {
                 config,
                 preview,

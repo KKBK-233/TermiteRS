@@ -58,48 +58,7 @@ pub fn analyze(config: &Path, input: &Path) -> Result<()> {
 }
 
 /// 嵌入脚本随二进制发布；使用统一进程树超时，不依赖源码目录布局。
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct GoogleNotification {
-    query: String,
-    url: String,
-    expires_at: String,
-}
-
-/// 验证链接只进入既有通知通道；不把敏感访问令牌写到标准输出。
-pub fn notify_google(config: &Path, input: &Path) -> Result<()> {
-    let config = Config::read_from(config)?;
-    let request: GoogleNotification = serde_json::from_slice(&fs::read(input)?)?;
-    ensure!(
-        request.url.starts_with("https://"),
-        "手机验证入口必须使用 HTTPS"
-    );
-    let body = format!(
-        "Google 搜索需要你亲自完成验证码。\n\n查询：{}\n\n手机或电脑打开：\n{}\n\n链接过期时间（UTC）：{}\n完成验证后程序会检查原查询并继续。此链接可以操作专用验证浏览器，请勿转发。",
-        request.query, request.url, request.expires_at
-    );
-    let sent = crate::notify::Notifier::new(config.notify)
-        .send_failure("Google 搜索需要人工验证", &body)?;
-    ensure!(sent, "未配置可用的通知通道");
-    println!("Google 人工验证通知已发送");
-    Ok(())
-}
-
 pub fn run_once(config: &Path, preview: bool, python: Option<&str>) -> Result<()> {
-    run_script(config, preview, python, false)
-}
-
-/// 人工接手 Google 浏览器，仅验收一个查询，不调用模型或发布首页。
-pub fn verify_google(config: &Path, python: Option<&str>) -> Result<()> {
-    run_script(config, false, python, true)
-}
-
-fn run_script(
-    config: &Path,
-    preview: bool,
-    python: Option<&str>,
-    verify_google: bool,
-) -> Result<()> {
     let config = config.canonicalize().context("研究配置文件不存在")?;
     let temp = std::env::temp_dir().join(format!("termiters-research-{}", uuid::Uuid::new_v4()));
     fs::create_dir(&temp)?;
@@ -117,13 +76,6 @@ fn run_script(
             .env("PYTHONIOENCODING", "utf-8");
         if preview {
             process.arg("--preview");
-        }
-        if verify_google {
-            // 交互入口直接继承输出，让验证码暂停状态及时出现在服务日志。
-            process.arg("--verify-google");
-            let status = process.status().context("启动 Google 人工验证失败")?;
-            ensure!(status.success(), "Google 人工验证未完成，退出码 {status}");
-            return Ok(());
         }
         let output = command::run_prepared(
             &mut process,

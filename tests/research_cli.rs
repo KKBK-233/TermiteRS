@@ -148,15 +148,3 @@ fn embedded_runner_refuses_disabled_config_before_network_or_model_calls() {
     assert!(!root.join(".termite").exists());
     fs::remove_dir_all(root).unwrap();
 }
-
-#[test]
-fn research_help_exposes_manual_google_verification() {
-    let output = Command::new(env!("CARGO_BIN_EXE_TermiteRS"))
-        .args(["research", "verify-google", "--help"])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    let output = String::from_utf8_lossy(&output.stdout);
-    assert!(output.contains("--config"));
-    assert!(output.contains("--python"));
-}

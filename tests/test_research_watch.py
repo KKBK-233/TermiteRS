@@ -6,7 +6,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch, Mock
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -85,150 +85,101 @@ class FakeRepository:
         return "b" * 40
 
 
-class GoogleBrowserTests(unittest.TestCase):
-    """验证人工接手、错误页拒收、配置互斥和搜索断点，不访问真实 Google。"""
+class UpstreamTests(unittest.TestCase):
+    """固定报告上游的版本发现、提交锁定和模型来源边界。"""
 
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
-        self.config = {"provider": "google", "browser_enabled": True, "browser_persistent": True,
-                       "browser_headless": False, "verification_wait_seconds": 5,
-                       "queries": ["first", "second", "third"], "max_results": 10}
-        self.web = research.Web(research.Budget(20), browser_state_dir=self.root)
-        self.addCleanup(self.web.close)
+        self.config = {"repository": "https://github.com/wtfwhs/tengu-decoded", "branch": "main"}
+        self.commit = "a" * 40
+        self.path = "versions/2.1.300/device-fingerprinting.md"
+        raw = BODY.encode("utf-8")
+        self.blob = research.hashlib.sha1(b"blob " + str(len(raw)).encode() + b"\0" + raw).hexdigest()
+        self.requests = []
+        self.web = research.Web(research.Budget(20))
 
-    def page(self, query="first"):
-        page = Mock()
-        page.url = "https://www.google.com/search?q=" + query
-        page.locator.return_value.evaluate_all.return_value = [[URL, "Original report"]]
-        page.locator.return_value.inner_text.return_value = "Search results"
-        page.is_closed.return_value = False
-        return page
+    def get(self, url, headers=None):
+        self.requests.append(url)
+        if "/git/ref/heads/" in url:
+            data = {"object": {"sha": self.commit, "type": "commit"}}
+        elif "/contents/versions?" in url:
+            data = [{"type": "dir", "name": value} for value in ["2.1.32", "2.1.300", "2.1.197"]]
+        elif "/contents/versions/2.1.300?" in url:
+            data = [{"type": "file", "name": "device-fingerprinting.md", "path": self.path, "sha": self.blob},
+                    {"type": "file", "name": "bundle.js", "path": "versions/2.1.300/bundle.js", "sha": self.blob}]
+        elif "raw.githubusercontent.com/" in url:
+            return url, BODY, "text/plain"
+        else:
+            raise AssertionError("unexpected request: " + url)
+        return url, json.dumps(data), "application/json"
 
-    def test_verification_page_and_different_query_are_not_success(self):
-        page = self.page()
-        page.url = "https://www.google.com/sorry/index?q=first"
-        self.assertIsNone(research.GoogleBrowser.results(page, "first"))
-        page.url = "https://www.google.com/search?q=different"
-        self.assertIsNone(research.GoogleBrowser.results(page, "first"))
-        page.url = "https://example.org/search?q=first"
-        self.assertIsNone(research.GoogleBrowser.results(page, "first"))
-        page.locator.assert_not_called()
+    def test_discovers_numeric_latest_and_fetches_verified_pinned_markdown(self):
+        with patch.object(self.web, "get", side_effect=self.get):
+            urls, upstream = self.web.upstream(self.config)
+            article = self.web.article(urls[0])
+        self.assertEqual(upstream["versions"], ["2.1.300"])
+        self.assertEqual(len(urls), 1)
+        self.assertEqual(article["body"], BODY)
+        self.assertEqual(article["tracked_upstream"]["commit"], self.commit)
+        self.assertIn("/" + self.commit + "/" + self.path, self.requests[-1])
+        self.assertIsNone(article["published"])
 
-    def test_result_requires_external_search_link_or_explicit_empty_result(self):
-        page = self.page()
-        self.assertEqual(research.GoogleBrowser.results(page, "first"), [(URL, "Original report")])
-        page.locator.return_value.evaluate_all.return_value = [["https://www.google.com/help", "Help"]]
-        self.assertIsNone(research.GoogleBrowser.results(page, "first"))
-        page.locator.return_value.inner_text.return_value = "Your search did not match any documents."
-        self.assertEqual(research.GoogleBrowser.results(page, "first"), [])
+    def test_rejects_raw_content_not_matching_upstream_git_blob(self):
+        with patch.object(self.web, "get", side_effect=self.get):
+            urls, _ = self.web.upstream(self.config)
+        with patch.object(self.web, "get", return_value=(urls[0], BODY + " tampered", "text/plain")):
+            with self.assertRaisesRegex(ValueError, "内容指纹"):
+                self.web.article(urls[0])
 
-    def test_human_completes_challenge_without_automated_click_or_reload(self):
-        page = self.page()
-        page.url = "https://www.google.com/sorry/index"
-        def human_finishes(*args):
-            page.url = "https://www.google.com/search?q=first"
-        page.wait_for_timeout.side_effect = human_finishes
-        context = Mock(pages=[page])
-        with patch.object(self.web.browser, "start", return_value=context):
-            result = self.web.google("first", self.config)
-        self.assertEqual(result, [(URL, "Original report")])
-        page.goto.assert_called_once()
-        page.click.assert_not_called()
-        page.reload.assert_not_called()
-        status = json.loads((self.root / "google-verification.json").read_text(encoding="utf-8"))
-        self.assertEqual(status["status"], "verified")
+    def test_every_model_phase_receives_explicit_upstream_identity(self):
+        source = {"repository": self.config["repository"], "commit": self.commit, "path": self.path, "version": "2.1.300"}
+        article = {"url": URL, "body": BODY, "hash": research.digest(BODY), "tracked_upstream": source}
+        received = []
+        model = FakeModel()
+        def capture(phase, evidence):
+            received.append((phase, evidence))
+            return model(phase, evidence)
+        result = research.investigate(article, FakeRepository(), capture, {}, "指纹研究")
+        self.assertEqual(result["status"], "accepted")
+        self.assertEqual([phase for phase, _ in received], ["classify", "evaluate", "verify"])
+        for _, evidence in received:
+            self.assertEqual(evidence["tracked_upstream"], source)
+            self.assertIn("用户明确指定", evidence["upstream_policy"])
+        self.assertEqual(result["findings"][0]["tracked_upstream"], source)
 
-    def test_zero_wait_keeps_needs_verification_and_stops(self):
-        page = self.page()
-        page.url = "https://www.google.com/sorry/index"
-        context = Mock(pages=[page])
-        with patch.object(self.web.browser, "start", return_value=context):
-            with self.assertRaises(research.GoogleVerificationRequired):
-                self.web.google("first", {**self.config, "verification_wait_seconds": 0})
-        page.wait_for_timeout.assert_not_called()
-        status = json.loads((self.root / "google-verification.json").read_text(encoding="utf-8"))
-        self.assertEqual(status["status"], "needs_verification")
+    def test_fixed_source_cycle_does_not_search_or_requeue_old_sources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            web, repo, model = FakeWeb(), FakeRepository(), FakeModel()
+            source = {"repository": self.config["repository"], "commit": self.commit, "versions": ["2.1.300"]}
+            web.upstream = lambda config: ([URL], source)
+            web.search = lambda config: self.fail("固定上游不得执行关键词搜索")
+            state = {"queue": ["https://old.example/report"]}
+            config = {"tracked_upstream": self.config, "topic": "指纹研究", "publish": True, "max_reports": 1}
+            result = research.cycle(config, state, repo, web, model, root)
+            self.assertFalse(result["errors"])
+            self.assertEqual(result["processed"], 1)
+            self.assertFalse(state["queue"])
+            self.assertIn("固定研究上游", repo.original)
+            self.assertIn("wtfwhs/tengu-decoded", repo.original)
+            # 相同报告和源码再次轮询不会重复调用模型。
+            research.cycle(config, state, repo, web, model, root)
+            self.assertEqual(len(model.calls), 3)
 
-    def test_challenge_retains_search_results_and_remaining_queries(self):
-        calls = []
-        def google(query, config):
-            calls.append(query)
-            if query == "second":
-                raise research.GoogleVerificationRequired("manual")
-            return [(URL, "report")]
-        with patch.object(self.web.browser, "start"), patch.object(self.web, "google", side_effect=google):
-            links, errors = self.web.search(self.config)
-        self.assertEqual(calls, ["first", "second"])
-        self.assertEqual(links, [URL])
-        self.assertEqual(len(errors), 1)
-        self.assertEqual(self.web.pending_queries, ["second", "third"])
-        # 新进程先验证断点关键词，再自动恢复；已完成的 first 不再发请求。
-        second = research.Web(research.Budget(20), browser_state_dir=self.root)
-        self.addCleanup(second.close)
-        with patch.object(second.browser, "start"), patch.object(second, "google", return_value=[(URL, "report")]) as request:
-            verified = second.verify_google(self.config)
-            self.assertEqual(verified["model_calls"], 0)
-            self.assertEqual(verified["query"], "second")
-            request.assert_called_once_with("second", self.config)
-            request.reset_mock()
-            self.assertFalse(second.search(self.config)[1])
-            request.assert_called_once_with("third", self.config)
-        self.assertFalse(second.pending_queries)
-        # 完整搜索完成后的下一轮重新检索，不能无限复用昨日搜索结果。
-        with patch.object(second.browser, "start"), patch.object(second, "google", return_value=[]) as request:
-            second.search(self.config)
-            self.assertEqual(request.call_count, 3)
-
-    def test_phone_token_is_random_revoked_and_never_logged(self):
-        config = {**self.config, "verification_public_url": "https://example.org/termite-google/"}
-        self.web.browser.notify("first", config)
-        token_line = (self.root / "google-vnc-tokens").read_text(encoding="utf-8")
-        token = token_line.split(":", 1)[0]
-        self.assertGreaterEqual(len(token), 40)
-        access = json.loads((self.root / "google-verification-access.json").read_text(encoding="utf-8"))
-        self.assertTrue(access["url"].startswith("https://example.org/termite-google/vnc.html?"))
-        self.assertIn(token, access["url"])
-        other = research.GoogleBrowser(self.root, research.Budget(5))
-        other.close()
-        self.assertEqual((self.root / "google-vnc-tokens").read_text(encoding="utf-8"), token_line)
-        self.web.browser.close()
-        self.assertEqual((self.root / "google-vnc-tokens").read_text(encoding="utf-8"), "")
-        self.assertFalse((self.root / "google-verification-access.json").exists())
-
-    def test_email_uses_existing_notifier_without_token_in_command_arguments(self):
-        config = {**self.config, "verification_public_url": "https://example.org/termite-google/",
-                  "notification_config": "/private/mail.yml"}
-        self.web.browser.notifier_executable = "TermiteRS"
-        with patch.object(research.subprocess, "run", return_value=Mock(returncode=0)) as send:
-            self.web.browser.notify("first", config)
-        command = send.call_args.args[0]
-        self.assertEqual(command[:3], ["TermiteRS", "research", "notify-google"])
-        self.assertIn("/private/mail.yml", command)
-        self.assertNotIn("https://", " ".join(command))
-
-    def test_configuration_change_invalidates_partial_search_progress(self):
-        progress = self.web.progress(self.config)
-        progress["completed"]["first"] = [[URL, "report"]]
-        self.web.save_progress(self.config, progress)
-        changed = {**self.config, "queries": ["new"]}
-        self.assertEqual(self.web.progress(changed)["completed"], {})
-
-    def test_browser_profile_lock_prevents_second_owner_and_releases_after_close(self):
-        self.root.mkdir(exist_ok=True)
-        import sqlite3
-        lock = sqlite3.connect(self.root / "google-browser-lock.sqlite3", timeout=0, isolation_level=None)
-        lock.execute("BEGIN IMMEDIATE")
-        try:
-            with self.assertRaises(sqlite3.OperationalError):
-                self.web.browser.start(self.config)
-            self.assertIsNone(self.web.browser.lock)
-        finally:
-            lock.close()
-        lock = sqlite3.connect(self.root / "google-browser-lock.sqlite3", timeout=0, isolation_level=None)
-        lock.execute("BEGIN IMMEDIATE")
-        lock.close()
+    def test_upstream_configuration_requires_exclusive_source_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "research.json"
+            config = json.loads((ROOT / "examples/research.json").read_text(encoding="utf-8"))
+            config.update(enabled=True, tracked_upstream=self.config)
+            path.write_text(json.dumps(config), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "关闭搜索"):
+                research.load_config(path)
+            config["search"].update(enabled=False, seed_urls=[])
+            path.write_text(json.dumps(config), encoding="utf-8")
+            self.assertEqual(research.load_config(path)["tracked_upstream"], self.config)
+            config["tracked_upstream"] = {**self.config, "report_files": ["../secret.md"]}
+            path.write_text(json.dumps(config), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                research.load_config(path)
 
 
 class ResearchTests(unittest.TestCase):
