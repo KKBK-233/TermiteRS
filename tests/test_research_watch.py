@@ -6,7 +6,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -83,6 +83,152 @@ class FakeRepository:
         self.published.append(updated)
         self.original = updated
         return "b" * 40
+
+
+class GoogleBrowserTests(unittest.TestCase):
+    """验证人工接手、错误页拒收、配置互斥和搜索断点，不访问真实 Google。"""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.config = {"provider": "google", "browser_enabled": True, "browser_persistent": True,
+                       "browser_headless": False, "verification_wait_seconds": 5,
+                       "queries": ["first", "second", "third"], "max_results": 10}
+        self.web = research.Web(research.Budget(20), browser_state_dir=self.root)
+        self.addCleanup(self.web.close)
+
+    def page(self, query="first"):
+        page = Mock()
+        page.url = "https://www.google.com/search?q=" + query
+        page.locator.return_value.evaluate_all.return_value = [[URL, "Original report"]]
+        page.locator.return_value.inner_text.return_value = "Search results"
+        page.is_closed.return_value = False
+        return page
+
+    def test_verification_page_and_different_query_are_not_success(self):
+        page = self.page()
+        page.url = "https://www.google.com/sorry/index?q=first"
+        self.assertIsNone(research.GoogleBrowser.results(page, "first"))
+        page.url = "https://www.google.com/search?q=different"
+        self.assertIsNone(research.GoogleBrowser.results(page, "first"))
+        page.url = "https://example.org/search?q=first"
+        self.assertIsNone(research.GoogleBrowser.results(page, "first"))
+        page.locator.assert_not_called()
+
+    def test_result_requires_external_search_link_or_explicit_empty_result(self):
+        page = self.page()
+        self.assertEqual(research.GoogleBrowser.results(page, "first"), [(URL, "Original report")])
+        page.locator.return_value.evaluate_all.return_value = [["https://www.google.com/help", "Help"]]
+        self.assertIsNone(research.GoogleBrowser.results(page, "first"))
+        page.locator.return_value.inner_text.return_value = "Your search did not match any documents."
+        self.assertEqual(research.GoogleBrowser.results(page, "first"), [])
+
+    def test_human_completes_challenge_without_automated_click_or_reload(self):
+        page = self.page()
+        page.url = "https://www.google.com/sorry/index"
+        def human_finishes(*args):
+            page.url = "https://www.google.com/search?q=first"
+        page.wait_for_timeout.side_effect = human_finishes
+        context = Mock(pages=[page])
+        with patch.object(self.web.browser, "start", return_value=context):
+            result = self.web.google("first", self.config)
+        self.assertEqual(result, [(URL, "Original report")])
+        page.goto.assert_called_once()
+        page.click.assert_not_called()
+        page.reload.assert_not_called()
+        status = json.loads((self.root / "google-verification.json").read_text(encoding="utf-8"))
+        self.assertEqual(status["status"], "verified")
+
+    def test_zero_wait_keeps_needs_verification_and_stops(self):
+        page = self.page()
+        page.url = "https://www.google.com/sorry/index"
+        context = Mock(pages=[page])
+        with patch.object(self.web.browser, "start", return_value=context):
+            with self.assertRaises(research.GoogleVerificationRequired):
+                self.web.google("first", {**self.config, "verification_wait_seconds": 0})
+        page.wait_for_timeout.assert_not_called()
+        status = json.loads((self.root / "google-verification.json").read_text(encoding="utf-8"))
+        self.assertEqual(status["status"], "needs_verification")
+
+    def test_challenge_retains_search_results_and_remaining_queries(self):
+        calls = []
+        def google(query, config):
+            calls.append(query)
+            if query == "second":
+                raise research.GoogleVerificationRequired("manual")
+            return [(URL, "report")]
+        with patch.object(self.web.browser, "start"), patch.object(self.web, "google", side_effect=google):
+            links, errors = self.web.search(self.config)
+        self.assertEqual(calls, ["first", "second"])
+        self.assertEqual(links, [URL])
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(self.web.pending_queries, ["second", "third"])
+        # 新进程先验证断点关键词，再自动恢复；已完成的 first 不再发请求。
+        second = research.Web(research.Budget(20), browser_state_dir=self.root)
+        self.addCleanup(second.close)
+        with patch.object(second.browser, "start"), patch.object(second, "google", return_value=[(URL, "report")]) as request:
+            verified = second.verify_google(self.config)
+            self.assertEqual(verified["model_calls"], 0)
+            self.assertEqual(verified["query"], "second")
+            request.assert_called_once_with("second", self.config)
+            request.reset_mock()
+            self.assertFalse(second.search(self.config)[1])
+            request.assert_called_once_with("third", self.config)
+        self.assertFalse(second.pending_queries)
+        # 完整搜索完成后的下一轮重新检索，不能无限复用昨日搜索结果。
+        with patch.object(second.browser, "start"), patch.object(second, "google", return_value=[]) as request:
+            second.search(self.config)
+            self.assertEqual(request.call_count, 3)
+
+    def test_phone_token_is_random_revoked_and_never_logged(self):
+        config = {**self.config, "verification_public_url": "https://example.org/termite-google/"}
+        self.web.browser.notify("first", config)
+        token_line = (self.root / "google-vnc-tokens").read_text(encoding="utf-8")
+        token = token_line.split(":", 1)[0]
+        self.assertGreaterEqual(len(token), 40)
+        access = json.loads((self.root / "google-verification-access.json").read_text(encoding="utf-8"))
+        self.assertTrue(access["url"].startswith("https://example.org/termite-google/vnc.html?"))
+        self.assertIn(token, access["url"])
+        other = research.GoogleBrowser(self.root, research.Budget(5))
+        other.close()
+        self.assertEqual((self.root / "google-vnc-tokens").read_text(encoding="utf-8"), token_line)
+        self.web.browser.close()
+        self.assertEqual((self.root / "google-vnc-tokens").read_text(encoding="utf-8"), "")
+        self.assertFalse((self.root / "google-verification-access.json").exists())
+
+    def test_email_uses_existing_notifier_without_token_in_command_arguments(self):
+        config = {**self.config, "verification_public_url": "https://example.org/termite-google/",
+                  "notification_config": "/private/mail.yml"}
+        self.web.browser.notifier_executable = "TermiteRS"
+        with patch.object(research.subprocess, "run", return_value=Mock(returncode=0)) as send:
+            self.web.browser.notify("first", config)
+        command = send.call_args.args[0]
+        self.assertEqual(command[:3], ["TermiteRS", "research", "notify-google"])
+        self.assertIn("/private/mail.yml", command)
+        self.assertNotIn("https://", " ".join(command))
+
+    def test_configuration_change_invalidates_partial_search_progress(self):
+        progress = self.web.progress(self.config)
+        progress["completed"]["first"] = [[URL, "report"]]
+        self.web.save_progress(self.config, progress)
+        changed = {**self.config, "queries": ["new"]}
+        self.assertEqual(self.web.progress(changed)["completed"], {})
+
+    def test_browser_profile_lock_prevents_second_owner_and_releases_after_close(self):
+        self.root.mkdir(exist_ok=True)
+        import sqlite3
+        lock = sqlite3.connect(self.root / "google-browser-lock.sqlite3", timeout=0, isolation_level=None)
+        lock.execute("BEGIN IMMEDIATE")
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                self.web.browser.start(self.config)
+            self.assertIsNone(self.web.browser.lock)
+        finally:
+            lock.close()
+        lock = sqlite3.connect(self.root / "google-browser-lock.sqlite3", timeout=0, isolation_level=None)
+        lock.execute("BEGIN IMMEDIATE")
+        lock.close()
 
 
 class ResearchTests(unittest.TestCase):

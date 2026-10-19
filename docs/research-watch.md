@@ -70,3 +70,34 @@ cargo test --test research_cli
 ```
 
 测试使用本机模拟模型与临时 Git remote，覆盖证据伪造、重复轮次、报告修订、代码更新、发布并发及未提交工作保护，不调用真实模型。
+
+## Google 人工验证与手机接手
+
+`TermiteRS research verify-google --config /etc/termiters/research.json --python /path/to/python` 只打开断点中的一个关键词，不调用模型、抓取报告或发布首页。需要安装 Playwright 完整 Chromium、TigerVNC 和 noVNC/websockify；原来的 headless shell 不支持显示验证窗口。
+
+在 `search` 中设置 `browser_enabled: true`、`browser_persistent: true`、`browser_headless: false`、`verification_wait_seconds: 1200`。浏览器配置固定保存在 `state_dir/google-profile`，自动与人工入口通过独立 SQLite 事务锁互斥。每个关键词复用同一浏览器；完整搜索结束后下一轮重新检索。验证码中断前的成功结果和未完成关键词保存在 `google-search-progress.json`，恢复不重复已完成查询。修改搜索配置会使旧断点失效。
+
+部署 `deploy/termiters-research-display.service`、`-novnc.service`、`-verify.service`，把 `termiters-research-browser.conf` 安装为研究服务的 drop-in。根据实际环境替换用户、二进制、配置、状态目录、Python 和 Playwright 浏览器路径。显示服务的 `PrivateTmp` 命名空间由研究和人工服务共享；显示和网页服务随依赖任务结束停止。不需要新增定时任务。
+
+手机访问需要已有 HTTPS 域名。设置 `search.verification_public_url: https://your-domain.example/termite-google/` 和 `search.notification_config: /etc/termiters/termite.yml`，研究服务环境文件提供原邮件通道所需的环境变量。验证码出现后生成随机访问令牌，通过现有 TermiteRS 通知通道发送限时链接。默认20分钟内有效，完成验证、等待超时或浏览器正常关闭时撤销。邮件被提交到 SMTP 不代表收件箱已收到；应由收件人确认。手机打开链接即可查看和操作服务器浏览器，支持缩放。无需导出 Cookie 或登录 Google 账号。浏览器子进程只继承白名单环境，不继承邮件和模型密钥。
+
+HTTPS 入口的 Nginx location 示例（加入已有 HTTPS 站点；若 TLS 由已有 CDN 终止，加入对应回源站点）：
+
+```nginx
+location ^~ /termite-google/ {
+    access_log off;
+    add_header Referrer-Policy no-referrer always;
+    add_header Cache-Control no-store always;
+    proxy_pass http://127.0.0.1:6080/;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_buffering off;
+    proxy_read_timeout 1300s;
+}
+```
+
+VNC 与 websockify 仅监听回环地址；WebSocket 通过 `TokenFile` 校验令牌，静态 noVNC 文件不含访问凭据。接手链接不得转发，反向代理关闭该入口的访问日志，避免记录令牌。若进程被强制终止来不及清理令牌，依赖服务结束会关闭会话；每次服务启动应清空遗留令牌。
+
+也可用 SSH 转发 `127.0.0.1:16080:127.0.0.1:6080`，把邮件链接的主机改成本地入口并移除反代路径前缀。页面验证完成后，程序只接受原关键词的 Google 搜索结果；验证码页、首页或其他查询不会冒充成功。人工操作期间程序不点击、不刷新、不跳转；超时保留断点并退出，不自动解决验证码。

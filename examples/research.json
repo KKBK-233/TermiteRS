@@ -7,8 +7,15 @@
     "remote": "https://github.com/your-name/your-project.git",
     "branch": "main",
     "homepage": "README.md",
-    "source_prefixes": ["model-gateway/"],
-    "required_code_paths": ["model-gateway/engine.mjs", "model-gateway/context.mjs", "model-gateway/anthropic.mjs", "model-gateway/cli-events.mjs"],
+    "source_prefixes": [
+      "model-gateway/"
+    ],
+    "required_code_paths": [
+      "model-gateway/engine.mjs",
+      "model-gateway/context.mjs",
+      "model-gateway/anthropic.mjs",
+      "model-gateway/cli-events.mjs"
+    ],
     "max_code_bytes": 96000
   },
   "search": {
@@ -20,8 +27,21 @@
       "\"Claude Code\" hidden markers watermark reverse engineering"
     ],
     "max_results": 10,
-    "required_keywords": ["stegan", "隐写", "reverse engineering", "逆向", "watermark", "hidden marker", "fingerprint"],
-    "seed_urls": ["https://thereallo.dev/blog/claude-code-prompt-steganography"]
+    "required_keywords": [
+      "stegan",
+      "隐写",
+      "reverse engineering",
+      "逆向",
+      "watermark",
+      "hidden marker",
+      "fingerprint"
+    ],
+    "seed_urls": [
+      "https://thereallo.dev/blog/claude-code-prompt-steganography"
+    ],
+    "browser_persistent": false,
+    "browser_headless": true,
+    "verification_wait_seconds": 1200
   },
   "max_reports": 6,
   "max_queue": 1000,
