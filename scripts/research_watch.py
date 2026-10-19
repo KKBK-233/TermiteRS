@@ -905,17 +905,20 @@ def update_homepage(original, section):
 
 
 def validated_model(model, phase, evidence, validator):
-    """校验失败时将明确错误退回模型修正一次，不能由执行器补造或修改研究结论。"""
+    """引用纠错有界重试；评估最多两次，复核否定机制时仍回到原研究流程。"""
     result = model(phase, evidence)
-    try:
-        return validator(result)
-    except ReportEvidenceFailure:
-        raise
-    except ValueError as error:
-        corrected = model(phase, {**evidence, "correction": {
-            "validation_error": str(error), "previous_response": result,
-            "instruction": "原文引用必须是原文中逐字连续片段，不要去掉引用中的符号或把多处内容拼接。未说明的版本输出 null。发现时间由执行器读取来源首发时间，不需要提取发现或引入日期。请修正有错误的字段，仍按本阶段原定 JSON 协议返回完整结果，不要为了通过校验改变事实。"}})
-        return validator(corrected)
+    limit = 2 if phase == "evaluate" else 1
+    for attempt in range(limit + 1):
+        try:
+            return validator(result)
+        except ReportEvidenceFailure:
+            raise
+        except ValueError as error:
+            if attempt == limit:
+                raise
+            result = model(phase, {**evidence, "correction": {
+                "validation_error": str(error), "previous_response": result,
+                "instruction": "原文引用必须是原文中逐字连续片段，不要去掉引用中的符号或把多处内容拼接。未说明的版本输出 null。发现时间由执行器读取来源首发时间，不需要提取发现或引入日期。请修正有错误的字段，仍按本阶段原定 JSON 协议返回完整结果，不要为了通过校验改变事实。"}})
 
 
 def investigate(article, repository, model, ledger, topic, evaluation_profile=None):
