@@ -361,6 +361,14 @@ class ResearchTests(unittest.TestCase):
         self.assertFalse(self.cycle()["errors"])
         self.assertTrue(self.repo.published)
 
+    def test_long_identifier_summary_is_preserved_for_semantic_verification(self):
+        entry = finding()
+        entry["label"] = "protocol-environment-device-identity-marker"
+        entry["trigger_summary"] = "Only if remoteControlMachineId is set, include machine_id in POST /v1/environments/bridge metadata."
+        checked = research.classify_result({"accepted": True, "reason": "原文支持", "findings": [entry]}, {"body": BODY})
+        self.assertEqual(checked[0]["trigger_summary"], entry["trigger_summary"])
+        self.assertGreater(len(checked[0]["trigger_summary"]), 90)
+
     def test_null_optional_object_is_treated_as_unspecified(self):
         self.assertIsNone(research.claim({'value': None, 'quote': None}, BODY, required=False))
         with self.assertRaises(ValueError):
@@ -479,7 +487,7 @@ class ResearchTests(unittest.TestCase):
         item.update(category="协议指纹", label="版本指纹", trigger_summary="使用自定义端点")
         result = {"accepted": True, "reason": "原始报告", "findings": [item]}
         self.assertEqual(research.classify_result(result, {"body": BODY})[0]["category"], "协议指纹")
-        item["label"] = "长" * 37
+        item["label"] = "长" * 73
         with self.assertRaises(ValueError):
             research.classify_result(result, {"body": BODY})
         item["label"], item["category"] = "短名", "未经许可的分类"

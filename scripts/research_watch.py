@@ -637,7 +637,8 @@ def classify_result(result, article):
         entry = {"id": identifier, **{key: claim(item.get(key), article["body"], key in {"mechanism", "trigger"})
                                       for key in ("mechanism", "trigger", "version")}}
         # 简表摘要同样进入独立复核；旧状态没有摘要时仍可完整展示证据。
-        for key, limit in (("label", 36), ("trigger_summary", 90)):
+        # 英文标识符按字符计数容易超出中文摘要目标；存储保留全文，展示仍按原宽度压缩。
+        for key, limit in (("label", 72), ("trigger_summary", 240)):
             if key in item:
                 entry[key] = text(item[key], key, limit)
         if "category" in item:
