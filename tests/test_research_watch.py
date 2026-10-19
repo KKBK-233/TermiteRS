@@ -123,6 +123,18 @@ class UpstreamTests(unittest.TestCase):
         self.assertIn("/" + self.commit + "/" + self.path, self.requests[-1])
         self.assertIsNone(article["published"])
 
+    def test_large_markdown_is_retained_whole_under_upstream_specific_limit(self):
+        with patch.object(self.web, "get", side_effect=self.get):
+            urls, _ = self.web.upstream(self.config)
+        body = "feature flags\n" + "x" * 132500 + "\nfinal evidence"
+        raw = body.encode("utf-8")
+        source = self.web.upstream_sources[urls[0]]
+        source["blob_sha"] = research.hashlib.sha1(b"blob " + str(len(raw)).encode() + b"\0" + raw).hexdigest()
+        with patch.object(self.web, "get", return_value=(source["raw_url"], body, "text/plain")):
+            article = self.web.article(urls[0])
+        self.assertEqual(article["body"], body)
+        self.assertTrue(article["body"].endswith("final evidence"))
+
     def test_rejects_raw_content_not_matching_upstream_git_blob(self):
         with patch.object(self.web, "get", side_effect=self.get):
             urls, _ = self.web.upstream(self.config)

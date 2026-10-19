@@ -54,6 +54,6 @@
     "branch": "main",
     "versions_dir": "versions",
     "latest_versions": 1,
-    "max_report_bytes": 96000
+    "max_report_bytes": 192000
   }
 }
