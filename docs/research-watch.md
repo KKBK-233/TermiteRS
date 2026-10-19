@@ -25,7 +25,7 @@ TermiteRS research run-once --config /etc/termiters/research.json
 
 默认评估配置为 `evaluation_profile: "unbundle_defaults"`：以 Unbundle 默认部署、固定 CLI 参数和环境白名单为前提，不假定用户启用额外功能或自定义覆盖。先判断默认配置是否会触发发送，再评估可能发送的字段是否经过过滤。无需读取或重置个人网关的凭据和私有配置。
 
-`tracked_upstream.context_reports` 默认示例配置为 `["telemetry.md", "environment-variables.md"]`。执行器在同一版本目录、同一固定提交中读取这些关联报告，即使验收通过 `report_files` 只选择一篇，仍补齐关联正文。关联报告用于评估与复核中的控制函数、环境变量和调用点对应说明，不单独扩大本轮主报告数量。关联报告变化会触发重评；缺失会显式提供给模型，超过 `max_context_bytes`（默认128000）明确失败，不静默截断。模型的“不触发”结论必须同时提供报告控制引用与网关代码引用，执行器逐字校验；README 展示固定提交的来源链接，完整引用保留在研究状态。
+`tracked_upstream.context_reports` 默认示例配置为 `["telemetry.md", "environment-variables.md", "feature-flags.md"]`。执行器在同一版本目录、同一固定提交中读取这些关联报告，即使验收通过 `report_files` 只选择一篇，仍补齐关联正文。关联报告用于评估与复核中的控制函数、环境变量和调用点对应说明，不单独扩大本轮主报告数量。关联报告变化会触发重评；缺失会显式提供给模型，超过 `max_context_bytes`（未配置时128000，三份关联报告示例为256000）明确失败，不静默截断。模型的“不触发”结论必须同时提供报告控制引用与网关代码引用，执行器逐字校验；报告路径可使用本轮已提供的精确固定链接，其他版本或未知链接一律拒绝。引用错误反馈具体机制和报告，便于模型修正格式；README 展示固定提交的来源链接，完整引用保留在研究状态。
 
 `tracked_upstream.max_report_bytes` 默认192000，上限256000；超过上限明确失败。其他来源默认仍使用48000字节限制。示例模型的 `max_prompt_bytes` 调整为524288，以容纳主报告、关联报告和网关代码的联合证据；这是证据大小上限，不代表每次请求都会使用到该上限。
 
