@@ -26,12 +26,16 @@ import xml.etree.ElementTree as ET
 
 START = "<!-- termiters:research:start -->"
 END = "<!-- termiters:research:end -->"
-RESEARCH_PROTOCOL = 4
-MODEL_PROTOCOL = 5
+RESEARCH_PROTOCOL = 5
+MODEL_PROTOCOL = 6
 REPORT_BASELINE = {
     "mode": "report_baseline",
     "assumption": "假设云端 CLI 为指定上游本轮选中的报告版本，并按报告描述运行；这是评估前提，不是实际部署版本检测结果。",
     "scope": "以报告中的机制与触发条件为依据，只判断目标网关的过滤、透传及触发条件控制；不自行逆向 CLI，不要求动态提取或验证报告中的 CLI 内部实现。",
+}
+DEFAULT_PROFILE = {
+    "name": "Unbundle 默认配置",
+    "policy": "按目标仓库的默认部署及 engine.mjs 中的固定 CLI 参数、环境白名单评估，不假定用户额外启用远程控制、OTel、插件或测试上游。不读取个人部署的凭据或自定义覆盖。先核对默认配置是否满足报告触发条件，再判断实际可能发送的信号是否过滤。",
 }
 STATUSES = {"filtered": "已过滤", "unfiltered": "未过滤", "partial": "部分过滤", "not_triggered": "当前配置不触发", "unknown": "待核实"}
 SUFFIXES = {".rs", ".go", ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".java", ".kt"}
@@ -244,6 +248,8 @@ class Web:
         self.budget, self.seconds, self.max_bytes = budget, timeout, max_bytes
         self.upstream_sources = {}
         self.max_report_bytes = 48000
+        self.article_cache = {}
+        self.publication_cache = {}
 
     def get(self, url, headers=None):
         url = normalized_url(url)
@@ -317,7 +323,7 @@ class Web:
             files = read_json("/contents/" + quote(prefix, safe="/") + "?ref=" + commit)
             for item in files:
                 name = item.get("name", "")
-                if item.get("type") != "file" or not name.endswith(".md") or (selected and name not in selected):
+                if item.get("type") != "file" or not name.endswith(".md"):
                     continue
                 path = safe_path(item.get("path", ""))
                 if path != prefix + "/" + name or "target" in item:
@@ -336,39 +342,102 @@ class Web:
         self.max_report_bytes = config.get("max_report_bytes", 192000)
         # 优先处理指纹与遥测，其余报告按用户配置顺序；不以 API 返回顺序决定优先级。
         priority = selected or ["device-fingerprinting.md", "telemetry.md", "api-endpoints.md", "system-prompt.md"]
-        urls = sorted(sources, key=lambda url: (tuple(-p for p in version_rank(sources[url]["version"])),
+        candidates = [url for url in sources if not selected or Path(sources[url]["path"]).name in selected]
+        if not candidates:
+            raise ValueError("上游最新版本目录中没有匹配的 Markdown 报告")
+        urls = sorted(candidates, key=lambda url: (tuple(-p for p in version_rank(sources[url]["version"])),
                       priority.index(Path(sources[url]["path"]).name) if Path(sources[url]["path"]).name in priority else len(priority), sources[url]["path"]))
         return urls, {"repository": repository, "branch": config.get("branch", "main"), "commit": commit,
                       "versions": versions, "report_paths": [sources[url]["path"] for url in urls]}
 
-    def article(self, url):
+    def upstream_publication(self, source):
+        """发现日期按报告文件最早可查提交记账，不要求确认机制的真实发现时间。"""
+        key = source["repository"] + ":" + source["path"]
+        if key in self.publication_cache:
+            return self.publication_cache[key]
+        slug = source["repository"].removeprefix("https://github.com/")
+        oldest = None
+        try:
+            for page in range(1, 6):
+                url = "https://api.github.com/repos/" + slug + "/commits?" + urlencode({
+                    "sha": source["commit"], "path": source["path"], "per_page": 100, "page": page})
+                history = json.loads(self.get(url, {"Accept": "application/vnd.github+json"})[1])
+                if not isinstance(history, list):
+                    raise ValueError("上游提交列表格式非法")
+                if history:
+                    oldest = history[-1]
+                if len(history) < 100:
+                    break
+            if not isinstance(oldest, dict) or not re.fullmatch(r"[0-9a-f]{40}", oldest.get("sha", "")):
+                return None
+            stamp = (oldest.get("commit", {}).get("committer") or {}).get("date")
+            day = publication_day(stamp) if isinstance(stamp, str) else None
+            if day:
+                result = {"value": day, "kind": "上游报告提交日期", "quote": "报告文件最早可查提交日期：" + stamp,
+                          "url": source["repository"] + "/commit/" + oldest["sha"]}
+                self.publication_cache[key] = result
+                return result
+        except (ValueError, OSError, TimeoutError, http.client.HTTPException):
+            # 日期获取失败不阻塞机制评估，下轮仍可补全。
+            return None
+        return None
+
+    def article(self, url, include_publication=True):
         source = self.upstream_sources.get(url)
-        final_url, body, content_type = self.get(source["raw_url"] if source else url)
-        if source:
-            raw = body.encode("utf-8")
-            actual = hashlib.sha1(b"blob " + str(len(raw)).encode("ascii") + b"\0" + raw).hexdigest()
-            if actual != source["blob_sha"]:
-                raise ValueError("上游原文与固定提交的 Git 内容指纹不一致")
-        published = None
-        if "html" in content_type:
-            publication = Publication()
-            publication.feed(body)
-            published = publication.result()
-            parser = PageText()
-            parser.feed(body)
-            body = "".join(parser.parts)
-        elif not any(t in content_type for t in ("text/", "json", "xml")):
-            raise ValueError("不支持的报告内容格式")
-        body = re.sub(r"[ \t]+", " ", body)
-        body = re.sub(r"\n\s*\n+", "\n\n", body).strip()
-        if len(body.encode("utf-8")) > self.max_report_bytes:
-            raise ValueError(f"报告正文超过 {self.max_report_bytes} 字节，需分段处理；本轮不做截断判断")
-        if len(body) < 80:
-            raise ValueError("报告正文为空或不足")
-        article = {"url": source["url"] if source else final_url, "body": body, "hash": digest(body), "published": published}
-        if source:
-            article["tracked_upstream"] = source
+        cached = self.article_cache.get(url)
+        if cached is None:
+            final_url, body, content_type = self.get(source["raw_url"] if source else url)
+            if source:
+                raw = body.encode("utf-8")
+                actual = hashlib.sha1(b"blob " + str(len(raw)).encode("ascii") + b"\0" + raw).hexdigest()
+                if actual != source["blob_sha"]:
+                    raise ValueError("上游原文与固定提交的 Git 内容指纹不一致")
+            published = None
+            if "html" in content_type:
+                publication = Publication()
+                publication.feed(body)
+                published = publication.result()
+                parser = PageText()
+                parser.feed(body)
+                body = "".join(parser.parts)
+            elif not any(t in content_type for t in ("text/", "json", "xml")):
+                raise ValueError("不支持的报告内容格式")
+            body = re.sub(r"[ \t]+", " ", body)
+            body = re.sub(r"\n\s*\n+", "\n\n", body).strip()
+            if len(body.encode("utf-8")) > self.max_report_bytes:
+                raise ValueError(f"报告正文超过 {self.max_report_bytes} 字节，需分段处理；本轮不做截断判断")
+            if len(body) < 80:
+                raise ValueError("报告正文为空或不足")
+            cached = {"url": source["url"] if source else final_url, "body": body, "hash": digest(body), "published": published}
+            if source:
+                cached["tracked_upstream"] = source
+            self.article_cache[url] = cached
+        article = dict(cached)
+        if source and include_publication:
+            article["published"] = self.upstream_publication(source)
         return article
+
+    def add_context(self, article, config):
+        """补齐同版本、同提交的公共控制报告；关联正文也参与去重和证据校验。"""
+        source = article.get("tracked_upstream")
+        if not source:
+            return article
+        reports, missing, used = [], [], 0
+        for name in config.get("context_reports", []):
+            if name == PurePosixPath(source["path"]).name:
+                continue
+            match = next((url for url, entry in self.upstream_sources.items()
+                          if entry["repository"] == source["repository"] and entry["commit"] == source["commit"]
+                          and entry["version"] == source["version"] and PurePosixPath(entry["path"]).name == name), None)
+            if match is None:
+                missing.append(name)
+                continue
+            context = self.article(match, include_publication=False)
+            used += len(context["body"].encode("utf-8"))
+            if used > config.get("max_context_bytes", 128000):
+                raise ValueError("关联报告总正文超过上限，不能截断后作判断")
+            reports.append(context)
+        return {**article, "context_reports": reports, "missing_context_reports": missing}
 
     def google(self, query, config):
         endpoint = "https://www.google.com/search?" + urlencode({"q": query, "num": config.get("max_results", 10), "hl": "en", "udm": 14})
@@ -654,7 +723,7 @@ def classify_result(result, article):
     return validated
 
 
-def assess_result(result, findings, files, unavailable):
+def assess_result(result, findings, files, unavailable, report_sources=None):
     assessments = result.get("assessments") if isinstance(result, dict) else None
     ids = {item["id"] for item in findings}
     if not isinstance(assessments, list) or len(assessments) != len(ids) or {a.get("id") for a in assessments} != ids:
@@ -678,7 +747,21 @@ def assess_result(result, findings, files, unavailable):
             verified.append({"path": path, "line": line, "quote": snippet})
         if status != "unknown" and (not verified or unavailable):
             status, reason = "unknown", "代码证据不完整，尚不能确定过滤状态。"
-        validated[item["id"]] = {"status": status, "reason": reason, "code_evidence": verified}
+        report_evidence = []
+        references = item.get("report_evidence", [])
+        if not isinstance(references, list) or len(references) > 8 or any(not isinstance(entry, dict) for entry in references):
+            raise ValueError("报告控制引用必须为最多8项的列表")
+        for entry in references:
+            path = entry.get("path")
+            snippet = text(entry.get("quote"), "报告控制证据", 2000)
+            if report_sources is None or path not in report_sources or snippet not in report_sources[path]["body"]:
+                raise ValueError("报告控制引用未在主报告或关联报告中找到")
+            report_evidence.append({"path": path, "quote": snippet, "url": report_sources[path]["url"]})
+        if status == "not_triggered" and report_sources is not None and not report_evidence:
+            raise ValueError("不触发结论必须引用报告的触发条件或禁用控制依据")
+        summary = text(item.get("summary", reason), "结论简述", 1500)
+        validated[item["id"]] = {"status": status, "reason": reason, "summary": summary,
+                                 "code_evidence": verified, "report_evidence": report_evidence}
     return validated
 
 
@@ -698,7 +781,7 @@ def apply_verification(result, assessments):
             raise ReportEvidenceFailure("报告机制或日期复核未通过：" + reason)
         assessments[verdict["id"]].update(review_supported=verdict["supported"], review_reason=reason)
         if not verdict["supported"]:
-            assessments[verdict["id"]].update(status="unknown", reason="复核未通过：" + reason)
+            assessments[verdict["id"]].update(status="unknown", reason="复核未通过：" + reason, summary="证据尚不足，详见复核说明。")
     return assessments
 
 
@@ -726,7 +809,7 @@ def compact(value, maximum):
     return escape(value if len(value) <= maximum else value[:maximum - 1] + "…")
 
 
-def render(ledger, current_hash, remote="", upstream=None):
+def render(ledger, current_hash, remote="", upstream=None, evaluation_profile=None):
     lines = [START, "## 隐写与指纹跟踪", "",
              "按报告分析版本新→旧排列。过滤仅对折叠证据列明的路径成立，不是端到端保证；未经真实流量验证，旧版标记不推定新版仍有。发现时间以原报告首发时间为准，不推断引入时间。", "",
              "| 报告版本 | 机制 | 过滤 | 触发条件（摘要） | 发现时间 |", "| --- | --- | --- | --- | --- |"]
@@ -735,6 +818,9 @@ def render(ledger, current_hash, remote="", upstream=None):
     if upstream:
         lines[3] = "评估前提：假设云端 CLI 为指定上游本轮选中的报告版本，并按报告描述运行。依据报告与网关源码判断过滤效果，不自行逆向 CLI，也不代表已检测部署版本或完成动态验证。历史条目仍按各自报告版本解释。发现时间以原报告首发时间为准。"
         lines[5:5] = ["已过滤＝相关路径移除信号；未过滤＝保留信号或 CLI 自发请求不经网关过滤；当前配置不触发＝有证据表明必要触发条件被禁用，不等于已过滤；待核实＝报告或网关证据仍不足。", ""]
+    if evaluation_profile == "unbundle_defaults":
+        lines[3] = "评估基准：Unbundle 默认配置；假设云端 CLI 使用下列报告版本，并接受报告描述的行为。结合同版本关联报告判断是否发送及是否过滤，不自行逆向 CLI。发现日期按上游报告文件最早可查提交日期记账，不代表确认或机制引入时间。"
+        lines = [line.replace("| 过滤 | 触发条件（摘要） |", "| 默认配置结论 | 原因（简述） |") for line in lines]
     rows = [(identifier, url, item) for identifier, records in ledger.items() for url, item in records.items()]
     rows.sort(key=lambda row: (tuple(-part for part in version_rank((row[2]["finding"].get("version") or {}).get("value"))), row[0], row[1]))
     details = []
@@ -746,6 +832,8 @@ def render(ledger, current_hash, remote="", upstream=None):
         status = "待核实（代码已变化）" if stale else STATUSES[assessment["status"]]
         if upstream and item.get("tracked_upstream") and not item.get("evaluation_basis") and not stale:
             status = "待重评（旧评估口径）"
+        if evaluation_profile and item.get("evaluation_profile") != evaluation_profile and not stale:
+            status = "待重评（默认配置）"
         if item.get("revised"):
             status = "待核实（来源已修订）"
         published = item.get("published")
@@ -760,19 +848,30 @@ def render(ledger, current_hash, remote="", upstream=None):
         numbers = list(dict.fromkeys(re.findall(r"(?<!\d)\d+\.\d+\.\d+(?!\d)", full_version)))
         version_text = " / ".join(numbers) if numbers else compact(full_version, 24)
         anchor = f"termiters-evidence-{number}"
-        lines.append(f"| {escape(version_text)} | {name} [↗]({report_link(url)}) | {status} | {trigger} [详情](#{anchor}) | {escape(discovered)} |")
+        active = not upstream or (item.get("tracked_upstream", {}).get("repository") == upstream["repository"]
+                                  and item.get("tracked_upstream", {}).get("version") in upstream["versions"])
+        if evaluation_profile == "unbundle_defaults":
+            if status == STATUSES["not_triggered"]:
+                status = "默认关闭／不触发"
+            trigger = "条件或配置已变化，等待重新评估。" if status.startswith(("待重评", "待核实（")) else compact(assessment.get("summary", assessment["reason"]), 65)
+        if active:
+            lines.append(f"| {escape(version_text)} | {name} [↗]({report_link(url)}) | {status} | {trigger} [详情](#{anchor}) | {escape(discovered)} |")
         evidence = []
         for entry in assessment["code_evidence"]:
             location = escape(entry["path"]) + ":" + str(entry["line"])
             if github and re.fullmatch(r"[0-9a-f]{40,64}", item["commit"]):
                 location = f"[{location}](https://github.com/{github[1]}/blob/{item['commit']}/{quote(entry['path'], safe='/')}#L{entry['line']})"
             evidence.append(location)
+        report_evidence = list(dict.fromkeys("[" + escape(entry["path"]) + "](" + report_link(entry["url"]) + ")"
+                           for entry in assessment.get("report_evidence", [])))
+        date_basis = published.get("kind", "来源首发日期") if published else "上游未提供可用日期"
         details += [f'<a id="{anchor}"></a>', f"**{number}. {compact(label, 36)}** · {escape(full_version)} · [原报告]({report_link(url)})", "",
                     "评估基准：" + ("假设云端使用报告版本，并接受报告描述的 CLI 行为。" if item.get("evaluation_basis") else "历史记录，尚未按报告版本假设重新评估。"), "",
                     f"机制：{escape(finding['mechanism']['value'])}", "",
                     f"完整触发条件：{escape(finding['trigger']['value'])}", "",
                     f"{status}：{escape(assessment['reason'])}", "",
-                    f"代码：{'、'.join(evidence) or '证据不足'}；审阅提交 {escape(item['commit'][:12])}。发现时间：{escape(discovered)}（以来源首发时间为准）。", ""]
+                    "关联报告依据：" + ("；".join(report_evidence) or "见主报告与代码说明"), "",
+                    f"代码：{'、'.join(evidence) or '证据不足'}；审阅提交 {escape(item['commit'][:12])}。发现时间：{escape(discovered)}（{escape(date_basis)}）。", ""]
     lines += ["", "<details>", "<summary>展开完整条件与代码证据</summary>", "", *details, "</details>", "",
               "此追踪由 [TermiteRS](https://github.com/KKBK-233/TermiteRS) 进行在线追踪更新。", "", END]
     return "\n".join(lines)
@@ -803,15 +902,18 @@ def validated_model(model, phase, evidence, validator):
         return validator(corrected)
 
 
-def investigate(article, repository, model, ledger, topic):
+def investigate(article, repository, model, ledger, topic, evaluation_profile=None):
     known = [{"id": key, "mechanisms": [r["finding"]["mechanism"]["value"] for r in rows.values()]} for key, rows in ledger.items()]
     upstream_evidence = {"tracked_upstream": article.get("tracked_upstream"),
                          "upstream_policy": "tracked_upstream 是用户明确指定的研究报告上游，不是 Claude 官方上游。只据该文件原文和目标网关源码核验，不把仓库身份当作结论正确的保证，不推断报告目录版本就是官方最新版本。"}
     if article.get("tracked_upstream"):
         upstream_evidence["evaluation_basis"] = {**REPORT_BASELINE, "version": article["tracked_upstream"].get("version")}
         upstream_evidence["upstream_policy"] = "tracked_upstream 是用户明确指定的研究基准，不是 Claude 官方仓库。接受报告所述 CLI 行为作为本次条件评估前提，仍须忠实提取原文机制和完整触发条件；无需再次证明报告的逆向过程，不推断报告版本就是官方最新发布版本。"
-    classification_evidence = {**upstream_evidence, "topic": topic, "article": article, "files": repository.sources, "known_mechanisms": known,
-                              "date_policy": "发现时间按来源首发时间记录，由执行器单独读取，不提取研究日期和引入时间。"}
+    if evaluation_profile == "unbundle_defaults":
+        upstream_evidence["deployment_profile"] = DEFAULT_PROFILE
+    primary_article = {key: value for key, value in article.items() if key not in {"context_reports", "missing_context_reports"}}
+    classification_evidence = {**upstream_evidence, "topic": topic, "article": primary_article, "files": repository.sources, "known_mechanisms": known,
+                              "date_policy": "指定上游的发现日期按报告文件最早可查提交日期记录，无需模型确认真实发现或引入时间。"}
     def validate_classification(result):
         return result, classify_result(result, article)
     # 语义复核失败后最多回到提取阶段一次，重读原文、重评代码并再次独立复核。
@@ -821,7 +923,10 @@ def investigate(article, repository, model, ledger, topic):
             return {"status": "rejected", "reason": classification["reason"], "findings": []}
         files, unavailable = repository.code(classification.get("code_paths", []))
         evidence = {**upstream_evidence, "article": article, "findings": findings, "files": files, "unavailable_files": unavailable, "commit": repository.commit}
-        assessments = validated_model(model, "evaluate", evidence, lambda result: assess_result(result, findings, files, unavailable))
+        report_sources = {entry["tracked_upstream"]["path"]: entry
+                          for entry in [article, *article.get("context_reports", [])] if entry.get("tracked_upstream")}
+        assessments = validated_model(model, "evaluate", evidence,
+                                      lambda result: assess_result(result, findings, files, unavailable, report_sources or None))
         try:
             assessments = validated_model(model, "verify", {**evidence, "article": article, "assessments": assessments},
                                           lambda result: apply_verification(result, json.loads(json.dumps(assessments))))
@@ -835,7 +940,8 @@ def investigate(article, repository, model, ledger, topic):
         records = [{"finding": finding, "assessment": assessments[finding["id"]], "code_hash": repository.code_hash,
                     "commit": repository.commit, "checked_at": now(), "published": article.get("published"),
                     "tracked_upstream": article.get("tracked_upstream") or {},
-                    "evaluation_basis": upstream_evidence.get("evaluation_basis")} for finding in findings]
+                    "evaluation_basis": upstream_evidence.get("evaluation_basis"), "evaluation_profile": evaluation_profile,
+                    "context_sources": [entry["tracked_upstream"] for entry in article.get("context_reports", [])]} for finding in findings]
         return {"status": "accepted", "reason": classification["reason"], "findings": records}
 
 
@@ -844,6 +950,7 @@ def cycle(config, state, repository, web, model, state_dir, preview=False):
     run = {"started_at": now(), "errors": [], "processed": 0, "skipped": 0, "published_commit": None}
     state.setdefault("articles", {})
     state.setdefault("ledger", {})
+    web.publication_cache = state.setdefault("publication_cache", {})
     if config.get("tracked_upstream"):
         candidates, upstream = web.upstream(config["tracked_upstream"])
         run["tracked_upstream"] = state["tracked_upstream"] = upstream
@@ -869,8 +976,13 @@ def cycle(config, state, repository, web, model, state_dir, preview=False):
             continue
         try:
             article = web.article(url)
+            if config.get("tracked_upstream", {}).get("context_reports"):
+                article = web.add_context(article, config["tracked_upstream"])
             previous = state["articles"].get(url, {})
-            report_fingerprint = digest(str(RESEARCH_PROTOCOL) + article["hash"] + config["topic"])
+            context_hash = digest(json.dumps({"reports": [(entry["tracked_upstream"]["path"], entry["hash"])
+                for entry in article.get("context_reports", [])], "missing": article.get("missing_context_reports", []),
+                "profile": config.get("evaluation_profile")}, sort_keys=True))
+            report_fingerprint = digest(str(RESEARCH_PROTOCOL) + article["hash"] + config["topic"] + context_hash)
             fingerprint = digest(report_fingerprint + repository.code_hash)
             same_rejected = previous.get("status") == "rejected" and previous.get("report_fingerprint") == report_fingerprint
             if same_rejected or (previous.get("fingerprint") == fingerprint and previous.get("status") == "accepted"):
@@ -881,7 +993,7 @@ def cycle(config, state, repository, web, model, state_dir, preview=False):
                 run["skipped"] += 1
                 continue
             run["processed"] += 1
-            decision = investigate(article, repository, model, state["ledger"], config["topic"])
+            decision = investigate(article, repository, model, state["ledger"], config["topic"], config.get("evaluation_profile"))
             state["articles"][url] = {"status": decision["status"], "reason": decision["reason"], "fingerprint": fingerprint,
                                       "report_fingerprint": report_fingerprint, "last_attempt": now(), "final_url": article["url"]}
             # 来源修订不静默覆盖其他报告；同一机制的不同来源保留各自版本和日期。
@@ -898,7 +1010,7 @@ def cycle(config, state, repository, web, model, state_dir, preview=False):
     state["queue"] = list(dict.fromkeys(remaining))
     if state["ledger"]:
         original = repository.read(repository.homepage)
-        updated = update_homepage(original, render(state["ledger"], repository.code_hash, config.get("target", {}).get("remote", ""), state.get("tracked_upstream")))
+        updated = update_homepage(original, render(state["ledger"], repository.code_hash, config.get("target", {}).get("remote", ""), state.get("tracked_upstream"), config.get("evaluation_profile")))
         (state_dir / "README.preview.md").write_text(updated, encoding="utf-8")
         if config.get("publish", False) and not preview:
             try:
@@ -958,9 +1070,20 @@ def load_config(path):
         for filename in files:
             if safe_path(filename) != PurePosixPath(filename).name or not filename.endswith(".md"):
                 raise ValueError("上游报告须为版本目录下的 Markdown 文件")
+        context_files = upstream.get("context_reports", [])
+        if not isinstance(context_files, list) or len(context_files) > 4 or any(not isinstance(name, str) for name in context_files) or len(set(context_files)) != len(context_files):
+            raise ValueError("context_reports 必须为最多4项且不重复的报告文件名列表")
+        for filename in context_files:
+            if safe_path(filename) != PurePosixPath(filename).name or not filename.endswith(".md"):
+                raise ValueError("关联报告须为同版本目录下的 Markdown 文件")
+        context_limit = upstream.get("max_context_bytes", 128000)
+        if type(context_limit) is not int or not 1024 <= context_limit <= 256000:
+            raise ValueError("max_context_bytes 应在 1024 至 256000 之间")
         limit = upstream.get("max_report_bytes", 192000)
         if type(limit) is not int or not 48000 <= limit <= 256000:
             raise ValueError("max_report_bytes 应在 48000 至 256000 之间")
+    if config.get("evaluation_profile") not in (None, "unbundle_defaults"):
+        raise ValueError("evaluation_profile 仅支持 unbundle_defaults")
     target = config.get("target", {})
     for boolean in ("publish",):
         if type(config.get(boolean, False)) is not bool:

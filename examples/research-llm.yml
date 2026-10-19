@@ -10,6 +10,6 @@ llm:
   api_key_env: DEEPSEEK_API_KEY
   temperature: 0.1
   # 复核同时提供报告原文、代码与候选判断。
-  max_prompt_bytes: 196608
+  max_prompt_bytes: 524288
   timeout_seconds: 180
   max_retries: 1

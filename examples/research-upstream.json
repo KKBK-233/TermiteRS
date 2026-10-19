@@ -54,6 +54,12 @@
     "branch": "main",
     "versions_dir": "versions",
     "latest_versions": 1,
-    "max_report_bytes": 192000
-  }
+    "max_report_bytes": 192000,
+    "context_reports": [
+      "telemetry.md",
+      "environment-variables.md"
+    ],
+    "max_context_bytes": 128000
+  },
+  "evaluation_profile": "unbundle_defaults"
 }
