@@ -157,6 +157,44 @@ class UpstreamTests(unittest.TestCase):
             self.assertEqual(evidence["tracked_upstream"], source)
             self.assertIn("用户明确指定", evidence["upstream_policy"])
         self.assertEqual(result["findings"][0]["tracked_upstream"], source)
+        for _, evidence in received:
+            self.assertEqual(evidence["evaluation_basis"]["mode"], "report_baseline")
+            self.assertEqual(evidence["evaluation_basis"]["version"], "2.1.300")
+            self.assertEqual(evidence["article"]["body"], BODY)
+        self.assertEqual(result["findings"][0]["evaluation_basis"], received[0][1]["evaluation_basis"])
+
+    def test_report_baseline_is_not_applied_to_unrelated_sources(self):
+        received = []
+        model = FakeModel()
+        def capture(phase, evidence):
+            received.append(evidence)
+            return model(phase, evidence)
+        research.investigate({"url": URL, "body": BODY}, FakeRepository(), capture, {}, "研究")
+        self.assertTrue(all("evaluation_basis" not in evidence for evidence in received))
+
+    def test_not_triggered_requires_code_evidence_and_survives_review(self):
+        result = {"assessments": [{"id": "date-mark", "status": "not_triggered", "reason": "报告必要条件被代码关闭",
+                                  "code_evidence": [{"path": "src/relay.mjs", "quote": "return input;"}]}]}
+        checked = research.assess_result(result, [finding()], {"src/relay.mjs": CODE}, [])
+        reviewed = research.apply_verification({"verdicts": [{"id": "date-mark", "report_supported": True,
+            "supported": True, "reason": "条件与代码对应"}]}, checked)
+        self.assertEqual(reviewed["date-mark"]["status"], "not_triggered")
+        self.assertTrue(reviewed["date-mark"]["review_supported"])
+        result["assessments"][0]["code_evidence"] = []
+        self.assertEqual(research.assess_result(result, [finding()], {}, [])["date-mark"]["status"], "unknown")
+
+    def test_render_distinguishes_baseline_results_from_unmigrated_records(self):
+        article = {"url": URL, "body": BODY, "tracked_upstream": {"version": "2.1.300"}}
+        result = research.investigate(article, FakeRepository(), FakeModel(), {}, "研究")
+        record = result["findings"][0]
+        ledger = {"date-mark": {URL: record}}
+        upstream = {"repository": self.config["repository"], "commit": self.commit, "versions": ["2.1.300"]}
+        rendered = research.render(ledger, "code-v1", upstream=upstream)
+        self.assertIn("假设云端 CLI", rendered)
+        self.assertIn("| 未过滤 |", rendered)
+        self.assertNotIn("旧版标记不推定新版仍有", rendered)
+        record.pop("evaluation_basis")
+        self.assertIn("待重评（旧评估口径）", research.render(ledger, "code-v1", upstream=upstream))
 
     def test_fixed_source_cycle_does_not_search_or_requeue_old_sources(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -437,6 +475,15 @@ class ResearchTests(unittest.TestCase):
         self.assertIn(URL + "-second", self.state["queue"])
         self.cycle()
         self.assertEqual(len(self.model.calls), 6)
+
+    def test_policy_change_rechecks_unchanged_reports_then_deduplicates(self):
+        self.cycle()
+        self.assertEqual(len(self.model.calls), 3)
+        with patch.object(research, "RESEARCH_PROTOCOL", research.RESEARCH_PROTOCOL + 1):
+            self.cycle()
+            self.assertEqual(len(self.model.calls), 6)
+            self.cycle()
+            self.assertEqual(len(self.model.calls), 6)
 
     def test_unknown_and_missing_code_never_become_definite(self):
         result = {"assessments": [{"id": "date-mark", "status": "filtered", "reason": "候选判断", "code_evidence": []}]}
