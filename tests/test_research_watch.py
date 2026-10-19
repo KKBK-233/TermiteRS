@@ -106,6 +106,9 @@ class UpstreamTests(unittest.TestCase):
         elif "/contents/versions/2.1.300?" in url:
             data = [{"type": "file", "name": "device-fingerprinting.md", "path": self.path, "sha": self.blob},
                     {"type": "file", "name": "bundle.js", "path": "versions/2.1.300/bundle.js", "sha": self.blob}]
+        elif "/commits?" in url:
+            data = [{"sha": "b" * 40, "commit": {"committer": {"date": "2026-10-19T01:00:00Z"}}},
+                    {"sha": "c" * 40, "commit": {"committer": {"date": "2026-10-17T02:00:00Z"}}}]
         elif "raw.githubusercontent.com/" in url:
             return url, BODY, "text/plain"
         else:
@@ -120,8 +123,9 @@ class UpstreamTests(unittest.TestCase):
         self.assertEqual(len(urls), 1)
         self.assertEqual(article["body"], BODY)
         self.assertEqual(article["tracked_upstream"]["commit"], self.commit)
-        self.assertIn("/" + self.commit + "/" + self.path, self.requests[-1])
-        self.assertIsNone(article["published"])
+        self.assertTrue(any("/" + self.commit + "/" + self.path in url for url in self.requests))
+        self.assertEqual(article["published"]["value"], "2026-10-17")
+        self.assertEqual(article["published"]["kind"], "上游报告提交日期")
 
     def test_large_markdown_is_retained_whole_under_upstream_specific_limit(self):
         with patch.object(self.web, "get", side_effect=self.get):
@@ -163,6 +167,115 @@ class UpstreamTests(unittest.TestCase):
             self.assertEqual(evidence["article"]["body"], BODY)
         self.assertEqual(result["findings"][0]["evaluation_basis"], received[0][1]["evaluation_basis"])
 
+    def test_context_report_survives_primary_file_filter_and_keeps_same_snapshot(self):
+        other_path = "versions/2.1.300/telemetry.md"
+        context_body = "Shared control: essential-only is enabled by NONESSENTIAL=1. " + BODY
+        blob = research.hashlib.sha1(b"blob " + str(len(context_body.encode())).encode() + b"\0" + context_body.encode()).hexdigest()
+        def get(url, headers=None):
+            if "/contents/versions/2.1.300?" in url:
+                return url, json.dumps([
+                    {"type": "file", "name": "device-fingerprinting.md", "path": self.path, "sha": self.blob},
+                    {"type": "file", "name": "telemetry.md", "path": other_path, "sha": blob}]), "application/json"
+            if "raw.githubusercontent.com" in url and url.endswith("telemetry.md"):
+                self.assertIn(self.commit, url)
+                return url, context_body, "text/plain"
+            return self.get(url, headers)
+        config = {**self.config, "report_files": ["device-fingerprinting.md"], "context_reports": ["telemetry.md"]}
+        with patch.object(self.web, "get", side_effect=get):
+            urls, _ = self.web.upstream(config)
+            self.assertEqual(len(urls), 1)
+            article = self.web.add_context(self.web.article(urls[0]), config)
+        self.assertEqual(article["context_reports"][0]["body"], context_body)
+        self.assertEqual(article["context_reports"][0]["tracked_upstream"]["commit"], self.commit)
+        self.assertEqual(article["missing_context_reports"], [])
+
+    def test_context_missing_and_size_limit_are_explicit(self):
+        with patch.object(self.web, "get", side_effect=self.get):
+            urls, _ = self.web.upstream(self.config)
+            article = self.web.article(urls[0])
+            result = self.web.add_context(article, {"context_reports": ["telemetry.md"]})
+        self.assertEqual(result["missing_context_reports"], ["telemetry.md"])
+        self.assertEqual(result["context_reports"], [])
+        context = {**article["tracked_upstream"], "path": "versions/2.1.300/telemetry.md"}
+        self.web.upstream_sources[URL] = context
+        with patch.object(self.web, "article", return_value={"body": BODY, "tracked_upstream": context}):
+            with self.assertRaisesRegex(ValueError, "关联报告总正文"):
+                self.web.add_context(article, {"context_reports": ["telemetry.md"], "max_context_bytes": 10})
+        self.web.upstream_sources[URL]["version"] = "2.1.299"
+        result = self.web.add_context(article, {"context_reports": ["telemetry.md"]})
+        self.assertEqual(result["missing_context_reports"], ["telemetry.md"])
+
+    def test_repository_publication_is_cached_and_failure_does_not_block_body(self):
+        with patch.object(self.web, "get", side_effect=self.get):
+            urls, _ = self.web.upstream(self.config)
+            first = self.web.article(urls[0])
+            second = self.web.article(urls[0])
+        self.assertEqual(first["published"], second["published"])
+        self.assertEqual(sum("/commits?" in url for url in self.requests), 1)
+        self.web.publication_cache.clear()
+        with patch.object(self.web, "get", side_effect=OSError("rate limit")):
+            article = self.web.article(urls[0])
+        self.assertEqual(article["body"], BODY)
+        self.assertIsNone(article["published"])
+
+    def test_default_profile_shares_context_with_evaluation_and_verification(self):
+        primary = {"url": URL, "body": BODY, "tracked_upstream": {"path": self.path, "version": "2.1.300"}}
+        context = {"url": URL + "/telemetry", "body": "Shared control evidence", "tracked_upstream": {"path": "versions/2.1.300/telemetry.md"}}
+        article = {**primary, "context_reports": [context]}
+        received = []
+        model = FakeModel()
+        def capture(phase, evidence):
+            received.append((phase, evidence))
+            return model(phase, evidence)
+        result = research.investigate(article, FakeRepository(), capture, {}, "研究", "unbundle_defaults")
+        self.assertNotIn("context_reports", received[0][1]["article"])
+        for _, evidence in received[1:]:
+            self.assertEqual(evidence["article"]["context_reports"], [context])
+            self.assertEqual(evidence["deployment_profile"]["name"], "Unbundle 默认配置")
+        self.assertEqual(result["findings"][0]["evaluation_profile"], "unbundle_defaults")
+
+    def test_not_triggered_needs_matching_report_control_evidence(self):
+        path = "versions/2.1.300/telemetry.md"
+        sources = {path: {"body": "essential-only is enabled by NONESSENTIAL=1", "url": URL}}
+        result = {"assessments": [{"id": "date-mark", "status": "not_triggered", "reason": "默认关闭", "summary": "默认关闭对应上报。",
+                                  "code_evidence": [{"path": "src/relay.mjs", "quote": "return input;"}],
+                                  "report_evidence": [{"path": path, "quote": sources[path]["body"]}]}]}
+        checked = research.assess_result(result, [finding()], {"src/relay.mjs": CODE}, [], sources)
+        self.assertEqual(checked["date-mark"]["status"], "not_triggered")
+        self.assertEqual(checked["date-mark"]["report_evidence"][0]["url"], URL)
+        result["assessments"][0]["report_evidence"][0]["quote"] = "fabricated"
+        with self.assertRaisesRegex(ValueError, "报告控制引用"):
+            research.assess_result(result, [finding()], {"src/relay.mjs": CODE}, [], sources)
+        result["assessments"][0]["report_evidence"] = []
+        with self.assertRaisesRegex(ValueError, "不触发结论必须引用"):
+            research.assess_result(result, [finding()], {"src/relay.mjs": CODE}, [], sources)
+
+    def test_default_summary_keeps_history_folded_and_stale_claims_out_of_table(self):
+        article = {"url": URL, "body": BODY, "tracked_upstream": {"path": self.path, "version": "2.1.300", "repository": self.config["repository"]}}
+        record = research.investigate(article, FakeRepository(), FakeModel(), {}, "研究", "unbundle_defaults")["findings"][0]
+        record["finding"]["version"]["value"] = "2.1.300"
+        record["assessment"].update(status="not_triggered", summary="默认关闭该上报。")
+        historical = json.loads(json.dumps(record))
+        historical["tracked_upstream"] = {}
+        historical["finding"]["label"] = "旧来源独立记录"
+        ledger = {"date-mark": {URL: record, URL + "/old": historical}}
+        upstream = {"repository": self.config["repository"], "commit": self.commit, "versions": ["2.1.300"]}
+        rendered = research.render(ledger, "code-v1", upstream=upstream, evaluation_profile="unbundle_defaults")
+        table, details = rendered.split("<details>", 1)
+        self.assertIn("默认配置结论", table)
+        self.assertIn("默认关闭该上报。", table)
+        self.assertNotIn("旧来源独立记录", table)
+        self.assertIn("旧来源独立记录", details)
+        stale = research.render(ledger, "changed", upstream=upstream, evaluation_profile="unbundle_defaults")
+        self.assertNotIn("默认关闭该上报。", stale.split("<details>")[0])
+
+    def test_failed_review_clears_a_definite_short_summary(self):
+        assessments = {"date-mark": {"status": "not_triggered", "reason": "候选理由", "summary": "默认关闭。", "code_evidence": []}}
+        verdicts = {"verdicts": [{"id": "date-mark", "report_supported": True, "supported": False, "reason": "没有对应控制条件"}]}
+        checked = research.apply_verification(verdicts, assessments)
+        self.assertEqual(checked["date-mark"]["status"], "unknown")
+        self.assertNotIn("默认关闭", checked["date-mark"]["summary"])
+
     def test_report_baseline_is_not_applied_to_unrelated_sources(self):
         received = []
         model = FakeModel()
@@ -184,7 +297,7 @@ class UpstreamTests(unittest.TestCase):
         self.assertEqual(research.assess_result(result, [finding()], {}, [])["date-mark"]["status"], "unknown")
 
     def test_render_distinguishes_baseline_results_from_unmigrated_records(self):
-        article = {"url": URL, "body": BODY, "tracked_upstream": {"version": "2.1.300"}}
+        article = {"url": URL, "body": BODY, "tracked_upstream": {"version": "2.1.300", "path": self.path, "repository": self.config["repository"]}}
         result = research.investigate(article, FakeRepository(), FakeModel(), {}, "研究")
         record = result["findings"][0]
         ledger = {"date-mark": {URL: record}}
@@ -313,7 +426,7 @@ class ResearchTests(unittest.TestCase):
             return result
         self.model = model
         self.assertFalse(self.cycle()['errors'])
-        self.assertIn('发现时间：未说明（以来源首发时间为准）', self.repo.original)
+        self.assertIn('发现时间：未说明（上游未提供可用日期）', self.repo.original)
 
     def test_publication_updates_without_reanalyzing_mechanisms(self):
         self.cycle()
@@ -475,6 +588,21 @@ class ResearchTests(unittest.TestCase):
         self.assertIn(URL + "-second", self.state["queue"])
         self.cycle()
         self.assertEqual(len(self.model.calls), 6)
+
+    def test_context_change_rechecks_but_publication_date_change_does_not(self):
+        self.config["tracked_upstream"] = {"context_reports": ["telemetry.md"]}
+        self.web.upstream = lambda config: ([URL], {"repository": "https://github.com/example/reports", "commit": "a" * 40, "versions": ["2.1.300"]})
+        context = {"url": URL + "/context", "body": "control v1", "hash": "context-v1", "tracked_upstream": {"path": "versions/2.1.300/telemetry.md"}}
+        self.web.add_context = lambda article, config: {**article, "context_reports": [context]}
+        self.cycle()
+        self.assertEqual(len(self.model.calls), 3)
+        context["hash"] = "context-v2"
+        self.cycle()
+        self.assertEqual(len(self.model.calls), 6)
+        self.web.article = lambda url: {"url": url, "body": BODY, "hash": research.digest(BODY), "published": {"value": "2026-10-19", "kind": "上游报告提交日期"}}
+        self.cycle()
+        self.assertEqual(len(self.model.calls), 6)
+        self.assertEqual(self.state["ledger"]["date-mark"][URL]["published"]["value"], "2026-10-19")
 
     def test_policy_change_rechecks_unchanged_reports_then_deduplicates(self):
         self.cycle()
