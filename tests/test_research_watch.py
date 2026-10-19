@@ -272,6 +272,17 @@ class UpstreamTests(unittest.TestCase):
         self.assertIn(self.path, str(caught.exception))
         self.assertIn("fabricated quote", str(caught.exception))
 
+    def test_report_quote_correction_receives_all_invalid_references(self):
+        sources = {self.path: {"body": BODY, "url": URL}}
+        findings = [finding(), {**finding(), "id": "second-mark"}]
+        result = {"assessments": [{"id": item["id"], "status": "not_triggered", "reason": "默认关闭",
+            "code_evidence": [{"path": "src/relay.mjs", "quote": "return input;"}],
+            "report_evidence": [{"path": URL, "quote": "fabricated " + item["id"]}]} for item in findings]}
+        with self.assertRaises(ValueError) as caught:
+            research.assess_result(result, findings, {"src/relay.mjs": CODE}, [], sources)
+        self.assertIn("fabricated date-mark", str(caught.exception))
+        self.assertIn("fabricated second-mark", str(caught.exception))
+
     def test_default_summary_keeps_history_folded_and_stale_claims_out_of_table(self):
         article = {"url": URL, "body": BODY, "tracked_upstream": {"path": self.path, "version": "2.1.300", "repository": self.config["repository"]}}
         record = research.investigate(article, FakeRepository(), FakeModel(), {}, "研究", "unbundle_defaults")["findings"][0]

@@ -729,6 +729,7 @@ def assess_result(result, findings, files, unavailable, report_sources=None):
     if not isinstance(assessments, list) or len(assessments) != len(ids) or {a.get("id") for a in assessments} != ids:
         raise ValueError("代码判断未完整对应机制清单")
     validated = {}
+    report_errors = []
     for item in assessments:
         status = item.get("status")
         if status not in STATUSES:
@@ -760,15 +761,20 @@ def assess_result(result, findings, files, unavailable, report_sources=None):
                 if len(matches) == 1:
                     path = matches[0]
             if report_sources is None or path not in report_sources:
-                raise ValueError(f"报告控制引用路径无效：{item['id']}；允许路径：{list(report_sources or {})}")
+                report_errors.append(f"报告控制引用路径无效：{item['id']}；允许路径：{list(report_sources or {})}")
+                continue
             if snippet not in report_sources[path]["body"]:
-                raise ValueError(f"报告控制引用不匹配：{item['id']}，{path}，引用={snippet!r}；须逐字连续引用，不能添加反引号或改写空白")
+                report_errors.append(f"报告控制引用不匹配：{item['id']}，{path}，引用={snippet!r}；须逐字连续引用，不能添加反引号或改写空白")
+                continue
             report_evidence.append({"path": path, "quote": snippet, "url": report_sources[path]["url"]})
         if status == "not_triggered" and report_sources is not None and not report_evidence:
-            raise ValueError("不触发结论必须引用报告的触发条件或禁用控制依据")
+            report_errors.append(f"不触发结论必须引用报告的触发条件或禁用控制依据：{item['id']}")
         summary = text(item.get("summary", reason), "结论简述", 1500)
         validated[item["id"]] = {"status": status, "reason": reason, "summary": summary,
                                  "code_evidence": verified, "report_evidence": report_evidence}
+    # 一次反馈全部报告引用错误，避免模型修好第一项后才看到下一项。
+    if report_errors:
+        raise ValueError("\n".join(report_errors))
     return validated
 
 
