@@ -1,0 +1,16 @@
+# 远程画面入口：公网访问交给 HTTPS 反向代理，WebSocket 必须携带限时令牌。
+[Unit]
+Description=TermiteRS Google verification web viewer
+Requires=termiters-research-display.service
+After=termiters-research-display.service
+StopWhenUnneeded=yes
+
+[Service]
+User=termiters
+Group=termiters
+ExecStart=/usr/bin/websockify --quiet --web /usr/share/novnc --token-plugin TokenFile --token-source /var/lib/termiters/research/google-vnc-tokens 127.0.0.1:6080
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+UMask=0077

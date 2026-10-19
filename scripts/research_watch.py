@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import secrets
 import signal
 import socket
 import sqlite3
@@ -232,11 +233,223 @@ def google_results(body):
     return parser.results
 
 
+class GoogleVerificationRequired(ValueError):
+    """人工验证未完成时停止本轮后续查询，保留断点。"""
+
+
+class GoogleBrowser:
+    """复用专用浏览器配置；验证码只交给人工操作，不自动点击。"""
+
+    def __init__(self, directory, budget, notifier_executable=None):
+        self.directory, self.budget = Path(directory), budget
+        self.context = self.playwright = self.lock = None
+        self.notifier_executable = notifier_executable
+        self.access_active = False
+
+    def status(self, status, query, **extra):
+        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        record = {"status": status, "query": query, "updated_at": now(), **extra}
+        target = self.directory / "google-verification.json"
+        temporary = target.with_suffix(".tmp")
+        temporary.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(target)
+
+    def revoke_access(self):
+        """撤销手机接手令牌；只允许创建令牌的浏览器实例撤销。"""
+        if self.access_active:
+            (self.directory / "google-vnc-tokens").write_text("", encoding="utf-8")
+            access = self.directory / "google-verification-access.json"
+            access.unlink(missing_ok=True)
+            self.access_active = False
+
+    def notify(self, query, config):
+        """生成限时手机入口，复用现有邮件通道；不在日志中输出访问令牌。"""
+        base = config.get("verification_public_url")
+        if not base:
+            return
+        seconds = config.get("verification_wait_seconds", 1200)
+        token = secrets.token_urlsafe(32)
+        # websockify 只接受随机令牌映射的回环 VNC 目标，令牌在浏览器关闭时撤销。
+        (self.directory / "google-vnc-tokens").write_text(token + ": 127.0.0.1:5977\n", encoding="utf-8")
+        self.access_active = True
+        path = urlsplit(base).path.strip("/") + "/websockify?token=" + token
+        url = base.rstrip("/") + "/vnc.html?" + urlencode(
+            {"autoconnect": "true", "resize": "scale", "path": path, "show_dot": "true"})
+        expires_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + seconds))
+        request = {"query": query, "url": url, "expires_at": expires_at}
+        target = self.directory / "google-verification-access.json"
+        target.write_text(json.dumps(request, ensure_ascii=False, indent=2), encoding="utf-8")
+        if os.name != "nt":
+            target.chmod(0o600)
+            (self.directory / "google-vnc-tokens").chmod(0o600)
+        if not config.get("notification_config") or not self.notifier_executable:
+            return
+        try:
+            result = subprocess.run(
+                [self.notifier_executable, "research", "notify-google", "--config", config["notification_config"],
+                 "--input", str(target)], capture_output=True, timeout=self.budget.timeout(30))
+            if result.returncode:
+                raise RuntimeError("邮件命令未成功，请检查通知服务配置")
+            print("Google 人工验证邮件已交给现有通知通道发送。", flush=True)
+        except Exception as error:
+            # 邮件失败不销毁已经打开的验证窗口，也不泄露 URL 或 SMTP 凭据。
+            print("Google 人工验证通知失败：" + type(error).__name__, flush=True)
+
+    def start(self, config):
+        if self.context is not None:
+            return self.context
+        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if os.name != "nt":
+            self.directory.chmod(0o700)
+        # 独立事务锁覆盖浏览器整个生命周期，人工与定时入口不能同时占用配置。
+        self.lock = sqlite3.connect(self.directory / "google-browser-lock.sqlite3", timeout=0, isolation_level=None)
+        try:
+            self.lock.execute("BEGIN IMMEDIATE")
+            from playwright.sync_api import sync_playwright
+            self.playwright = sync_playwright().start()
+            allowed = {"PATH", "HOME", "LANG", "TMPDIR", "TEMP", "TMP", "PLAYWRIGHT_BROWSERS_PATH",
+                       "SystemRoot", "WINDIR", "DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR"}
+            browser_env = {key: value for key, value in os.environ.items() if key in allowed}
+            self.context = self.playwright.chromium.launch_persistent_context(
+                str(self.directory / "google-profile"), headless=config.get("browser_headless", True),
+                env=browser_env, viewport={"width": 1280, "height": 850},
+                args=["--window-size=1280,950", "--no-first-run"])
+            return self.context
+        except BaseException:
+            self.close()
+            raise
+
+    @staticmethod
+    def results(page, query):
+        # 仅接受原查询的 Google 搜索页；验证页、首页和手动跳转页面均不算成功。
+        parsed = urlsplit(page.url)
+        if parsed.scheme != "https" or parsed.hostname not in {"www.google.com", "google.com"}:
+            return None
+        if parsed.path != "/search" or parse_qs(parsed.query).get("q") != [query]:
+            return None
+        rows = page.locator("a:has(h3)").evaluate_all(
+            "elements => elements.map(a => [a.href, a.innerText])")
+        links = []
+        for href, title in rows:
+            if href.startswith("https://www.google.com/url?"):
+                values = parse_qs(urlsplit(href).query)
+                href = (values.get("q") or values.get("url") or [""])[0]
+            try:
+                url = normalized_url(href)
+            except ValueError:
+                continue
+            host = urlsplit(url).hostname
+            if host != "google.com" and not host.endswith(".google.com"):
+                links.append((url, title))
+        if links:
+            return links
+        body = page.locator("body").inner_text().lower()
+        if any(marker in body for marker in ("did not match any documents", "no results found")):
+            return []
+        return None
+
+    def search(self, query, config):
+        context = self.start(config)
+        page = context.pages[0] if context.pages else context.new_page()
+        endpoint = "https://www.google.com/search?" + urlencode(
+            {"q": query, "num": config.get("max_results", 10), "hl": "en", "udm": 14})
+        self.status("searching", query)
+        page.goto(endpoint, wait_until="domcontentloaded", timeout=int(self.budget.timeout(45) * 1000))
+        page.wait_for_function(
+            "document.querySelector('a h3') || location.pathname.startsWith('/sorry/') || "
+            "/did not match any documents|no results found/i.test(document.body.innerText)",
+            timeout=int(self.budget.timeout(30) * 1000))
+        if urlsplit(page.url).path.startswith("/sorry/"):
+            seconds = config.get("verification_wait_seconds", 1200)
+            deadline = time.monotonic() + self.budget.timeout(max(seconds, 0.01))
+            self.status("needs_verification", query, wait_seconds=seconds)
+            self.notify(query, config)
+            print("Google 需要人工验证，请通过 SSH 隧道接手服务器浏览器；程序暂停页面操作。", flush=True)
+            if config.get("browser_headless", True) or seconds == 0:
+                raise GoogleVerificationRequired("Google 需要人工验证；请运行 research verify-google")
+            while time.monotonic() < deadline:
+                if page.is_closed():
+                    self.status("interrupted", query)
+                    raise GoogleVerificationRequired("人工验证页面已关闭，下次从断点继续")
+                # 此处只观察页面，不点击、刷新或跳转，避免与人工争抢控制权。
+                results = self.results(page, query)
+                if results is not None:
+                    self.status("verified", query, result_count=len(results))
+                    self.revoke_access()
+                    return results
+                page.wait_for_timeout(min(1000, max(1, (deadline - time.monotonic()) * 1000)))
+            self.status("verification_timeout", query)
+            raise GoogleVerificationRequired("人工验证等待超时，进度已保留")
+        results = self.results(page, query)
+        if results is None:
+            self.status("unrecognized_page", query)
+            raise ValueError("Google 页面未包含原查询的可解析结果，未视为验证成功")
+        self.status("ready", query, result_count=len(results))
+        return results
+
+    def close(self):
+        self.revoke_access()
+        try:
+            if self.context is not None:
+                self.context.close()
+        finally:
+            self.context = None
+            try:
+                if self.playwright is not None:
+                    self.playwright.stop()
+            finally:
+                self.playwright = None
+                if self.lock is not None:
+                    self.lock.close()
+                    self.lock = None
+
+
 class Web:
     """逐跳核对公网地址并固定连接 IP，阻止重定向和 DNS 重绑定读取内网。"""
 
-    def __init__(self, budget, timeout=30, max_bytes=1048576):
+    def __init__(self, budget, timeout=30, max_bytes=1048576, browser_state_dir=None, notifier_executable=None):
         self.budget, self.seconds, self.max_bytes = budget, timeout, max_bytes
+        self.browser = GoogleBrowser(browser_state_dir, budget, notifier_executable) if browser_state_dir else None
+        self.pending_queries = []
+
+    def close(self):
+        if self.browser:
+            self.browser.close()
+
+    def progress(self, config):
+        """搜索结果在验证码中断前落盘，恢复时不重搜已经完成的关键词。"""
+        fingerprint = digest(json.dumps(config, sort_keys=True, ensure_ascii=False))
+        record = {"fingerprint": fingerprint, "completed": {}}
+        if self.browser:
+            path = self.browser.directory / "google-search-progress.json"
+            if path.exists():
+                saved = json.loads(path.read_text(encoding="utf-8"))
+                if saved.get("fingerprint") == fingerprint and saved.get("pending_queries"):
+                    record = saved
+        return record
+
+    def save_progress(self, config, record):
+        self.pending_queries = [q for q in config["queries"] if q not in record["completed"]]
+        record.update(pending_queries=self.pending_queries, updated_at=now())
+        if self.browser:
+            self.browser.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            target = self.browser.directory / "google-search-progress.json"
+            temporary = target.with_suffix(".tmp")
+            temporary.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.replace(target)
+
+    def verify_google(self, config):
+        if not self.browser or not config.get("browser_persistent") or config.get("browser_headless", True):
+            raise ValueError("人工验证需要配置 browser_enabled=true、browser_persistent=true、browser_headless=false")
+        self.browser.start(config)
+        progress = self.progress(config)
+        query = next((q for q in config["queries"] if q not in progress["completed"]), config["queries"][0])
+        self.save_progress(config, progress)
+        results = self.google(query, config)
+        progress["completed"][query] = results
+        self.save_progress(config, progress)
+        return {"query": query, "result_count": len(results), "results": results,
+                "pending_queries": self.pending_queries, "model_calls": 0}
 
     def get(self, url, headers=None):
         url = normalized_url(url)
@@ -305,6 +518,10 @@ class Web:
         return {"url": final_url, "body": body, "hash": digest(body), "published": published}
 
     def google(self, query, config):
+        if config.get("browser_persistent", False):
+            if not self.browser:
+                raise ValueError("持久浏览器需要专用状态目录")
+            return self.browser.search(query, config)
         endpoint = "https://www.google.com/search?" + urlencode({"q": query, "num": config.get("max_results", 10), "hl": "en", "udm": 14})
         _, body, _ = self.get(endpoint)
         try:
@@ -341,10 +558,22 @@ class Web:
         if not config.get("enabled", True):
             return [], []
         links, errors = [], []
+        persistent = config.get("provider") == "google" and config.get("browser_persistent", False)
+        if persistent:
+            self.browser.start(config)
+        progress = self.progress(config) if persistent else None
+        if persistent:
+            self.save_progress(config, progress)
         for query in config["queries"]:
             try:
                 if config.get("provider", "bing_rss") == "google":
-                    results = self.google(query, config)
+                    if persistent and query in progress["completed"]:
+                        results = progress["completed"][query]
+                    else:
+                        results = self.google(query, config)
+                        if persistent:
+                            progress["completed"][query] = results
+                            self.save_progress(config, progress)
                 elif config.get("provider", "bing_rss") == "brave":
                     key = os.environ[config.get("api_key_env", "BRAVE_SEARCH_API_KEY")]
                     endpoint = "https://api.search.brave.com/res/v1/web/search?" + urlencode({"q": query, "count": config.get("max_results", 10)})
@@ -369,6 +598,8 @@ class Web:
                         continue
             except Exception as error:
                 errors.append(f"搜索 {query}: {type(error).__name__}: {str(error)[:180]}")
+                if isinstance(error, GoogleVerificationRequired):
+                    break
         return list(dict.fromkeys(links)), errors
 
 
@@ -762,6 +993,7 @@ def cycle(config, state, repository, web, model, state_dir, preview=False):
     state.setdefault("ledger", {})
     candidates, errors = web.search(config["search"])
     run["errors"].extend(errors)
+    run["pending_search_queries"] = getattr(web, "pending_queries", [])
     # 已核验的报告持续追踪，覆盖报告修订和代码升级，不依赖搜索排序始终命中。
     candidates = config["search"].get("seed_urls", []) + candidates
     candidates += [url for url, value in state["articles"].items() if value.get("status") in {"accepted", "pending"}]
@@ -833,8 +1065,20 @@ def load_config(path):
         raise ValueError("search.enabled 必须为布尔值")
     if search.get("provider", "bing_rss") not in {"google", "bing_rss", "brave"}:
         raise ValueError("不支持的搜索提供方")
-    if type(search.get("browser_enabled", False)) is not bool:
-        raise ValueError("browser_enabled 必须为布尔值")
+    for key, default in (("browser_enabled", False), ("browser_persistent", False), ("browser_headless", True)):
+        if type(search.get(key, default)) is not bool:
+            raise ValueError(f"{key} 必须为布尔值")
+    wait = search.get("verification_wait_seconds", 1200)
+    if type(wait) is not int or not 0 <= wait <= 3600:
+        raise ValueError("verification_wait_seconds 应在 0 至 3600 之间")
+    if search.get("browser_persistent") and (not search.get("browser_enabled") or search.get("provider") != "google"):
+        raise ValueError("持久浏览器仅用于已启用浏览器的 Google 搜索")
+    if search.get("verification_public_url"):
+        normalized_url(search["verification_public_url"])
+        if not search.get("browser_persistent") or search.get("browser_headless", True):
+            raise ValueError("手机接手入口需要带界面的持久浏览器")
+    if search.get("notification_config"):
+        search["notification_config"] = str((path.parent / search["notification_config"]).resolve())
     queries = search.get("queries")
     if not isinstance(queries, list) or not 1 <= len(queries) <= 12:
         raise ValueError("需要配置 1 至 12 个关键词查询")
@@ -888,14 +1132,26 @@ def load_config(path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path)
-    parser.add_argument("--termiters", required=True)
+    parser.add_argument("--termiters")
     parser.add_argument("--preview", action="store_true")
+    parser.add_argument("--verify-google", action="store_true", help="仅人工验证一个 Google 查询，不调用模型或发布")
     args = parser.parse_args()
     config = load_config(args.config)
     state_dir = Path(config["state_dir"])
     state_dir.mkdir(parents=True, exist_ok=True)
     if os.name != "nt":
         state_dir.chmod(0o700)
+    if args.verify_google:
+        web = Web(Budget(min(7200, config["search"].get("verification_wait_seconds", 1200) + 120)),
+                  config["http_timeout_seconds"], browser_state_dir=state_dir, notifier_executable=args.termiters)
+        try:
+            print(json.dumps(web.verify_google(config["search"]), ensure_ascii=False, indent=2), flush=True)
+            return 0
+        finally:
+            web.close()
+    if not args.termiters:
+        parser.error("正常研究需要 --termiters")
+    web = None
     # SQLite 事务锁随进程退出自动释放，避免掉电遗留锁文件阻断后续调度。
     connection = sqlite3.connect(state_dir / "state.sqlite3", timeout=0, isolation_level=None)
     try:
@@ -914,7 +1170,7 @@ def main():
             signal.setitimer(signal.ITIMER_REAL, max(0.1, config["timeout_seconds"] - 1))
         try:
             repository = Repository(config["target"], state_dir, budget).refresh()
-            web = Web(budget, config["http_timeout_seconds"])
+            web = Web(budget, config["http_timeout_seconds"], browser_state_dir=state_dir, notifier_executable=args.termiters)
             model = Model(args.termiters, config["llm_config"], budget, config["model_timeout_seconds"], state_dir / "model-cache")
             result = cycle(config, state, repository, web, model, state_dir, args.preview)
         except Exception as error:
@@ -926,6 +1182,8 @@ def main():
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 1 if result["errors"] else 0
     finally:
+        if web is not None:
+            web.close()
         if os.name != "nt":
             signal.setitimer(signal.ITIMER_REAL, 0)
         connection.close()
