@@ -1,6 +1,6 @@
 [package]
 name = "TermiteRS"
-version = "1.26.4"
+version = "1.26.5"
 edition = "2024"
 build = "build.rs"
 
