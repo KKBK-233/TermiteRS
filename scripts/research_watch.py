@@ -3,6 +3,7 @@
 import argparse
 import contextlib
 from datetime import date, datetime
+from difflib import get_close_matches
 import hashlib
 import html
 from html.parser import HTMLParser
@@ -764,7 +765,9 @@ def assess_result(result, findings, files, unavailable, report_sources=None):
                 report_errors.append(f"报告控制引用路径无效：{item['id']}；允许路径：{list(report_sources or {})}")
                 continue
             if snippet not in report_sources[path]["body"]:
-                report_errors.append(f"报告控制引用不匹配：{item['id']}，{path}，引用={snippet!r}；须逐字连续引用，不能添加反引号或改写空白")
+                # 相近行只帮助定位，仍拒绝当前引用，必须由模型重读并逐字修正。
+                nearby = get_close_matches(snippet, report_sources[path]["body"].splitlines(), n=2, cutoff=0.5)
+                report_errors.append(f"报告控制引用不匹配：{item['id']}，{path}，引用={snippet!r}；须逐字连续引用，不能添加反引号或改写空白；相近原文行（仅供定位，须核对语义）：{nearby!r}")
                 continue
             report_evidence.append({"path": path, "quote": snippet, "url": report_sources[path]["url"]})
         if status == "not_triggered" and report_sources is not None and not report_evidence:

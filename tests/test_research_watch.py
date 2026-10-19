@@ -283,6 +283,21 @@ class UpstreamTests(unittest.TestCase):
         self.assertIn("fabricated date-mark", str(caught.exception))
         self.assertIn("fabricated second-mark", str(caught.exception))
 
+    def test_similar_source_line_is_feedback_not_accepted_evidence(self):
+        original = "| feature | false | Artifact comments (env FLAG_NAME). |"
+        altered = original.replace("FLAG_NAME", "`FLAG_NAME`")
+        sources = {self.path: {"body": original, "url": URL}}
+        result = {"assessments": [{"id": "date-mark", "status": "not_triggered", "reason": "默认关闭",
+            "code_evidence": [{"path": "src/relay.mjs", "quote": "return input;"}],
+            "report_evidence": [{"path": URL, "quote": altered}]}]}
+        with self.assertRaises(ValueError) as caught:
+            research.assess_result(result, [finding()], {"src/relay.mjs": CODE}, [], sources)
+        self.assertIn(original, str(caught.exception))
+        self.assertEqual(result["assessments"][0]["report_evidence"][0]["quote"], altered)
+        result["assessments"][0]["report_evidence"][0]["quote"] = original
+        checked = research.assess_result(result, [finding()], {"src/relay.mjs": CODE}, [], sources)
+        self.assertEqual(checked["date-mark"]["status"], "not_triggered")
+
     def test_default_summary_keeps_history_folded_and_stale_claims_out_of_table(self):
         article = {"url": URL, "body": BODY, "tracked_upstream": {"path": self.path, "version": "2.1.300", "repository": self.config["repository"]}}
         record = research.investigate(article, FakeRepository(), FakeModel(), {}, "研究", "unbundle_defaults")["findings"][0]
