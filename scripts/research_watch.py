@@ -26,9 +26,14 @@ import xml.etree.ElementTree as ET
 
 START = "<!-- termiters:research:start -->"
 END = "<!-- termiters:research:end -->"
-RESEARCH_PROTOCOL = 3
-MODEL_PROTOCOL = 4
-STATUSES = {"filtered": "已过滤", "unfiltered": "未过滤", "partial": "部分过滤", "unknown": "待核实"}
+RESEARCH_PROTOCOL = 4
+MODEL_PROTOCOL = 5
+REPORT_BASELINE = {
+    "mode": "report_baseline",
+    "assumption": "假设云端 CLI 为指定上游本轮选中的报告版本，并按报告描述运行；这是评估前提，不是实际部署版本检测结果。",
+    "scope": "以报告中的机制与触发条件为依据，只判断目标网关的过滤、透传及触发条件控制；不自行逆向 CLI，不要求动态提取或验证报告中的 CLI 内部实现。",
+}
+STATUSES = {"filtered": "已过滤", "unfiltered": "未过滤", "partial": "部分过滤", "not_triggered": "当前配置不触发", "unknown": "待核实"}
 SUFFIXES = {".rs", ".go", ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".java", ".kt"}
 
 
@@ -691,6 +696,7 @@ def apply_verification(result, assessments):
         reason = text(verdict.get("reason"), "复核理由")
         if not verdict["report_supported"]:
             raise ReportEvidenceFailure("报告机制或日期复核未通过：" + reason)
+        assessments[verdict["id"]].update(review_supported=verdict["supported"], review_reason=reason)
         if not verdict["supported"]:
             assessments[verdict["id"]].update(status="unknown", reason="复核未通过：" + reason)
     return assessments
@@ -726,6 +732,9 @@ def render(ledger, current_hash, remote="", upstream=None):
              "| 报告版本 | 机制 | 过滤 | 触发条件（摘要） | 发现时间 |", "| --- | --- | --- | --- | --- |"]
     if upstream:
         lines[5:5] = [f"固定研究上游：[{escape(upstream['repository'].removeprefix('https://github.com/'))}]({report_link(upstream['repository'])})；本轮读取提交 [`{upstream['commit'][:12]}`]({upstream['repository']}/commit/{upstream['commit']})。报告目录版本：{escape('、'.join(upstream['versions']))}（不代表官方最新发布版本）。历史来源保留供查证。", ""]
+    if upstream:
+        lines[3] = "评估前提：假设云端 CLI 为指定上游本轮选中的报告版本，并按报告描述运行。依据报告与网关源码判断过滤效果，不自行逆向 CLI，也不代表已检测部署版本或完成动态验证。历史条目仍按各自报告版本解释。发现时间以原报告首发时间为准。"
+        lines[5:5] = ["已过滤＝相关路径移除信号；未过滤＝保留信号或 CLI 自发请求不经网关过滤；当前配置不触发＝有证据表明必要触发条件被禁用，不等于已过滤；待核实＝报告或网关证据仍不足。", ""]
     rows = [(identifier, url, item) for identifier, records in ledger.items() for url, item in records.items()]
     rows.sort(key=lambda row: (tuple(-part for part in version_rank((row[2]["finding"].get("version") or {}).get("value"))), row[0], row[1]))
     details = []
@@ -735,6 +744,8 @@ def render(ledger, current_hash, remote="", upstream=None):
         url = item.get("tracked_upstream", {}).get("url", url)
         stale = item["code_hash"] != current_hash
         status = "待核实（代码已变化）" if stale else STATUSES[assessment["status"]]
+        if upstream and item.get("tracked_upstream") and not item.get("evaluation_basis") and not stale:
+            status = "待重评（旧评估口径）"
         if item.get("revised"):
             status = "待核实（来源已修订）"
         published = item.get("published")
@@ -757,6 +768,7 @@ def render(ledger, current_hash, remote="", upstream=None):
                 location = f"[{location}](https://github.com/{github[1]}/blob/{item['commit']}/{quote(entry['path'], safe='/')}#L{entry['line']})"
             evidence.append(location)
         details += [f'<a id="{anchor}"></a>', f"**{number}. {compact(label, 36)}** · {escape(full_version)} · [原报告]({report_link(url)})", "",
+                    "评估基准：" + ("假设云端使用报告版本，并接受报告描述的 CLI 行为。" if item.get("evaluation_basis") else "历史记录，尚未按报告版本假设重新评估。"), "",
                     f"机制：{escape(finding['mechanism']['value'])}", "",
                     f"完整触发条件：{escape(finding['trigger']['value'])}", "",
                     f"{status}：{escape(assessment['reason'])}", "",
@@ -795,6 +807,9 @@ def investigate(article, repository, model, ledger, topic):
     known = [{"id": key, "mechanisms": [r["finding"]["mechanism"]["value"] for r in rows.values()]} for key, rows in ledger.items()]
     upstream_evidence = {"tracked_upstream": article.get("tracked_upstream"),
                          "upstream_policy": "tracked_upstream 是用户明确指定的研究报告上游，不是 Claude 官方上游。只据该文件原文和目标网关源码核验，不把仓库身份当作结论正确的保证，不推断报告目录版本就是官方最新版本。"}
+    if article.get("tracked_upstream"):
+        upstream_evidence["evaluation_basis"] = {**REPORT_BASELINE, "version": article["tracked_upstream"].get("version")}
+        upstream_evidence["upstream_policy"] = "tracked_upstream 是用户明确指定的研究基准，不是 Claude 官方仓库。接受报告所述 CLI 行为作为本次条件评估前提，仍须忠实提取原文机制和完整触发条件；无需再次证明报告的逆向过程，不推断报告版本就是官方最新发布版本。"
     classification_evidence = {**upstream_evidence, "topic": topic, "article": article, "files": repository.sources, "known_mechanisms": known,
                               "date_policy": "发现时间按来源首发时间记录，由执行器单独读取，不提取研究日期和引入时间。"}
     def validate_classification(result):
@@ -805,7 +820,7 @@ def investigate(article, repository, model, ledger, topic):
         if not findings:
             return {"status": "rejected", "reason": classification["reason"], "findings": []}
         files, unavailable = repository.code(classification.get("code_paths", []))
-        evidence = {**upstream_evidence, "findings": findings, "files": files, "unavailable_files": unavailable, "commit": repository.commit}
+        evidence = {**upstream_evidence, "article": article, "findings": findings, "files": files, "unavailable_files": unavailable, "commit": repository.commit}
         assessments = validated_model(model, "evaluate", evidence, lambda result: assess_result(result, findings, files, unavailable))
         try:
             assessments = validated_model(model, "verify", {**evidence, "article": article, "assessments": assessments},
@@ -819,7 +834,8 @@ def investigate(article, repository, model, ledger, topic):
             continue
         records = [{"finding": finding, "assessment": assessments[finding["id"]], "code_hash": repository.code_hash,
                     "commit": repository.commit, "checked_at": now(), "published": article.get("published"),
-                    "tracked_upstream": article.get("tracked_upstream") or {}} for finding in findings]
+                    "tracked_upstream": article.get("tracked_upstream") or {},
+                    "evaluation_basis": upstream_evidence.get("evaluation_basis")} for finding in findings]
         return {"status": "accepted", "reason": classification["reason"], "findings": records}
 
 
