@@ -328,7 +328,7 @@ class Web:
         if not sources:
             raise ValueError("上游最新版本目录中没有匹配的 Markdown 报告")
         self.upstream_sources = sources
-        self.max_report_bytes = config.get("max_report_bytes", 96000)
+        self.max_report_bytes = config.get("max_report_bytes", 192000)
         # 优先处理指纹与遥测，其余报告按用户配置顺序；不以 API 返回顺序决定优先级。
         priority = selected or ["device-fingerprinting.md", "telemetry.md", "api-endpoints.md", "system-prompt.md"]
         urls = sorted(sources, key=lambda url: (tuple(-p for p in version_rank(sources[url]["version"])),
@@ -725,7 +725,7 @@ def render(ledger, current_hash, remote="", upstream=None):
              "按报告分析版本新→旧排列。过滤仅对折叠证据列明的路径成立，不是端到端保证；未经真实流量验证，旧版标记不推定新版仍有。发现时间以原报告首发时间为准，不推断引入时间。", "",
              "| 报告版本 | 机制 | 过滤 | 触发条件（摘要） | 发现时间 |", "| --- | --- | --- | --- | --- |"]
     if upstream:
-        lines[4:4] = [f"固定研究上游：[{escape(upstream['repository'].removeprefix('https://github.com/'))}]({report_link(upstream['repository'])})；本轮读取提交 [`{upstream['commit'][:12]}`]({upstream['repository']}/commit/{upstream['commit']})。报告目录版本：{escape('、'.join(upstream['versions']))}（不代表官方最新发布版本）。历史来源保留供查证。", ""]
+        lines[5:5] = [f"固定研究上游：[{escape(upstream['repository'].removeprefix('https://github.com/'))}]({report_link(upstream['repository'])})；本轮读取提交 [`{upstream['commit'][:12]}`]({upstream['repository']}/commit/{upstream['commit']})。报告目录版本：{escape('、'.join(upstream['versions']))}（不代表官方最新发布版本）。历史来源保留供查证。", ""]
     rows = [(identifier, url, item) for identifier, records in ledger.items() for url, item in records.items()]
     rows.sort(key=lambda row: (tuple(-part for part in version_rank((row[2]["finding"].get("version") or {}).get("value"))), row[0], row[1]))
     details = []
@@ -942,9 +942,9 @@ def load_config(path):
         for filename in files:
             if safe_path(filename) != PurePosixPath(filename).name or not filename.endswith(".md"):
                 raise ValueError("上游报告须为版本目录下的 Markdown 文件")
-        limit = upstream.get("max_report_bytes", 96000)
-        if type(limit) is not int or not 48000 <= limit <= 128000:
-            raise ValueError("max_report_bytes 应在 48000 至 128000 之间")
+        limit = upstream.get("max_report_bytes", 192000)
+        if type(limit) is not int or not 48000 <= limit <= 256000:
+            raise ValueError("max_report_bytes 应在 48000 至 256000 之间")
     target = config.get("target", {})
     for boolean in ("publish",):
         if type(config.get(boolean, False)) is not bool:
