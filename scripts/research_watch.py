@@ -1169,7 +1169,7 @@ def finish_run(state, run):
     run["pending"] = len(state.get("queue", []))
     if run.get("publication") == "failed" or (run["errors"] and not state.get("ledger")):
         run["status"] = "failed"
-    elif run["errors"] or run["pending"]:
+    elif run["errors"] or run["pending"] or run.get("awaiting_upstream_change"):
         run["status"] = "partial"
     else:
         run["status"] = "complete"
@@ -1180,8 +1180,31 @@ def finish_run(state, run):
     return run
 
 
+def upstream_fingerprints(web, candidates, config):
+    """仅以选定报告及同版本关联报告的 Git 内容指纹决定是否需要模型。"""
+    sources = web.upstream_sources
+    result = {}
+    for url in candidates:
+        source = sources[url]
+        context = []
+        for name in config.get("context_reports", []):
+            if name == PurePosixPath(source["path"]).name:
+                continue
+            match = next((entry for entry in sources.values()
+                          if entry["repository"] == source["repository"] and entry["version"] == source["version"]
+                          and PurePosixPath(entry["path"]).name == name), None)
+            context.append((name, match["blob_sha"] if match else None))
+        result[url] = digest(json.dumps({"repository": source["repository"], "path": source["path"],
+                                         "blob": source["blob_sha"], "context": sorted(context)}, sort_keys=True))
+    return result
+
+
 def cycle(config, state, repository, web, model, state_dir, preview=False):
-    """失败逐项保留并在下轮重试；成功结果按正文与代码指纹去重。"""
+    """固定上游可仅随报告变化研究；搜索模式保留原有增量重评与重试。"""
+    change_only = config.get("tracked_upstream", {}).get("update_only_on_change", False)
+    # 预览可以产出文件，但不能消耗生产调度水位或覆盖已保存的评估。
+    if preview and change_only:
+        state = json.loads(json.dumps(state))
     run = {"started_at": now(), "errors": [], "processed": 0, "skipped": 0, "published_commit": None}
     state.setdefault("articles", {})
     state.setdefault("ledger", {})
@@ -1189,6 +1212,13 @@ def cycle(config, state, repository, web, model, state_dir, preview=False):
     if config.get("tracked_upstream"):
         candidates, upstream = web.upstream(config["tracked_upstream"])
         run["tracked_upstream"] = state["tracked_upstream"] = upstream
+        if change_only:
+            fingerprints = upstream_fingerprints(web, candidates, config["tracked_upstream"])
+            attempts = state.setdefault("upstream_attempts", {})
+            selected = [url for url in candidates if attempts.get(url) != fingerprints[url]]
+            run["upstream_unchanged"] = not selected
+            run["skipped"] = len(candidates) - len(selected)
+            candidates = selected
         # 固定上游模式只调度本轮选定报告，旧来源的历史证据保留但不继续抓取。
         carried = [url for url in state.get("queue", []) if url in candidates]
     else:
@@ -1233,6 +1263,8 @@ def cycle(config, state, repository, web, model, state_dir, preview=False):
             same_report = previous.get("report_fingerprint") == report_fingerprint
             dependencies_unchanged = previous_records and all(not record_stale(record, repository.code_hash, current_files) for record in previous_records)
             if same_rejected or (same_report and previous.get("status") == "accepted" and dependencies_unchanged and all(not missing_dimensions(record) for record in previous_records)):
+                if change_only:
+                    attempts[url] = fingerprints[url]
                 # 日期口径独立迁移，不重跑已经核验的机制与代码结论，不沿用旧的研究日期。
                 for records in state["ledger"].values():
                     if url in records:
@@ -1240,6 +1272,9 @@ def cycle(config, state, repository, web, model, state_dir, preview=False):
                 run["skipped"] += 1
                 continue
             run["processed"] += 1
+            if change_only:
+                # 在调用前记录本次内容；失败保留证据，只有报告再次变化才自动重试。
+                attempts[url] = fingerprints[url]
             cached = previous.get("classification") if same_report else None
             if cached and any("direction" not in finding for finding in cached.get("findings", [])):
                 cached = None
@@ -1260,9 +1295,17 @@ def cycle(config, state, repository, web, model, state_dir, preview=False):
             for records in state["ledger"].values():
                 if url in records:
                     records[url]["review_pending"] = True
-            remaining.append(url)
+            if not change_only or attempts.get(url) != fingerprints[url]:
+                remaining.append(url)
     state["queue"] = list(dict.fromkeys(remaining))
-    publish_snapshot(config, state, repository, state_dir, run, preview)
+    if change_only:
+        run["awaiting_upstream_change"] = sum(
+            state["articles"].get(url, {}).get("status") == "pending" and attempts.get(url) == fingerprint
+            for url, fingerprint in fingerprints.items())
+    if not change_only or not run["upstream_unchanged"] or state.get("last_run", {}).get("publication") == "failed":
+        publish_snapshot(config, state, repository, state_dir, run, preview)
+    else:
+        run["publication"] = "upstream_unchanged"
     return finish_run(state, run)
 
 
@@ -1297,6 +1340,8 @@ def load_config(path):
     if upstream is not None:
         if not isinstance(upstream, dict) or not re.fullmatch(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?/?", upstream.get("repository", "")):
             raise ValueError("tracked_upstream.repository 必须是明确的 GitHub 仓库")
+        if type(upstream.get("update_only_on_change", False)) is not bool:
+            raise ValueError("update_only_on_change 必须为布尔值")
         if search.get("enabled", True) or search.get("seed_urls"):
             raise ValueError("固定上游模式须关闭搜索并清空 seed_urls，避免混入其他来源")
         branch = text(upstream.get("branch", "main"), "上游分支", 200)

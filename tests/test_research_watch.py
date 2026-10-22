@@ -395,6 +395,113 @@ class UpstreamTests(unittest.TestCase):
                 research.load_config(path)
 
 
+class UpstreamChangeOnlyTests(unittest.TestCase):
+    """按上游内容调度，使用替身确认无更新、失败及预览均不会重复付费。"""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.repo, self.web, self.model = FakeRepository(), FakeWeb(), FakeModel()
+        self.sources = {URL: {"repository": "https://github.com/example/reports", "version": "2.1.300",
+                             "path": "versions/2.1.300/report.md", "blob_sha": "a" * 40}}
+        self.web.upstream_sources = self.sources
+        self.web.upstream = lambda config: (list(self.sources), {"commit": self.repo.commit,
+            "repository": "https://github.com/example/reports", "versions": ["2.1.300"]})
+        self.config = {"topic": "研究", "tracked_upstream": {"update_only_on_change": True},
+                       "publish": True, "max_reports": 4}
+        self.state = {}
+
+    def cycle(self, preview=False):
+        return research.cycle(self.config, self.state, self.repo, self.web, self.model, self.root, preview)
+
+    def change(self, url=URL):
+        self.sources[url]["blob_sha"] = "b" * 40
+        self.web.body += " Updated."
+
+    def test_unchanged_source_ignores_target_and_protocol_changes(self):
+        self.cycle()
+        self.model.calls.clear()
+        self.repo.code_hash = "changed"
+        self.repo.commit = "c" * 40
+        with patch.object(research, "RESEARCH_PROTOCOL", 999), patch.object(self.web, "article", side_effect=AssertionError("不应下载正文")):
+            result = self.cycle()
+        self.assertTrue(result["upstream_unchanged"])
+        self.assertEqual(result["publication"], "upstream_unchanged")
+        self.assertEqual(self.model.calls, [])
+        self.assertEqual(len(self.repo.published), 1)
+
+    def test_changed_report_calls_model_again(self):
+        self.cycle()
+        self.change()
+        self.assertEqual(self.cycle()["processed"], 1)
+        self.assertEqual(len(self.model.calls), 6)
+
+    def test_failed_content_is_attempted_once_until_changed(self):
+        self.model.forged = True
+        self.assertTrue(self.cycle()["errors"])
+        count = len(self.model.calls)
+        self.assertEqual(self.state["articles"][URL]["status"], "pending")
+        self.assertEqual(self.state["queue"], [])
+        result = self.cycle()
+        self.assertEqual(result["awaiting_upstream_change"], 1)
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(len(self.model.calls), count)
+        self.change()
+        self.cycle()
+        self.assertGreater(len(self.model.calls), count)
+
+    def test_deferred_reports_continue_without_repeating_failure(self):
+        second = URL + "-second"
+        self.sources[second] = {**self.sources[URL], "path": "versions/2.1.300/second.md"}
+        self.config["max_reports"] = 1
+        self.model.forged = True
+        self.cycle()
+        self.assertEqual(self.state["queue"], [second])
+        self.model.forged = False
+        before = len(self.model.calls)
+        self.assertEqual(self.cycle()["processed"], 1)
+        self.assertEqual(len(self.model.calls), before + 3)
+        self.assertEqual(self.state["queue"], [])
+        self.cycle()
+        self.assertEqual(len(self.model.calls), before + 3)
+
+    def test_preview_does_not_advance_production_watermark(self):
+        self.cycle(preview=True)
+        self.assertEqual(self.state, {})
+        self.cycle()
+        self.assertEqual(len(self.model.calls), 6)
+
+    def test_context_change_selects_only_same_version(self):
+        context = URL + "-context"
+        self.sources[context] = {**self.sources[URL], "path": "versions/2.1.300/telemetry.md"}
+        self.config["tracked_upstream"]["context_reports"] = ["telemetry.md"]
+        before = research.upstream_fingerprints(self.web, [URL], self.config["tracked_upstream"])
+        self.change(context)
+        after = research.upstream_fingerprints(self.web, [URL], self.config["tracked_upstream"])
+        self.assertNotEqual(before, after)
+        self.sources[context]["version"] = "2.1.301"
+        missing = research.upstream_fingerprints(self.web, [URL], self.config["tracked_upstream"])
+        self.sources[context]["blob_sha"] = "c" * 40
+        self.assertEqual(missing, research.upstream_fingerprints(self.web, [URL], self.config["tracked_upstream"]))
+
+    def test_download_failure_retries_without_consuming_model_attempt(self):
+        self.web.fail = True
+        self.assertTrue(self.cycle()["errors"])
+        self.assertEqual(self.model.calls, [])
+        self.assertNotIn(URL, self.state["upstream_attempts"])
+        self.web.fail = False
+        self.assertEqual(self.cycle()["processed"], 1)
+
+    def test_publish_failure_retries_without_model(self):
+        with patch.object(self.repo, "publish", side_effect=OSError("模拟发布失败")):
+            self.cycle()
+        before = len(self.model.calls)
+        result = self.cycle()
+        self.assertEqual(len(self.model.calls), before)
+        self.assertEqual(result["publication"], "published")
+
+
 class ResearchTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
