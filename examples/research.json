@@ -29,6 +29,7 @@
   "http_timeout_seconds": 30,
   "model_timeout_seconds": 600,
   "publish": false,
+  "evidence_document": "docs/research/README.md",
   "author": {
     "name": "TermiteRS Research",
     "email": "research@example.invalid"

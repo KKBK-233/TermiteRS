@@ -44,6 +44,14 @@ fn main() -> Result<()> {
             } => {
                 TermiteRS::research::run_once(&config, preview, python.as_deref())?;
             }
+            ResearchCommands::Render {
+                config,
+                publish,
+                offline,
+                python,
+            } => {
+                TermiteRS::research::render_saved(&config, publish, offline, python.as_deref())?;
+            }
             ResearchCommands::Analyze { config, input } => {
                 TermiteRS::research::analyze(&config, &input)?;
             }

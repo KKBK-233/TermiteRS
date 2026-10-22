@@ -148,3 +148,30 @@ fn embedded_runner_refuses_disabled_config_before_network_or_model_calls() {
     assert!(!root.join(".termite").exists());
     fs::remove_dir_all(root).unwrap();
 }
+
+/// 离线预览不能被发布开关绕过，也不需要真实模型凭据。
+#[test]
+fn research_render_help_and_conflicting_flags_are_explicit() {
+    let binary = env!("CARGO_BIN_EXE_TermiteRS");
+    let help = Command::new(binary)
+        .args(["research", "render", "--help"])
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    let text = String::from_utf8_lossy(&help.stdout);
+    assert!(text.contains("--offline"));
+    assert!(text.contains("--publish"));
+    let invalid = Command::new(binary)
+        .args([
+            "research",
+            "render",
+            "--config",
+            "missing.json",
+            "--offline",
+            "--publish",
+        ])
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("cannot be used"));
+}

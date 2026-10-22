@@ -302,7 +302,7 @@ class UpstreamTests(unittest.TestCase):
         article = {"url": URL, "body": BODY, "tracked_upstream": {"path": self.path, "version": "2.1.300", "repository": self.config["repository"]}}
         record = research.investigate(article, FakeRepository(), FakeModel(), {}, "研究", "unbundle_defaults")["findings"][0]
         record["finding"]["version"]["value"] = "2.1.300"
-        record["assessment"].update(status="not_triggered", summary="默认关闭该上报。")
+        record["assessment"].update(status="not_triggered", trigger_state="not_triggered", summary="默认关闭该上报。")
         historical = json.loads(json.dumps(record))
         historical["tracked_upstream"] = {}
         historical["finding"]["label"] = "旧来源独立记录"
@@ -310,12 +310,12 @@ class UpstreamTests(unittest.TestCase):
         upstream = {"repository": self.config["repository"], "commit": self.commit, "versions": ["2.1.300"]}
         rendered = research.render(ledger, "code-v1", upstream=upstream, evaluation_profile="unbundle_defaults")
         table, details = rendered.split("<details>", 1)
-        self.assertIn("默认配置结论", table)
-        self.assertIn("默认关闭该上报。", table)
+        self.assertIn("默认触发", table)
+        self.assertIn("默认关闭／不触发", table)
         self.assertNotIn("旧来源独立记录", table)
         self.assertIn("旧来源独立记录", details)
         stale = research.render(ledger, "changed", upstream=upstream, evaluation_profile="unbundle_defaults")
-        self.assertNotIn("默认关闭该上报。", stale.split("<details>")[0])
+        self.assertNotIn("默认关闭／不触发", stale.split("<details>")[0])
 
     def test_failed_review_clears_a_definite_short_summary(self):
         assessments = {"date-mark": {"status": "not_triggered", "reason": "候选理由", "summary": "默认关闭。", "code_evidence": []}}
@@ -409,7 +409,7 @@ class ResearchTests(unittest.TestCase):
         result = self.cycle()
         self.assertFalse(result["errors"])
         self.assertEqual(self.model.calls, ["classify", "evaluate", "verify"])
-        self.assertIn("| 报告版本 | 机制 | 过滤 | 触发条件（摘要） | 发现时间 |", self.repo.original)
+        self.assertIn("| 报告版本 | 机制 | 来源／方向 | 默认触发 | 网关处理 | 评估状态 | 证据 |", self.repo.original)
         self.assertIn("未过滤", self.repo.original)
         self.assertIn("发现时间：未说明", self.repo.original)
         self.assertNotIn("引入：", self.repo.original)
@@ -424,7 +424,7 @@ class ResearchTests(unittest.TestCase):
         self.repo.code_hash = "code-v2"
         self.repo.commit = "c" * 40
         self.cycle()
-        self.assertEqual(len(self.model.calls), 6)
+        self.assertEqual(self.model.calls, ["classify", "evaluate", "verify", "evaluate", "verify"])
 
     def test_changed_report_is_rechecked(self):
         self.cycle()
@@ -482,7 +482,7 @@ class ResearchTests(unittest.TestCase):
         self.web.article = lambda url: {**article(url), 'published': {'value': '2026-07-01', 'quote': '2026-07-01', 'kind': '首发元数据'}}
         self.cycle()
         self.assertEqual(len(self.model.calls), 3)
-        self.assertIn('| 2026-07-01 |', self.repo.original)
+        self.assertIn('发现时间：2026-07-01', self.repo.original)
         self.assertNotIn('2026-06-30', self.repo.original)
         self.assertNotIn('引入：', self.repo.original)
 
@@ -638,7 +638,7 @@ class ResearchTests(unittest.TestCase):
         self.model.supported = False
         self.cycle()
         self.assertIn("待核实", self.repo.original)
-        self.assertNotIn("未过滤", self.repo.original)
+        self.assertNotIn("| 未过滤 |", self.repo.original)
 
     def test_preview_produces_document_without_pushing(self):
         self.cycle(preview=True)
@@ -731,9 +731,9 @@ class ResearchTests(unittest.TestCase):
         self.assertNotIn(full, rendered.split("<details>")[0])
         self.assertIn(full, rendered.split("<details>")[1])
         self.assertIn("https://github.com/example/adapter/blob/" + self.repo.commit + "/src/relay.mjs#L1", rendered)
-        self.assertIn("[详情](#termiters-evidence-1)", rendered)
-        self.assertIn('id="termiters-evidence-1"', rendered)
-        self.assertTrue(rendered.endswith("此追踪由 [TermiteRS](https://github.com/KKBK-233/TermiteRS) 进行在线追踪更新。\n\n" + research.END))
+        self.assertIn("[1 份来源](#mechanism-date-mark)", rendered)
+        self.assertIn('id="mechanism-date-mark"', rendered)
+        self.assertTrue(rendered.endswith("此追踪由 [TermiteRS](https://github.com/KKBK-233/TermiteRS) 自动更新。\n\n" + research.END))
 
     def test_classification_validates_compact_labels_and_categories(self):
         item = finding()
@@ -847,6 +847,95 @@ class ResearchTests(unittest.TestCase):
         self.assertFalse(loaded["publish"])
 
 
+class SnapshotTests(unittest.TestCase):
+    """合并来源、分离维度及增量重评的对外行为。"""
+    setUp = ResearchTests.setUp
+    cycle = ResearchTests.cycle
+
+    def test_same_mechanism_has_one_row_and_keeps_both_sources(self):
+        self.cycle()
+        record = json.loads(json.dumps(self.state["ledger"]["date-mark"][URL]))
+        self.state["ledger"]["date-mark"][URL + "/second"] = record
+        section, evidence = research.render_documents(self.state["ledger"], self.repo.code_hash, detail_link="docs/research/README.md")
+        self.assertEqual(len([line for line in section.splitlines() if "#mechanism-date-mark)" in line]), 1)
+        self.assertIn("[2 份来源](docs/research/README.md#mechanism-date-mark)", section)
+        self.assertIn(URL + "/second", evidence)
+        self.assertIn("The date marks the custom endpoint.", evidence)
+        self.assertNotIn("The date marks", section)
+
+    def test_conflicting_sources_do_not_choose_a_winner(self):
+        self.cycle()
+        record = json.loads(json.dumps(self.state["ledger"]["date-mark"][URL]))
+        record["assessment"].update(status="filtered", handling="removed")
+        self.state["ledger"]["date-mark"][URL + "/second"] = record
+        section, evidence = research.render_documents(self.state["ledger"], self.repo.code_hash)
+        self.assertIn("来源结论不一致", section.split("<details>")[0])
+        self.assertIn("历史评估结论：未过滤", evidence)
+        self.assertIn("历史评估结论：已过滤", evidence)
+
+    def test_legacy_unfiltered_does_not_imply_default_emission(self):
+        self.cycle()
+        record = self.state["ledger"]["date-mark"][URL]
+        self.assertEqual(research.dimensions(record), ("unknown", "unknown", "unknown"))
+
+    def test_response_direction_requires_quote_and_stays_separate_from_handling(self):
+        item = finding()
+        item["direction"] = {"value": "service_to_cli", "quote": "The request keeps its punctuation."}
+        checked = research.classify_result({"accepted": True, "reason": "原文", "findings": [item]}, {"body": BODY})
+        self.assertEqual(checked[0]["direction"]["value"], "service_to_cli")
+        item["direction"]["quote"] = "invented direction"
+        with self.assertRaises(ValueError):
+            research.classify_result({"accepted": True, "reason": "原文", "findings": [item]}, {"body": BODY})
+
+    def test_unrelated_file_change_skips_model_and_related_change_reuses_extraction(self):
+        self.repo.config = {"required_code_paths": ["src/relay.mjs"]}
+        self.repo.entries = {"src/relay.mjs": ("100644", "one"), "src/other.mjs": ("100644", "other")}
+        self.cycle()
+        self.repo.entries["src/other.mjs"] = ("100644", "changed")
+        self.repo.code_hash = "global-v2"
+        self.cycle()
+        self.assertEqual(self.model.calls, ["classify", "evaluate", "verify"])
+        self.repo.entries["src/relay.mjs"] = ("100644", "two")
+        self.repo.code_hash = "global-v3"
+        self.cycle()
+        self.assertEqual(self.model.calls, ["classify", "evaluate", "verify", "evaluate", "verify"])
+        self.assertEqual(self.state["ledger"]["date-mark"][URL]["code_dependencies"]["src/relay.mjs"], "two")
+
+    def test_failed_reassessment_keeps_old_evidence_but_marks_it_pending(self):
+        self.cycle()
+        old = json.loads(json.dumps(self.state["ledger"]["date-mark"][URL]))
+        self.web.body += " revised"
+        self.model.forged = True
+        run = self.cycle()
+        record = self.state["ledger"]["date-mark"][URL]
+        self.assertEqual(run["status"], "partial")
+        self.assertEqual(record["finding"], old["finding"])
+        self.assertTrue(record["review_pending"])
+        table = self.repo.original.split("<details>")[0]
+        self.assertIn("报告核验未完成", table)
+        self.assertNotIn("| 未过滤 |", table)
+        count = len(self.repo.published)
+        self.cycle()
+        self.assertEqual(len(self.repo.published), count)
+
+    def test_publication_failure_is_failed_not_partial_success(self):
+        def fail(*args):
+            raise RuntimeError("remote moved")
+        self.repo.publish = fail
+        result = self.cycle()
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["publication"], "failed")
+        self.assertTrue(self.state["ledger"])
+
+    def test_render_does_not_overwrite_last_research_run(self):
+        self.cycle()
+        previous = self.state["last_run"]
+        result = {"errors": [], "processed": 0, "mode": "render_only"}
+        research.finish_run(self.state, result)
+        self.assertIs(self.state["last_run"], previous)
+        self.assertIs(self.state["last_render"], result)
+
+
 class GitPublishTests(unittest.TestCase):
     """使用本机临时 bare remote 验证真实 Git 发布，不访问网络或调用模型。"""
 
@@ -911,6 +1000,28 @@ class GitPublishTests(unittest.TestCase):
         published = self.git('-C', str(self.remote), 'show', commit + ':README.md')
         self.assertTrue(published.startswith(manual))
         self.assertEqual((self.work / 'README.md').read_text(encoding='utf-8'), manual)
+
+    def test_evidence_and_readme_publish_atomically_and_unchanged_snapshot_is_noop(self):
+        original = self.repo.read("README.md")
+        doc = research.DETAIL_MARKER + "\n# Evidence\n"
+        commit = self.repo.publish(original, original + "\nResearch\n", self.publish_config, {"docs/research/README.md": doc})
+        changed = self.git("-C", str(self.remote), "diff-tree", "--no-commit-id", "--name-only", "-r", commit).splitlines()
+        self.assertEqual(changed, ["README.md", "docs/research/README.md"])
+        self.repo.refresh()
+        self.assertIsNone(self.repo.publish(self.repo.read("README.md"), self.repo.read("README.md"), self.publish_config, {"docs/research/README.md": doc}))
+
+    def test_existing_manual_evidence_document_is_not_overwritten(self):
+        (self.work / "docs/research").mkdir(parents=True)
+        (self.work / "docs/research/README.md").write_text("Human notes\n")
+        self.git("-C", str(self.work), "add", "docs")
+        self.git("-C", str(self.work), "commit", "-m", "1.0.1 notes")
+        self.git("-C", str(self.work), "push", "origin", "main")
+        self.repo.refresh()
+        with self.assertRaisesRegex(ValueError, "拒绝覆盖"):
+            self.repo.publish(self.repo.read("README.md"), "replacement", self.publish_config,
+                              {"docs/research/README.md": research.DETAIL_MARKER + "\nGenerated\n"})
+        self.assertEqual(self.git("-C", str(self.remote), "show", "main:docs/research/README.md"), "Human notes")
+
 
 
 if __name__ == "__main__":
