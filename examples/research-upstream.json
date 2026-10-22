@@ -51,6 +51,7 @@
     "email": "research@example.invalid"
   },
   "tracked_upstream": {
+    "update_only_on_change": true,
     "repository": "https://github.com/wtfwhs/tengu-decoded",
     "branch": "main",
     "versions_dir": "versions",
