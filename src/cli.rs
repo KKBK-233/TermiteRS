@@ -135,6 +135,19 @@ pub enum ResearchCommands {
         #[arg(long)]
         python: Option<String>,
     },
+    /// 用保存的证据生成预览；不抓取报告、不调用模型。
+    Render {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// 显式发布生成快照；配置也必须允许 publish。
+        #[arg(long, conflicts_with = "offline")]
+        publish: bool,
+        /// 不拉取 Git 远端，只用已有副本离线预览。
+        #[arg(long)]
+        offline: bool,
+        #[arg(long)]
+        python: Option<String>,
+    },
     /// 供研究执行器复用已配置的模型接口，返回结构化判断。
     #[command(hide = true)]
     Analyze {

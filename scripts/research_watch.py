@@ -11,6 +11,7 @@ import http.client
 import ipaddress
 import json
 import os
+import posixpath
 from pathlib import Path, PurePosixPath
 import re
 import signal
@@ -27,8 +28,8 @@ import xml.etree.ElementTree as ET
 
 START = "<!-- termiters:research:start -->"
 END = "<!-- termiters:research:end -->"
-RESEARCH_PROTOCOL = 5
-MODEL_PROTOCOL = 6
+RESEARCH_PROTOCOL = 6
+MODEL_PROTOCOL = 7
 REPORT_BASELINE = {
     "mode": "report_baseline",
     "assumption": "假设云端 CLI 为指定上游本轮选中的报告版本，并按报告描述运行；这是评估前提，不是实际部署版本检测结果。",
@@ -40,6 +41,54 @@ DEFAULT_PROFILE = {
 }
 STATUSES = {"filtered": "已过滤", "unfiltered": "未过滤", "partial": "部分过滤", "not_triggered": "当前配置不触发", "unknown": "待核实"}
 SUFFIXES = {".rs", ".go", ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".java", ".kt"}
+
+
+# 分开记录信号方向、触发与处理；静态研究不能自行升级为动态验证。
+DIRECTIONS = {"client_to_gateway": "本地客户端 → 网关", "cloud_cli_to_service": "云端 CLI → 服务端",
+              "service_to_cli": "服务端 → CLI", "internal": "组件内部传递", "multiple": "多条路径（见证据）", "unknown": "待补充"}
+TRIGGERS = {"default": "默认触发", "not_triggered": "默认关闭／不触发", "conditional": "条件触发", "unknown": "待核实"}
+HANDLINGS = {"removed": "移除", "rewritten": "改写", "retained": "保留", "partial": "部分处理",
+             "outside_gateway": "不经过网关", "unknown": "待核实"}
+DETAIL_MARKER = "<!-- termiters:research-evidence -->"
+
+
+def dependency_snapshot(repository, paths):
+    """仅记录实际审阅文件；缺少文件目录的旧记录继续使用全局哈希。"""
+    entries = getattr(repository, "entries", None)
+    if entries is None:
+        return None
+    paths = sorted(set(paths) | set(repository.config.get("required_code_paths", [])))
+    return {path: entries[path][1] if path in entries else None for path in paths}
+
+
+def record_stale(item, current_hash, current_files=None):
+    dependencies = item.get("code_dependencies")
+    if dependencies and current_files is not None:
+        return any(current_files.get(path) != oid for path, oid in dependencies.items())
+    return item.get("code_hash") != current_hash
+
+
+def record_state(item, current_hash, current_files=None, upstream=None, evaluation_profile=None):
+    if item.get("revised"):
+        return "待核实（来源已修订）"
+    if item.get("review_pending"):
+        return "待重评（报告核验未完成）"
+    if record_stale(item, current_hash, current_files):
+        return "待核实（代码已变化）"
+    if upstream and item.get("tracked_upstream") and not item.get("evaluation_basis"):
+        return "待重评（旧评估口径）"
+    if evaluation_profile and item.get("evaluation_profile") != evaluation_profile:
+        return "待重评（默认配置）"
+    return STATUSES[item["assessment"]["status"]]
+
+
+def dimensions(item):
+    """旧记录只迁移明确的过滤/禁用结论，未过滤不自动推导默认触发或上传方向。"""
+    assessment = item["assessment"]
+    direction = item["finding"].get("direction", {}).get("value", "unknown")
+    trigger = assessment.get("trigger_state", "not_triggered" if assessment["status"] == "not_triggered" else "unknown")
+    handling = assessment.get("handling", {"filtered": "removed", "partial": "partial"}.get(assessment["status"], "unknown"))
+    return direction, trigger, handling
 
 
 def digest(value):
@@ -556,13 +605,16 @@ class Repository:
     def git(self, *args, data=None, env=None):
         return run_command(["git", "-C", str(self.path), *args], self.budget, data=data, env=env)
 
-    def refresh(self):
+    def refresh(self, fetch=True):
         if not self.path.exists():
+            if not fetch:
+                raise ValueError("离线渲染需要已有目标仓库副本")
             run_command(["git", "init", "--bare", str(self.path)], self.budget)
             self.git("remote", "add", "origin", self.remote)
         if self.git("remote", "get-url", "origin").strip() != self.remote:
             raise ValueError("研究副本 remote 不匹配")
-        self.git("fetch", "--no-tags", "origin", f"+refs/heads/{self.branch}:refs/remotes/origin/{self.branch}")
+        if fetch:
+            self.git("fetch", "--no-tags", "origin", f"+refs/heads/{self.branch}:refs/remotes/origin/{self.branch}")
         self.commit = self.git("rev-parse", f"refs/remotes/origin/{self.branch}").strip()
         entries = self.git("ls-tree", "-r", "-z", self.commit).split("\0")
         self.entries = {}
@@ -581,7 +633,8 @@ class Repository:
     def read(self, path):
         if path not in self.entries:
             raise ValueError("目标文件不存在或不是普通跟踪文件")
-        if int(self.git("cat-file", "-s", self.entries[path][1])) > 200000:
+        limit = 2000000 if path.endswith(".md") else 200000
+        if int(self.git("cat-file", "-s", self.entries[path][1])) > limit:
             raise ValueError("源文件过大")
         return self.git("cat-file", "blob", self.entries[path][1])
 
@@ -608,8 +661,22 @@ class Repository:
                 used += size
         return files, unavailable
 
-    def publish(self, original, updated, config):
-        if original == updated:
+    def publish(self, original, updated, config, artifacts=None):
+        changes = {self.homepage: updated} if original != updated else {}
+        for path, content in (artifacts or {}).items():
+            safe_path(path)
+            if path == self.homepage or not content.startswith(DETAIL_MARKER + "\n"):
+                raise ValueError("证据文档路径或标记非法")
+            if path in self.entries:
+                if self.entries[path][0] not in {"100644", "100755"}:
+                    raise ValueError("证据路径必须为普通文件")
+                previous = self.read(path)
+                if not previous.startswith(DETAIL_MARKER + "\n"):
+                    raise ValueError("证据路径存在非自动生成文档，拒绝覆盖")
+                if previous == content:
+                    continue
+            changes[path] = content
+        if not changes:
             return None
         if self.read(self.homepage) != original:
             raise ValueError("首页快照不匹配")
@@ -626,10 +693,12 @@ class Repository:
         with tempfile.TemporaryDirectory(prefix="termiters-index-") as temporary:
             env["GIT_INDEX_FILE"] = str(Path(temporary) / "index")
             self.git("read-tree", self.commit, env=env)
-            blob = self.git("hash-object", "-w", "--stdin", data=updated.encode()).strip()
-            self.git("update-index", "--add", "--cacheinfo", self.entries[self.homepage][0], blob, self.homepage, env=env)
+            for path, content in changes.items():
+                blob = self.git("hash-object", "-w", "--stdin", data=content.encode()).strip()
+                mode = self.entries.get(path, ("100644", None))[0]
+                self.git("update-index", "--add", "--cacheinfo", mode, blob, path, env=env)
             tree = self.git("write-tree", env=env).strip()
-            commit = self.git("commit-tree", tree, "-p", self.commit, "-m", f"{version} 更新隐写记录", env=env).strip()
+            commit = self.git("commit-tree", tree, "-p", self.commit, "-m", f"{version} 更新研究记录", env=env).strip()
             # 普通快进推送：远端有并发提交时失败，下轮重新基于最新代码判断。
             self.git("push", "origin", f"{commit}:refs/heads/{self.branch}")
             return commit
@@ -720,6 +789,11 @@ def classify_result(result, article):
             if item["category"] not in {"隐写", "环境标记", "协议指纹", "模型水印"}:
                 raise ValueError("机制分类非法")
             entry["category"] = item["category"]
+        if "direction" in item:
+            direction = claim(item["direction"], article["body"])
+            if direction["value"] not in DIRECTIONS:
+                raise ValueError("信号方向非法")
+            entry["direction"] = direction
         validated.append(entry)
     return validated
 
@@ -773,7 +847,21 @@ def assess_result(result, findings, files, unavailable, report_sources=None):
         if status == "not_triggered" and report_sources is not None and not report_evidence:
             report_errors.append(f"不触发结论必须引用报告的触发条件或禁用控制依据：{item['id']}")
         summary = text(item.get("summary", reason), "结论简述", 1500)
+        trigger_state = item.get("trigger_state", "not_triggered" if status == "not_triggered" else "unknown")
+        handling = item.get("handling", {"filtered": "removed", "partial": "partial"}.get(status, "unknown"))
+        if trigger_state not in TRIGGERS or handling not in HANDLINGS:
+            raise ValueError("触发或网关处理枚举非法")
+        if trigger_state == "not_triggered" and status != "not_triggered":
+            raise ValueError("不触发维度必须与结论及控制证据一致")
+        if status == "not_triggered" and trigger_state != "not_triggered":
+            raise ValueError("不触发结论与触发维度矛盾")
+        if status == "filtered" and handling != "removed":
+            raise ValueError("已过滤结论必须对应移除")
+        if status == "unknown":
+            trigger_state, handling = "unknown", "unknown"
         validated[item["id"]] = {"status": status, "reason": reason, "summary": summary,
+                                 "trigger_state": trigger_state, "handling": handling,
+                                 "evidence_level": "report_and_code",
                                  "code_evidence": verified, "report_evidence": report_evidence}
     # 一次反馈全部报告引用错误，避免模型修好第一项后才看到下一项。
     if report_errors:
@@ -797,7 +885,7 @@ def apply_verification(result, assessments):
             raise ReportEvidenceFailure("报告机制或日期复核未通过：" + reason)
         assessments[verdict["id"]].update(review_supported=verdict["supported"], review_reason=reason)
         if not verdict["supported"]:
-            assessments[verdict["id"]].update(status="unknown", reason="复核未通过：" + reason, summary="证据尚不足，详见复核说明。")
+            assessments[verdict["id"]].update(status="unknown", reason="复核未通过：" + reason, summary="证据尚不足，详见复核说明。", trigger_state="unknown", handling="unknown")
     return assessments
 
 
@@ -825,72 +913,115 @@ def compact(value, maximum):
     return escape(value if len(value) <= maximum else value[:maximum - 1] + "…")
 
 
-def render(ledger, current_hash, remote="", upstream=None, evaluation_profile=None):
-    lines = [START, "## 隐写与指纹跟踪", "",
-             "按报告分析版本新→旧排列。过滤仅对折叠证据列明的路径成立，不是端到端保证；未经真实流量验证，旧版标记不推定新版仍有。发现时间以原报告首发时间为准，不推断引入时间。", "",
-             "| 报告版本 | 机制 | 过滤 | 触发条件（摘要） | 发现时间 |", "| --- | --- | --- | --- | --- |"]
-    if upstream:
-        lines[5:5] = [f"固定研究上游：[{escape(upstream['repository'].removeprefix('https://github.com/'))}]({report_link(upstream['repository'])})；本轮读取提交 [`{upstream['commit'][:12]}`]({upstream['repository']}/commit/{upstream['commit']})。报告目录版本：{escape('、'.join(upstream['versions']))}（不代表官方最新发布版本）。历史来源保留供查证。", ""]
-    if upstream:
-        lines[3] = "评估前提：假设云端 CLI 为指定上游本轮选中的报告版本，并按报告描述运行。依据报告与网关源码判断过滤效果，不自行逆向 CLI，也不代表已检测部署版本或完成动态验证。历史条目仍按各自报告版本解释。发现时间以原报告首发时间为准。"
-        lines[5:5] = ["已过滤＝相关路径移除信号；未过滤＝保留信号或 CLI 自发请求不经网关过滤；当前配置不触发＝有证据表明必要触发条件被禁用，不等于已过滤；待核实＝报告或网关证据仍不足。", ""]
-    if evaluation_profile == "unbundle_defaults":
-        lines[3] = "评估基准：Unbundle 默认配置；假设云端 CLI 使用下列报告版本，并接受报告描述的行为。结合同版本关联报告判断是否发送及是否过滤，不自行逆向 CLI。发现日期按上游报告文件最早可查提交日期记账，不代表确认或机制引入时间。"
-        lines = [line.replace("| 过滤 | 触发条件（摘要） |", "| 默认配置结论 | 原因（简述） |") for line in lines]
-    rows = [(identifier, url, item) for identifier, records in ledger.items() for url, item in records.items()]
-    rows.sort(key=lambda row: (tuple(-part for part in version_rank((row[2]["finding"].get("version") or {}).get("value"))), row[0], row[1]))
-    details = []
+def render_documents(ledger, current_hash, remote="", upstream=None, evaluation_profile=None,
+                     current_files=None, detail_link=None, incomplete=False):
+    """机制只占一行，全部来源保存在独立证据文档；失效来源不参与当前结论合并。"""
     github = re.fullmatch(r"(?:git@github\.com:|https://github\.com/)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?", remote)
-    for number, (identifier, url, item) in enumerate(rows, 1):
-        finding, assessment = item["finding"], item["assessment"]
-        url = item.get("tracked_upstream", {}).get("url", url)
-        stale = item["code_hash"] != current_hash
-        status = "待核实（代码已变化）" if stale else STATUSES[assessment["status"]]
-        if upstream and item.get("tracked_upstream") and not item.get("evaluation_basis") and not stale:
-            status = "待重评（旧评估口径）"
-        if evaluation_profile and item.get("evaluation_profile") != evaluation_profile and not stale:
-            status = "待重评（默认配置）"
-        if item.get("revised"):
-            status = "待核实（来源已修订）"
-        published = item.get("published")
-        discovered = published["value"] if published else "未说明"
-        version = finding.get("version")
-        label = finding.get("label", finding["mechanism"]["value"])
-        category = finding.get("category")
-        name = (escape(category) + " · " if category else "") + compact(label, 36)
-        trigger = compact(finding.get("trigger_summary", finding["trigger"]["value"]), 90)
-        full_version = version["value"] if version else "未说明"
-        # 简表只展示版本号；架构、包名等附注留在证据区，不推造版本区间。
-        numbers = list(dict.fromkeys(re.findall(r"(?<!\d)\d+\.\d+\.\d+(?!\d)", full_version)))
-        version_text = " / ".join(numbers) if numbers else compact(full_version, 24)
-        anchor = f"termiters-evidence-{number}"
-        active = not upstream or (item.get("tracked_upstream", {}).get("repository") == upstream["repository"]
-                                  and item.get("tracked_upstream", {}).get("version") in upstream["versions"])
-        if evaluation_profile == "unbundle_defaults":
-            if status == STATUSES["not_triggered"]:
-                status = "默认关闭／不触发"
-            trigger = "条件或配置已变化，等待重新评估。" if status.startswith(("待重评", "待核实（")) else compact(assessment.get("summary", assessment["reason"]), 65)
-        if active:
-            lines.append(f"| {escape(version_text)} | {name} [↗]({report_link(url)}) | {status} | {trigger} [详情](#{anchor}) | {escape(discovered)} |")
-        evidence = []
-        for entry in assessment["code_evidence"]:
-            location = escape(entry["path"]) + ":" + str(entry["line"])
-            if github and re.fullmatch(r"[0-9a-f]{40,64}", item["commit"]):
-                location = f"[{location}](https://github.com/{github[1]}/blob/{item['commit']}/{quote(entry['path'], safe='/')}#L{entry['line']})"
-            evidence.append(location)
-        report_evidence = list(dict.fromkeys("[" + escape(entry["path"]) + "](" + report_link(entry["url"]) + ")"
-                           for entry in assessment.get("report_evidence", [])))
-        date_basis = published.get("kind", "来源首发日期") if published else "上游未提供可用日期"
-        details += [f'<a id="{anchor}"></a>', f"**{number}. {compact(label, 36)}** · {escape(full_version)} · [原报告]({report_link(url)})", "",
-                    "评估基准：" + ("假设云端使用报告版本，并接受报告描述的 CLI 行为。" if item.get("evaluation_basis") else "历史记录，尚未按报告版本假设重新评估。"), "",
-                    f"机制：{escape(finding['mechanism']['value'])}", "",
-                    f"完整触发条件：{escape(finding['trigger']['value'])}", "",
-                    f"{status}：{escape(assessment['reason'])}", "",
-                    "关联报告依据：" + ("；".join(report_evidence) or "见主报告与代码说明"), "",
-                    f"代码：{'、'.join(evidence) or '证据不足'}；审阅提交 {escape(item['commit'][:12])}。发现时间：{escape(discovered)}（{escape(date_basis)}）。", ""]
-    lines += ["", "<details>", "<summary>展开完整条件与代码证据</summary>", "", *details, "</details>", "",
-              "此追踪由 [TermiteRS](https://github.com/KKBK-233/TermiteRS) 进行在线追踪更新。", "", END]
-    return "\n".join(lines)
+    groups, pending, conflicts = [], 0, 0
+    details = [DETAIL_MARKER, "# 研究证据", "", "此文件自动生成；按机制保留多来源、版本、完整条件、原文引用与代码依据。", "",
+               "证据程度：报告描述＋源码静态评估。没有真实流量验证，不代表检测到了服务器实际发送行为。", ""]
+    def active(item):
+        source = item.get("tracked_upstream", {})
+        return not upstream or (source.get("repository") == upstream["repository"] and source.get("version") in upstream["versions"])
+    def combine(values, labels):
+        values = set(values)
+        known = values - {"unknown"}
+        if not known:
+            return labels["unknown"]
+        if len(known) > 1:
+            return "来源结论不一致（见条件）"
+        return labels[next(iter(known))] + ("（部分来源待补充）" if "unknown" in values else "")
+    def group_order(group):
+        identifier, records = group
+        versions = [version_rank((item["finding"].get("version") or {}).get("value")) for item in records.values() if active(item)]
+        return tuple(-v for v in max(versions, default=(0, 0, 0))), identifier
+    for identifier, records in sorted(ledger.items(), key=group_order):
+        selected = [(url, item) for url, item in records.items() if active(item)]
+        all_rows = sorted(records.items(), key=lambda row: (tuple(-v for v in version_rank((row[1]["finding"].get("version") or {}).get("value"))), row[0]))
+        representative = max(selected or all_rows, key=lambda row: (row[1].get("checked_at", ""), row[0]))[1]
+        finding = representative["finding"]
+        anchor = "mechanism-" + identifier
+        details += [f'<a id="{escape(anchor)}"></a>', "## " + escape(finding.get("label", finding["mechanism"]["value"])), "", "机制 ID：" + escape(identifier), ""]
+        good = []
+        for url, item in all_rows:
+            f, assessment = item["finding"], item["assessment"]
+            state = record_state(item, current_hash, current_files, upstream, evaluation_profile)
+            is_current = active(item)
+            if is_current and assessment["status"] != "unknown" and not state.startswith(("待核实（", "待重评")):
+                good.append(item)
+            direction, trigger, handling = dimensions(item)
+            source_url = item.get("tracked_upstream", {}).get("url", url)
+            version = (f.get("version") or {}).get("value", "未说明")
+            label = "当前报告来源" if is_current else "历史来源"
+            discovered = (item.get("published") or {}).get("value", "未说明")
+            details += [f"### {label} · {escape(version)} · {escape(f.get('label', f['mechanism']['value']))}", "", f"[原报告]({report_link(source_url)})；评估时间：{escape(item.get('checked_at', '未说明'))}；审阅提交：{escape(item.get('commit', '')[:12])}。", "",
+                        "评估基准：" + ("假设云端使用报告版本，并接受报告描述的 CLI 行为。" if item.get("evaluation_basis") else "历史评估口径，见条件与证据。"), "",
+                        f"机制：{escape(f['mechanism']['value'])}", "", f"完整触发条件：{escape(f['trigger']['value'])}", "",
+                        f"方向：{DIRECTIONS[direction]}；触发：{TRIGGERS[trigger]}；网关处理：{HANDLINGS[handling]}。", "",
+                        f"当前有效性：{state}。历史评估结论：{STATUSES[assessment['status']]}。", "", escape(assessment['reason']), "",
+                        f"发现时间：{escape(discovered)}（{escape((item.get('published') or {}).get('kind', '上游未提供可用日期'))}）。", ""]
+            for key in ("mechanism", "trigger", "version", "direction"):
+                claim_value = f.get(key)
+                if claim_value and claim_value.get("quote"):
+                    details += [f"报告原文（{key}）：", "", "> " + escape(claim_value["quote"]), ""]
+            for entry in assessment.get("report_evidence", []):
+                details += [f"关联报告：[原文]({report_link(entry['url'])})", "", "> " + escape(entry["quote"]), ""]
+            for entry in assessment.get("code_evidence", []):
+                location = escape(entry["path"]) + ":" + str(entry["line"])
+                if github and re.fullmatch(r"[0-9a-f]{40,64}", item.get("commit", "")):
+                    location = f"[{location}](https://github.com/{github[1]}/blob/{item['commit']}/{quote(entry['path'], safe='/')}#L{entry['line']})"
+                details += ["代码：" + location, "", "> " + escape(entry["quote"]), ""]
+            if item.get("code_dependencies"):
+                details += ["依赖文件：" + "、".join(escape(path) for path in sorted(item["code_dependencies"])), ""]
+        if not selected:
+            continue
+        if not good:
+            state = record_state(selected[0][1], current_hash, current_files, upstream, evaluation_profile)
+            direction = combine([dimensions(x)[0] for _, x in selected], DIRECTIONS)
+            trigger, handling = "待重评", "待重评"
+            pending += 1
+        else:
+            state = combine([x["assessment"]["status"] for x in good], STATUSES)
+            direction = combine([dimensions(x)[0] for x in good], DIRECTIONS)
+            trigger = combine([dimensions(x)[1] for x in good], TRIGGERS)
+            handling = combine([dimensions(x)[2] for x in good], HANDLINGS)
+            if any("来源结论不一致" in x for x in (state, direction, trigger, handling)):
+                conflicts += 1
+            if len(good) < len(selected):
+                state += "；部分来源待重评"
+                pending += 1
+            if evaluation_profile == "unbundle_defaults" and state == STATUSES["not_triggered"]:
+                state = "默认关闭／不触发"
+        label = compact(finding.get("label", finding["mechanism"]["value"]), 36)
+        name = escape(finding.get("category", "未分类")) + " · " + label
+        link = (detail_link or "") + "#" + anchor
+        sources = f"[{len(selected)} 份来源]({link})"
+        versions = []
+        for _, item in selected:
+            version_text = (item["finding"].get("version") or {}).get("value", "")
+            versions.extend(re.findall(r"(?<!\d)\d+\.\d+\.\d+(?!\d)", version_text))
+        version_cell = " / ".join(sorted(set(versions), key=version_rank, reverse=True)) or "未说明"
+        groups.append((version_cell, name, direction, trigger, handling, state, sources))
+    latest = max((item.get("checked_at", "") for records in ledger.values() for item in records.values()), default="")
+    lines = [START, "## 隐写与指纹跟踪", "",
+             "评估基准：" + ("Unbundle 默认配置；" if evaluation_profile == "unbundle_defaults" else "") + "假设云端 CLI 按指定报告版本描述运行，结合同版本报告及仓库源码静态评估。未经真实流量验证，不代表已检测实际部署版本或确认发生采集。", "",
+             "方向、触发条件、网关处理分别记录；不经过网关不等于上传，未过滤不等于默认触发。来源差异须结合版本和路径查看，不能强行合并成确定结论。", ""]
+    if upstream:
+        lines += [f"固定研究上游：[{escape(upstream['repository'].removeprefix('https://github.com/'))}]({report_link(upstream['repository'])})；报告版本：{escape('、'.join(upstream['versions']))}（不代表官方最新发布版本）；读取提交：`{escape(upstream['commit'][:12])}`。", ""]
+    lines += [f"去重后 **{len(groups)} 项机制**；**{pending} 项含待重评来源**；**{conflicts} 项存在来源结论差异**。最近保存的报告核验记录：{escape(latest or '未说明')}。", "",
+              "研究快照：" + ("部分完成，保留旧评估及其基准，待重评项不作当前确定结论。" if pending or incomplete else "当前已展示来源的有效性见各行；报告队列及执行错误另记运行日志。"), "",
+              "| 报告版本 | 机制 | 来源／方向 | 默认触发 | 网关处理 | 评估状态 | 证据 |", "| --- | --- | --- | --- | --- | --- | --- |"]
+    lines += ["| " + " | ".join(row) + " |" for row in groups]
+    if detail_link:
+        lines += ["", f"[完整条件、原文引用、代码证据与历史来源]({detail_link})。发现时间按上游报告首发／首次可查提交记账，不代表机制引入时间。"]
+    else:
+        lines += ["", "<details>", "<summary>展开完整条件与代码证据</summary>", "", *details[1:], "</details>"]
+    lines += ["", "此追踪由 [TermiteRS](https://github.com/KKBK-233/TermiteRS) 自动更新。", "", END]
+    return "\n".join(lines), "\n".join(details) + "\n"
+
+
+def render(ledger, current_hash, remote="", upstream=None, evaluation_profile=None, current_files=None):
+    return render_documents(ledger, current_hash, remote, upstream, evaluation_profile, current_files)[0]
 
 
 def update_homepage(original, section):
@@ -922,7 +1053,7 @@ def validated_model(model, phase, evidence, validator):
                 "instruction": "原文引用必须是原文中逐字连续片段，不要去掉引用中的符号或把多处内容拼接。未说明的版本输出 null。发现时间由执行器读取来源首发时间，不需要提取发现或引入日期。请修正有错误的字段，仍按本阶段原定 JSON 协议返回完整结果，不要为了通过校验改变事实。"}})
 
 
-def investigate(article, repository, model, ledger, topic, evaluation_profile=None):
+def investigate(article, repository, model, ledger, topic, evaluation_profile=None, cached_classification=None):
     known = [{"id": key, "mechanisms": [r["finding"]["mechanism"]["value"] for r in rows.values()]} for key, rows in ledger.items()]
     upstream_evidence = {"tracked_upstream": article.get("tracked_upstream"),
                          "upstream_policy": "tracked_upstream 是用户明确指定的研究报告上游，不是 Claude 官方上游。只据该文件原文和目标网关源码核验，不把仓库身份当作结论正确的保证，不推断报告目录版本就是官方最新版本。"}
@@ -938,9 +1069,12 @@ def investigate(article, repository, model, ledger, topic, evaluation_profile=No
         return result, classify_result(result, article)
     # 语义复核失败后最多回到提取阶段一次，重读原文、重评代码并再次独立复核。
     for attempt in range(2):
-        classification, findings = validated_model(model, "classify", classification_evidence, validate_classification)
+        if attempt == 0 and cached_classification is not None:
+            classification, findings = validate_classification(cached_classification)
+        else:
+            classification, findings = validated_model(model, "classify", classification_evidence, validate_classification)
         if not findings:
-            return {"status": "rejected", "reason": classification["reason"], "findings": []}
+            return {"status": "rejected", "reason": classification["reason"], "findings": [], "classification": classification}
         files, unavailable = repository.code(classification.get("code_paths", []))
         evidence = {**upstream_evidence, "article": article, "findings": findings, "files": files, "unavailable_files": unavailable, "commit": repository.commit}
         report_sources = {entry["tracked_upstream"]["path"]: entry
@@ -961,8 +1095,58 @@ def investigate(article, repository, model, ledger, topic, evaluation_profile=No
                     "commit": repository.commit, "checked_at": now(), "published": article.get("published"),
                     "tracked_upstream": article.get("tracked_upstream") or {},
                     "evaluation_basis": upstream_evidence.get("evaluation_basis"), "evaluation_profile": evaluation_profile,
-                    "context_sources": [entry["tracked_upstream"] for entry in article.get("context_reports", [])]} for finding in findings]
-        return {"status": "accepted", "reason": classification["reason"], "findings": records}
+                    "context_sources": [entry["tracked_upstream"] for entry in article.get("context_reports", [])],
+                    "code_dependencies": dependency_snapshot(repository, files) if not unavailable else None} for finding in findings]
+        return {"status": "accepted", "reason": classification["reason"], "findings": records, "classification": classification}
+
+
+def publish_snapshot(config, state, repository, state_dir, run, preview=False):
+    """首页和证据文档以一个 Git 提交发布；执行错误不混入机制结论。"""
+    if not state.get("ledger"):
+        run["publication"] = "no_evidence"
+        return
+    original = repository.read(repository.homepage)
+    evidence_path = config.get("evidence_document")
+    detail_link = quote(posixpath.relpath(evidence_path, str(PurePosixPath(repository.homepage).parent)), safe="/.-") if evidence_path else None
+    entries = getattr(repository, "entries", None)
+    current_files = {path: value[1] for path, value in entries.items()} if entries is not None else None
+    section, details = render_documents(state["ledger"], repository.code_hash, config.get("target", {}).get("remote", ""),
+                                        state.get("tracked_upstream"), config.get("evaluation_profile"), current_files, detail_link,
+                                        bool(state.get("queue") or run["errors"]))
+    updated = update_homepage(original, section)
+    (state_dir / "README.preview.md").write_text(updated, encoding="utf-8")
+    artifacts = {evidence_path: details} if evidence_path else {}
+    if evidence_path:
+        (state_dir / "research-evidence.preview.md").write_text(details, encoding="utf-8")
+    run["publication"] = "preview"
+    if config.get("publish", False) and not preview:
+        try:
+            if artifacts:
+                run["published_commit"] = repository.publish(original, updated, config, artifacts)
+            else:
+                run["published_commit"] = repository.publish(original, updated, config)
+            run["publication"] = "published" if run["published_commit"] else "unchanged"
+        except Exception as error:
+            run["publication"] = "failed"
+            run["errors"].append("研究快照发布失败，下轮重新生成：" + type(error).__name__ + ": " + str(error)[:160])
+
+
+def finish_run(state, run):
+    """部分研究失败有独立状态，发布失败仍属于致命失败。"""
+    run["finished_at"] = now()
+    run["mechanisms"] = len(state.get("ledger", {}))
+    run["pending"] = len(state.get("queue", []))
+    if run.get("publication") == "failed" or (run["errors"] and not state.get("ledger")):
+        run["status"] = "failed"
+    elif run["errors"] or run["pending"]:
+        run["status"] = "partial"
+    else:
+        run["status"] = "complete"
+    if run["status"] == "complete" and run.get("processed", 0):
+        state["last_complete_run"] = run["finished_at"]
+    run["last_complete_run"] = state.get("last_complete_run")
+    state["last_render" if run.get("mode") == "render_only" else "last_run"] = run
+    return run
 
 
 def cycle(config, state, repository, web, model, state_dir, preview=False):
@@ -1005,7 +1189,12 @@ def cycle(config, state, repository, web, model, state_dir, preview=False):
             report_fingerprint = digest(str(RESEARCH_PROTOCOL) + article["hash"] + config["topic"] + context_hash)
             fingerprint = digest(report_fingerprint + repository.code_hash)
             same_rejected = previous.get("status") == "rejected" and previous.get("report_fingerprint") == report_fingerprint
-            if same_rejected or (previous.get("fingerprint") == fingerprint and previous.get("status") == "accepted"):
+            previous_records = [records[url] for records in state["ledger"].values() if url in records and not records[url].get("revised")]
+            entries = getattr(repository, "entries", None)
+            current_files = {path: value[1] for path, value in entries.items()} if entries is not None else None
+            same_report = previous.get("report_fingerprint") == report_fingerprint
+            dependencies_unchanged = previous_records and all(not record_stale(record, repository.code_hash, current_files) for record in previous_records)
+            if same_rejected or (same_report and previous.get("status") == "accepted" and dependencies_unchanged):
                 # 日期口径独立迁移，不重跑已经核验的机制与代码结论，不沿用旧的研究日期。
                 for records in state["ledger"].values():
                     if url in records:
@@ -1013,9 +1202,11 @@ def cycle(config, state, repository, web, model, state_dir, preview=False):
                 run["skipped"] += 1
                 continue
             run["processed"] += 1
-            decision = investigate(article, repository, model, state["ledger"], config["topic"], config.get("evaluation_profile"))
+            cached = previous.get("classification") if same_report else None
+            decision = investigate(article, repository, model, state["ledger"], config["topic"], config.get("evaluation_profile"), cached)
             state["articles"][url] = {"status": decision["status"], "reason": decision["reason"], "fingerprint": fingerprint,
-                                      "report_fingerprint": report_fingerprint, "last_attempt": now(), "final_url": article["url"]}
+                                      "report_fingerprint": report_fingerprint, "last_attempt": now(), "final_url": article["url"],
+                                      "classification": decision.get("classification")}
             # 来源修订不静默覆盖其他报告；同一机制的不同来源保留各自版本和日期。
             for records in state["ledger"].values():
                 if url in records:
@@ -1026,22 +1217,13 @@ def cycle(config, state, repository, web, model, state_dir, preview=False):
             detail = f"{type(error).__name__}: {str(error)[:240]}"
             state["articles"][url] = {**state["articles"].get(url, {}), "status": "pending", "last_attempt": now(), "last_error": detail}
             run["errors"].append(f"报告 {url}: {detail}")
+            for records in state["ledger"].values():
+                if url in records:
+                    records[url]["review_pending"] = True
             remaining.append(url)
     state["queue"] = list(dict.fromkeys(remaining))
-    if state["ledger"]:
-        original = repository.read(repository.homepage)
-        updated = update_homepage(original, render(state["ledger"], repository.code_hash, config.get("target", {}).get("remote", ""), state.get("tracked_upstream"), config.get("evaluation_profile")))
-        (state_dir / "README.preview.md").write_text(updated, encoding="utf-8")
-        if config.get("publish", False) and not preview:
-            try:
-                run["published_commit"] = repository.publish(original, updated, config)
-            except Exception as error:
-                run["errors"].append("首页发布失败，下轮重新生成：" + type(error).__name__)
-    run["finished_at"] = now()
-    run["mechanisms"] = len(state["ledger"])
-    run["pending"] = len(state["queue"])
-    state["last_run"] = run
-    return run
+    publish_snapshot(config, state, repository, state_dir, run, preview)
+    return finish_run(state, run)
 
 
 def load_config(path):
@@ -1112,6 +1294,10 @@ def load_config(path):
     if not (re.fullmatch(r"https://github\.com/[\w.-]+/[\w.-]+(?:\.git)?", remote)
             or re.fullmatch(r"git@github\.com:[\w.-]+/[\w.-]+(?:\.git)?", remote)):
         raise ValueError("自动发布目标须为明确的 GitHub 仓库")
+    evidence_path = config.setdefault("evidence_document", "docs/research/README.md")
+    safe_path(evidence_path)
+    if evidence_path == target.get("homepage", "README.md") or not evidence_path.endswith(".md"):
+        raise ValueError("证据文档必须为独立 Markdown 路径")
     prefixes = target.get("source_prefixes", ["src/"])
     if not isinstance(prefixes, list) or not prefixes or len(prefixes) > 20:
         raise ValueError("source_prefixes 必须为非空目录列表")
@@ -1145,7 +1331,11 @@ def main():
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--termiters", required=True)
     parser.add_argument("--preview", action="store_true")
+    parser.add_argument("--render-only", action="store_true", help="只用已保存证据生成快照，不抓取报告、不调用模型")
+    parser.add_argument("--offline", action="store_true", help="仅用于 render-only；不获取远端提交，强制预览")
     args = parser.parse_args()
+    if args.offline and not args.render_only:
+        parser.error("--offline 必须与 --render-only 一起使用")
     config = load_config(args.config)
     state_dir = Path(config["state_dir"])
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -1168,18 +1358,23 @@ def main():
             signal.signal(signal.SIGALRM, alarm_timeout)
             signal.setitimer(signal.ITIMER_REAL, max(0.1, config["timeout_seconds"] - 1))
         try:
-            repository = Repository(config["target"], state_dir, budget).refresh()
-            web = Web(budget, config["http_timeout_seconds"])
-            model = Model(args.termiters, config["llm_config"], budget, config["model_timeout_seconds"], state_dir / "model-cache")
-            result = cycle(config, state, repository, web, model, state_dir, args.preview)
+            repository = Repository(config["target"], state_dir, budget).refresh(fetch=not args.offline)
+            if args.render_only:
+                result = {"started_at": now(), "errors": [], "processed": 0, "skipped": 0, "published_commit": None, "mode": "render_only"}
+                publish_snapshot(config, state, repository, state_dir, result, args.preview or args.offline)
+                result = finish_run(state, result)
+            else:
+                web = Web(budget, config["http_timeout_seconds"])
+                model = Model(args.termiters, config["llm_config"], budget, config["model_timeout_seconds"], state_dir / "model-cache")
+                result = cycle(config, state, repository, web, model, state_dir, args.preview)
         except Exception as error:
-            result = {"finished_at": now(), "errors": [type(error).__name__ + ": " + str(error)]}
-            state["last_run"] = result
+            result = {"finished_at": now(), "status": "failed", "errors": [type(error).__name__ + ": " + str(error)]}
+            state["last_render" if args.render_only else "last_run"] = result
         connection.execute("INSERT OR REPLACE INTO research_state VALUES (1, ?)", (json.dumps(state, ensure_ascii=False),))
         connection.commit()
-        (state_dir / "last-run.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        (state_dir / ("last-render.json" if args.render_only else "last-run.json")).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
         print(json.dumps(result, ensure_ascii=False, indent=2))
-        return 1 if result["errors"] else 0
+        return {"failed": 1, "partial": 2, "complete": 0}[result["status"]]
     finally:
         if os.name != "nt":
             signal.setitimer(signal.ITIMER_REAL, 0)
