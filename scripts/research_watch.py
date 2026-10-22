@@ -29,7 +29,7 @@ import xml.etree.ElementTree as ET
 START = "<!-- termiters:research:start -->"
 END = "<!-- termiters:research:end -->"
 RESEARCH_PROTOCOL = 6
-MODEL_PROTOCOL = 7
+MODEL_PROTOCOL = 8
 REPORT_BASELINE = {
     "mode": "report_baseline",
     "assumption": "假设云端 CLI 为指定上游本轮选中的报告版本，并按报告描述运行；这是评估前提，不是实际部署版本检测结果。",
@@ -45,7 +45,7 @@ SUFFIXES = {".rs", ".go", ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", "
 
 # 分开记录信号方向、触发与处理；静态研究不能自行升级为动态验证。
 DIRECTIONS = {"client_to_gateway": "本地客户端 → 网关", "cloud_cli_to_service": "云端 CLI → 服务端",
-              "service_to_cli": "服务端 → CLI", "internal": "组件内部传递", "multiple": "多条路径（见证据）", "unknown": "待补充"}
+              "service_to_cli": "服务端 → CLI", "internal": "组件内部传递", "multiple": "多条路径（见证据）", "unknown": "证据不足"}
 TRIGGERS = {"default": "默认触发", "not_triggered": "默认关闭／不触发", "conditional": "条件触发", "unknown": "待核实"}
 HANDLINGS = {"removed": "移除", "rewritten": "改写", "retained": "保留", "partial": "部分处理",
              "outside_gateway": "不经过网关", "unknown": "待核实"}
@@ -82,13 +82,18 @@ def record_state(item, current_hash, current_files=None, upstream=None, evaluati
     return STATUSES[item["assessment"]["status"]]
 
 
+def missing_dimensions(item):
+    """识别尚未结构化的旧记录，不把字段缺失当作证据不足。"""
+    return ("direction" not in item["finding"] or
+            any(key not in item["assessment"] for key in ("trigger_state", "handling")))
+
+
 def dimensions(item):
-    """旧记录只迁移明确的过滤/禁用结论，未过滤不自动推导默认触发或上传方向。"""
+    """渲染旧记录时显示迁移状态，不凭过滤结论推测方向和默认触发。"""
     assessment = item["assessment"]
-    direction = item["finding"].get("direction", {}).get("value", "unknown")
-    trigger = assessment.get("trigger_state", "not_triggered" if assessment["status"] == "not_triggered" else "unknown")
-    handling = assessment.get("handling", {"filtered": "removed", "partial": "partial"}.get(assessment["status"], "unknown"))
-    return direction, trigger, handling
+    return (item["finding"].get("direction", {}).get("value", "unmigrated"),
+            assessment.get("trigger_state", "unmigrated"),
+            assessment.get("handling", "unmigrated"))
 
 
 def digest(value):
@@ -763,7 +768,7 @@ def claim(value, body, required=True):
     return result
 
 
-def classify_result(result, article):
+def classify_result(result, article, require_dimensions=False):
     if not isinstance(result, dict) or type(result.get("accepted")) is not bool:
         raise ValueError("报告核验格式非法")
     text(result.get("reason"), "核验理由")
@@ -789,6 +794,8 @@ def classify_result(result, article):
             if item["category"] not in {"隐写", "环境标记", "协议指纹", "模型水印"}:
                 raise ValueError("机制分类非法")
             entry["category"] = item["category"]
+        if require_dimensions and "direction" not in item:
+            raise ValueError("必须填写 direction 及原文引用；确实缺乏方向证据时明确填 unknown")
         if "direction" in item:
             direction = claim(item["direction"], article["body"])
             if direction["value"] not in DIRECTIONS:
@@ -798,7 +805,7 @@ def classify_result(result, article):
     return validated
 
 
-def assess_result(result, findings, files, unavailable, report_sources=None):
+def assess_result(result, findings, files, unavailable, report_sources=None, require_dimensions=False):
     assessments = result.get("assessments") if isinstance(result, dict) else None
     ids = {item["id"] for item in findings}
     if not isinstance(assessments, list) or len(assessments) != len(ids) or {a.get("id") for a in assessments} != ids:
@@ -806,6 +813,8 @@ def assess_result(result, findings, files, unavailable, report_sources=None):
     validated = {}
     report_errors = []
     for item in assessments:
+        if require_dimensions and any(key not in item for key in ("trigger_state", "handling")):
+            raise ValueError("必须分别填写 trigger_state 和 handling；缺证据填 unknown 并在 reason 解释缺口")
         status = item.get("status")
         if status not in STATUSES:
             raise ValueError("过滤状态非法")
@@ -918,6 +927,9 @@ def render_documents(ledger, current_hash, remote="", upstream=None, evaluation_
     """机制只占一行，全部来源保存在独立证据文档；失效来源不参与当前结论合并。"""
     github = re.fullmatch(r"(?:git@github\.com:|https://github\.com/)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?", remote)
     groups, pending, conflicts = [], 0, 0
+    direction_labels = {**DIRECTIONS, "unmigrated": "旧记录待回填"}
+    trigger_labels = {**TRIGGERS, "unmigrated": "旧记录待回填"}
+    handling_labels = {**HANDLINGS, "unmigrated": "旧记录待回填"}
     details = [DETAIL_MARKER, "# 研究证据", "", "此文件自动生成；按机制保留多来源、版本、完整条件、原文引用与代码依据。", "",
                "证据程度：报告描述＋源码静态评估。没有真实流量验证，不代表检测到了服务器实际发送行为。", ""]
     def active(item):
@@ -925,12 +937,12 @@ def render_documents(ledger, current_hash, remote="", upstream=None, evaluation_
         return not upstream or (source.get("repository") == upstream["repository"] and source.get("version") in upstream["versions"])
     def combine(values, labels):
         values = set(values)
-        known = values - {"unknown"}
+        known = values - {"unknown", "unmigrated"}
         if not known:
-            return labels["unknown"]
+            return "／".join(labels[value] for value in sorted(values))
         if len(known) > 1:
             return "来源结论不一致（见条件）"
-        return labels[next(iter(known))] + ("（部分来源待补充）" if "unknown" in values else "")
+        return labels[next(iter(known))] + ("（部分来源证据不足）" if "unknown" in values else "") + ("（部分旧记录待回填）" if "unmigrated" in values else "")
     def group_order(group):
         identifier, records = group
         versions = [version_rank((item["finding"].get("version") or {}).get("value")) for item in records.values() if active(item)]
@@ -957,7 +969,7 @@ def render_documents(ledger, current_hash, remote="", upstream=None, evaluation_
             details += [f"### {label} · {escape(version)} · {escape(f.get('label', f['mechanism']['value']))}", "", f"[原报告]({report_link(source_url)})；评估时间：{escape(item.get('checked_at', '未说明'))}；审阅提交：{escape(item.get('commit', '')[:12])}。", "",
                         "评估基准：" + ("假设云端使用报告版本，并接受报告描述的 CLI 行为。" if item.get("evaluation_basis") else "历史评估口径，见条件与证据。"), "",
                         f"机制：{escape(f['mechanism']['value'])}", "", f"完整触发条件：{escape(f['trigger']['value'])}", "",
-                        f"方向：{DIRECTIONS[direction]}；触发：{TRIGGERS[trigger]}；网关处理：{HANDLINGS[handling]}。", "",
+                        f"方向：{direction_labels[direction]}；触发：{trigger_labels[trigger]}；网关处理：{handling_labels[handling]}。", "",
                         f"当前有效性：{state}。历史评估结论：{STATUSES[assessment['status']]}。", "", escape(assessment['reason']), "",
                         f"发现时间：{escape(discovered)}（{escape((item.get('published') or {}).get('kind', '上游未提供可用日期'))}）。", ""]
             for key in ("mechanism", "trigger", "version", "direction"):
@@ -977,14 +989,14 @@ def render_documents(ledger, current_hash, remote="", upstream=None, evaluation_
             continue
         if not good:
             state = record_state(selected[0][1], current_hash, current_files, upstream, evaluation_profile)
-            direction = combine([dimensions(x)[0] for _, x in selected], DIRECTIONS)
+            direction = combine([dimensions(x)[0] for _, x in selected], direction_labels)
             trigger, handling = "待重评", "待重评"
             pending += 1
         else:
             state = combine([x["assessment"]["status"] for x in good], STATUSES)
-            direction = combine([dimensions(x)[0] for x in good], DIRECTIONS)
-            trigger = combine([dimensions(x)[1] for x in good], TRIGGERS)
-            handling = combine([dimensions(x)[2] for x in good], HANDLINGS)
+            direction = combine([dimensions(x)[0] for x in good], direction_labels)
+            trigger = combine([dimensions(x)[1] for x in good], trigger_labels)
+            handling = combine([dimensions(x)[2] for x in good], handling_labels)
             if any("来源结论不一致" in x for x in (state, direction, trigger, handling)):
                 conflicts += 1
             if len(good) < len(selected):
@@ -1005,12 +1017,12 @@ def render_documents(ledger, current_hash, remote="", upstream=None, evaluation_
     latest = max((item.get("checked_at", "") for records in ledger.values() for item in records.values()), default="")
     lines = [START, "## 隐写与指纹跟踪", "",
              "评估基准：" + ("Unbundle 默认配置；" if evaluation_profile == "unbundle_defaults" else "") + "假设云端 CLI 按指定报告版本描述运行，结合同版本报告及仓库源码静态评估。未经真实流量验证，不代表已检测实际部署版本或确认发生采集。", "",
-             "方向、触发条件、网关处理分别记录；不经过网关不等于上传，未过滤不等于默认触发。来源差异须结合版本和路径查看，不能强行合并成确定结论。", ""]
+             "“旧记录待回填”表示结构化字段尚未迁移，“证据不足／待核实”表示已评估但依据不足，“待重评”表示旧结论需要重新核验。方向、触发条件、网关处理分别记录；不经过网关不等于上传，未过滤不等于默认触发。来源差异须结合版本和路径查看，不能强行合并成确定结论。", ""]
     if upstream:
         lines += [f"固定研究上游：[{escape(upstream['repository'].removeprefix('https://github.com/'))}]({report_link(upstream['repository'])})；报告版本：{escape('、'.join(upstream['versions']))}（不代表官方最新发布版本）；读取提交：`{escape(upstream['commit'][:12])}`。", ""]
     lines += [f"去重后 **{len(groups)} 项机制**；**{pending} 项含待重评来源**；**{conflicts} 项存在来源结论差异**。最近保存的报告核验记录：{escape(latest or '未说明')}。", "",
               "研究快照：" + ("部分完成，保留旧评估及其基准，待重评项不作当前确定结论。" if pending or incomplete else "当前已展示来源的有效性见各行；报告队列及执行错误另记运行日志。"), "",
-              "| 报告版本 | 机制 | 来源／方向 | 默认触发 | 网关处理 | 评估状态 | 证据 |", "| --- | --- | --- | --- | --- | --- | --- |"]
+              "| 报告版本 | 机制 | 信号方向 | 默认触发 | 网关处理 | 评估状态 | 证据 |", "| --- | --- | --- | --- | --- | --- | --- |"]
     lines += ["| " + " | ".join(row) + " |" for row in groups]
     if detail_link:
         lines += ["", f"[完整条件、原文引用、代码证据与历史来源]({detail_link})。发现时间按上游报告首发／首次可查提交记账，不代表机制引入时间。"]
@@ -1066,7 +1078,7 @@ def investigate(article, repository, model, ledger, topic, evaluation_profile=No
     classification_evidence = {**upstream_evidence, "topic": topic, "article": primary_article, "files": repository.sources, "known_mechanisms": known,
                               "date_policy": "指定上游的发现日期按报告文件最早可查提交日期记录，无需模型确认真实发现或引入时间。"}
     def validate_classification(result):
-        return result, classify_result(result, article)
+        return result, classify_result(result, article, require_dimensions=True)
     # 语义复核失败后最多回到提取阶段一次，重读原文、重评代码并再次独立复核。
     for attempt in range(2):
         if attempt == 0 and cached_classification is not None:
@@ -1080,7 +1092,7 @@ def investigate(article, repository, model, ledger, topic, evaluation_profile=No
         report_sources = {entry["tracked_upstream"]["path"]: entry
                           for entry in [article, *article.get("context_reports", [])] if entry.get("tracked_upstream")}
         assessments = validated_model(model, "evaluate", evidence,
-                                      lambda result: assess_result(result, findings, files, unavailable, report_sources or None))
+                                      lambda result: assess_result(result, findings, files, unavailable, report_sources or None, require_dimensions=True))
         try:
             assessments = validated_model(model, "verify", {**evidence, "article": article, "assessments": assessments},
                                           lambda result: apply_verification(result, json.loads(json.dumps(assessments))))
@@ -1169,7 +1181,14 @@ def cycle(config, state, repository, web, model, state_dir, preview=False):
     candidates = list(dict.fromkeys(candidates))
     # 超过每日上限的候选落盘排队，下一轮优先处理，避免后续条目长期饥饿。
     queue = list(dict.fromkeys(carried + candidates))
-    queue.sort(key=lambda url: state["articles"].get(url, {}).get("last_attempt", ""))
+    # 优先回填已有结论；失败后回到正常重试队列，避免阻塞其他报告。
+    def queue_order(url):
+        previous = state["articles"].get(url, {})
+        legacy = previous.get("status") == "accepted" and any(
+            url in rows and not rows[url].get("revised") and missing_dimensions(rows[url])
+            for rows in state["ledger"].values())
+        return (not legacy, previous.get("last_attempt", ""))
+    queue.sort(key=queue_order)
     if len(queue) > config.get("max_queue", 1000):
         run["errors"].append("候选队列达到上限，请收窄关键词或调整 max_queue")
         queue = queue[:config.get("max_queue", 1000)]
@@ -1194,7 +1213,7 @@ def cycle(config, state, repository, web, model, state_dir, preview=False):
             current_files = {path: value[1] for path, value in entries.items()} if entries is not None else None
             same_report = previous.get("report_fingerprint") == report_fingerprint
             dependencies_unchanged = previous_records and all(not record_stale(record, repository.code_hash, current_files) for record in previous_records)
-            if same_rejected or (same_report and previous.get("status") == "accepted" and dependencies_unchanged):
+            if same_rejected or (same_report and previous.get("status") == "accepted" and dependencies_unchanged and all(not missing_dimensions(record) for record in previous_records)):
                 # 日期口径独立迁移，不重跑已经核验的机制与代码结论，不沿用旧的研究日期。
                 for records in state["ledger"].values():
                     if url in records:
@@ -1203,6 +1222,8 @@ def cycle(config, state, repository, web, model, state_dir, preview=False):
                 continue
             run["processed"] += 1
             cached = previous.get("classification") if same_report else None
+            if cached and any("direction" not in finding for finding in cached.get("findings", [])):
+                cached = None
             decision = investigate(article, repository, model, state["ledger"], config["topic"], config.get("evaluation_profile"), cached)
             state["articles"][url] = {"status": decision["status"], "reason": decision["reason"], "fingerprint": fingerprint,
                                       "report_fingerprint": report_fingerprint, "last_attempt": now(), "final_url": article["url"],

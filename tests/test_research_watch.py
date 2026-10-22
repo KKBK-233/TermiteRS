@@ -21,6 +21,7 @@ CODE = "export function relay(input) { return input; }\n"
 def finding():
     return {"id": "date-mark", "mechanism": {"value": "日期标记", "quote": "The date marks the custom endpoint."},
             "trigger": {"value": "使用自定义端点", "quote": "custom endpoint"},
+            "direction": {"value": "client_to_gateway", "quote": "The request keeps its punctuation."},
             "version": {"value": "2.1.196", "quote": "Version 2.1.196"},
             "discovered": {"value": "2026-06-30", "quote": "Discovered June 30, 2026"}, "introduced": None}
 
@@ -42,6 +43,7 @@ class FakeModel:
             return {"accepted": self.accepted, "reason": "存在原创技术分析", "code_paths": ["src/relay.mjs"], "findings": [item]}
         if phase == "evaluate":
             return {"assessments": [{"id": "date-mark", "status": "unfiltered", "reason": "实现直接返回输入。",
+                                      "trigger_state": "conditional", "handling": "retained",
                                       "code_evidence": [{"path": "src/relay.mjs", "quote": "return input;"}]}]}
         return {"verdicts": [{"id": "date-mark", "report_supported": self.report_supported,
                               "supported": self.supported, "reason": "逐字核对实现路径"}]}
@@ -409,7 +411,7 @@ class ResearchTests(unittest.TestCase):
         result = self.cycle()
         self.assertFalse(result["errors"])
         self.assertEqual(self.model.calls, ["classify", "evaluate", "verify"])
-        self.assertIn("| 报告版本 | 机制 | 来源／方向 | 默认触发 | 网关处理 | 评估状态 | 证据 |", self.repo.original)
+        self.assertIn("| 报告版本 | 机制 | 信号方向 | 默认触发 | 网关处理 | 评估状态 | 证据 |", self.repo.original)
         self.assertIn("未过滤", self.repo.original)
         self.assertIn("发现时间：未说明", self.repo.original)
         self.assertNotIn("引入：", self.repo.original)
@@ -876,7 +878,59 @@ class SnapshotTests(unittest.TestCase):
     def test_legacy_unfiltered_does_not_imply_default_emission(self):
         self.cycle()
         record = self.state["ledger"]["date-mark"][URL]
-        self.assertEqual(research.dimensions(record), ("unknown", "unknown", "unknown"))
+        record["finding"].pop("direction")
+        record["assessment"].pop("trigger_state")
+        record["assessment"].pop("handling")
+        self.assertEqual(research.dimensions(record), ("unmigrated", "unmigrated", "unmigrated"))
+        section, _ = research.render_documents(self.state["ledger"], self.repo.code_hash)
+        self.assertIn("旧记录待回填", section)
+
+    def test_unchanged_legacy_records_are_backfilled_once(self):
+        self.cycle()
+        record = self.state["ledger"]["date-mark"][URL]
+        record["finding"].pop("direction")
+        record["assessment"].pop("trigger_state")
+        self.state["articles"][URL]["classification"]["findings"][0].pop("direction")
+        self.model.calls.clear()
+        self.cycle()
+        self.assertEqual(self.model.calls, ["classify", "evaluate", "verify"])
+        self.assertFalse(research.missing_dimensions(self.state["ledger"]["date-mark"][URL]))
+        self.model.calls.clear()
+        self.cycle()
+        self.assertEqual(self.model.calls, [])
+
+    def test_new_results_must_include_explicit_dimensions(self):
+        item = finding()
+        item.pop("direction")
+        with self.assertRaisesRegex(ValueError, "direction"):
+            research.classify_result({"accepted": True, "reason": "原文", "findings": [item]},
+                                     {"body": BODY}, require_dimensions=True)
+        result = FakeModel()("evaluate", {})
+        result["assessments"][0].pop("handling")
+        with self.assertRaisesRegex(ValueError, "handling"):
+            research.assess_result(result, [finding()], {"src/relay.mjs": CODE}, [], require_dimensions=True)
+
+    def test_explicit_unknown_is_not_treated_as_unmigrated(self):
+        self.cycle()
+        record = self.state["ledger"]["date-mark"][URL]
+        record["finding"]["direction"]["value"] = "unknown"
+        self.assertFalse(research.missing_dimensions(record))
+        section, _ = research.render_documents(self.state["ledger"], self.repo.code_hash)
+        row = next(line for line in section.splitlines() if "#mechanism-date-mark)" in line)
+        self.assertIn("证据不足", row)
+        self.assertNotIn("旧记录待回填", row)
+        self.model.calls.clear()
+        self.cycle()
+        self.assertEqual(self.model.calls, [])
+
+    def test_legacy_backfill_has_priority_within_existing_report_budget(self):
+        self.cycle()
+        self.state["ledger"]["date-mark"][URL]["assessment"].pop("handling")
+        self.web.links = [URL + "/new", URL]
+        self.config["max_reports"] = 1
+        self.cycle()
+        self.assertFalse(research.missing_dimensions(self.state["ledger"]["date-mark"][URL]))
+        self.assertIn(URL + "/new", self.state["queue"])
 
     def test_response_direction_requires_quote_and_stays_separate_from_handling(self):
         item = finding()

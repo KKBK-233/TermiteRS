@@ -71,7 +71,7 @@ TermiteRS research run-once --config /etc/termiters/research.json
 
 ## 增量评估与执行状态
 
-新评估保存实际提供给模型的代码文件及必读入口的 Git blob ID。只有这些文件变化才重新评估；证据不全或旧记录没有文件依赖时仍保守使用整体源码哈希。代码变化但报告及评估口径未变时，复用通过校验的机制提取结果，只重跑评估与复核；复核否定机制提取时仍回退到提取阶段纠正。新协议字段上线后，旧报告按每日预算逐步重评，不在迁移时自动扩量。
+新评估保存实际提供给模型的代码文件及必读入口的 Git blob ID。只有这些文件变化才重新评估；证据不全或旧记录没有文件依赖时仍保守使用整体源码哈希。代码变化但报告及评估口径未变时，复用通过校验的机制提取结果，只重跑评估与复核；复核否定机制提取时仍回退到提取阶段纠正。新协议字段上线后，即使报告及代码哈希未变，缺失方向、触发或处理字段的旧记录也必须回填；已接受的旧报告优先使用现有报告预算，失败后回到正常重试队列，不自动扩量。新模型结果必须显式提供三个字段，确有证据缺口时填写 unknown 并说明理由。原报告及默认源码足以支持的条件结论无需以真实抓包为前提。同一机制涉及多个通道时分别说明触发条件。
 
 报告分别保存结果。失败来源保留历史结论但标为待重评；新报告失败不产生机制结论。运行结果区分 `complete`、`partial`、`failed`，发布另记 `published`、`unchanged`、`preview`、`failed` 或 `no_evidence`。报告排队或部分失败有有效证据时属于部分完成，Rust 入口正常返回并提示查看运行记录；没有任何有效证据的错误、发布失败和执行器异常仍报失败。这样不会把“成功发布部分结果”冒充完整研究，也不会丢掉已经核验的材料。
 
@@ -90,7 +90,7 @@ TermiteRS research render --config /etc/termiters-research/research.json
 TermiteRS research render --config /etc/termiters-research/research.json --publish
 ```
 
-预览保存在状态目录的 `README.preview.md` 与 `research-evidence.preview.md`。`--offline` 与 `--publish` 互斥。渲染会检查当前源码有效性，但不会把旧结论补写成新验证结果。
+预览保存在状态目录的 `README.preview.md` 与 `research-evidence.preview.md`。`--offline` 与 `--publish` 互斥。渲染会检查当前源码有效性，但不会把旧结论补写成新验证结果。展示中“旧记录待回填”表示字段尚未结构化，“证据不足／待核实”表示已评估但依据不足，“待重评”表示旧结论失效或核验未完成；原报告来源独立保留。
 
 ## Linux 每日运行
 
