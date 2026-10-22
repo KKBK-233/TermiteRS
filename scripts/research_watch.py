@@ -777,6 +777,23 @@ def classify_result(result, article, require_dimensions=False):
     findings = result.get("findings")
     if not isinstance(findings, list) or not 1 <= len(findings) <= 12:
         raise ValueError("报告机制数量非法")
+    # 一次反馈全部不匹配引文及位置，避免多机制报告只修好第一处就耗尽重试。
+    quote_errors = []
+    for item in findings:
+        if not isinstance(item, dict):
+            raise ValueError("报告机制必须为对象")
+        for key in ("mechanism", "trigger", "version", "direction"):
+            if key == "direction" and not require_dimensions and key not in item:
+                continue
+            try:
+                claim(item.get(key), article["body"], key != "version")
+            except ValueError as error:
+                value = item.get(key)
+                snippet = value.get("quote") if isinstance(value, dict) else None
+                nearby = get_close_matches(snippet, article["body"].splitlines(), n=2, cutoff=0.45) if isinstance(snippet, str) else []
+                quote_errors.append(f"{item.get('id')} 的 {key}：{error}；引用={snippet!r}；相近原文行（仅供定位，不自动替换）：{nearby!r}")
+    if quote_errors:
+        raise ValueError("\n".join(quote_errors))
     validated, ids = [], set()
     for item in findings:
         identifier = text(item.get("id"), "机制ID", 100)
