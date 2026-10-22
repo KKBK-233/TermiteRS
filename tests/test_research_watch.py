@@ -899,6 +899,20 @@ class SnapshotTests(unittest.TestCase):
         self.cycle()
         self.assertEqual(self.model.calls, [])
 
+    def test_classification_reports_all_quote_errors_in_one_correction(self):
+        first, second = finding(), finding()
+        first["direction"]["quote"] = "The request keeps punctuation."
+        second["id"] = "other-mark"
+        second["mechanism"]["quote"] = "The date marks custom endpoint."
+        with self.assertRaises(ValueError) as caught:
+            research.classify_result({"accepted": True, "reason": "原文", "findings": [first, second]},
+                                     {"body": BODY.replace(". ", ".\n")}, require_dimensions=True)
+        message = str(caught.exception)
+        self.assertIn("date-mark 的 direction", message)
+        self.assertIn("other-mark 的 mechanism", message)
+        self.assertIn("The request keeps its punctuation.", message)
+        self.assertIn("The date marks the custom endpoint.", message)
+
     def test_new_results_must_include_explicit_dimensions(self):
         item = finding()
         item.pop("direction")
