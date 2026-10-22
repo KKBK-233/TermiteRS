@@ -923,6 +923,16 @@ class SnapshotTests(unittest.TestCase):
         self.cycle()
         self.assertEqual(self.model.calls, [])
 
+    def test_reviewed_unknown_remains_evidence_gap_not_stale_record(self):
+        self.cycle()
+        record = self.state["ledger"]["date-mark"][URL]
+        record["assessment"].update(status="unknown", trigger_state="unknown", handling="unknown")
+        section, _ = research.render_documents(self.state["ledger"], self.repo.code_hash)
+        row = next(line for line in section.splitlines() if "#mechanism-date-mark)" in line)
+        self.assertIn("待核实", row)
+        self.assertNotIn("待重评", row)
+        self.assertNotIn("旧记录待回填", row)
+
     def test_legacy_backfill_has_priority_within_existing_report_budget(self):
         self.cycle()
         self.state["ledger"]["date-mark"][URL]["assessment"].pop("handling")

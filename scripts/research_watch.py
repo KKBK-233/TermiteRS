@@ -959,7 +959,7 @@ def render_documents(ledger, current_hash, remote="", upstream=None, evaluation_
             f, assessment = item["finding"], item["assessment"]
             state = record_state(item, current_hash, current_files, upstream, evaluation_profile)
             is_current = active(item)
-            if is_current and assessment["status"] != "unknown" and not state.startswith(("待核实（", "待重评")):
+            if is_current and not state.startswith(("待核实（", "待重评")):
                 good.append(item)
             direction, trigger, handling = dimensions(item)
             source_url = item.get("tracked_upstream", {}).get("url", url)
@@ -1014,13 +1014,15 @@ def render_documents(ledger, current_hash, remote="", upstream=None, evaluation_
             versions.extend(re.findall(r"(?<!\d)\d+\.\d+\.\d+(?!\d)", version_text))
         version_cell = " / ".join(sorted(set(versions), key=version_rank, reverse=True)) or "未说明"
         groups.append((version_cell, name, direction, trigger, handling, state, sources))
+    unmigrated = sum(active(item) and not item.get("revised") and missing_dimensions(item)
+                     for rows in ledger.values() for item in rows.values())
     latest = max((item.get("checked_at", "") for records in ledger.values() for item in records.values()), default="")
     lines = [START, "## 隐写与指纹跟踪", "",
              "评估基准：" + ("Unbundle 默认配置；" if evaluation_profile == "unbundle_defaults" else "") + "假设云端 CLI 按指定报告版本描述运行，结合同版本报告及仓库源码静态评估。未经真实流量验证，不代表已检测实际部署版本或确认发生采集。", "",
              "“旧记录待回填”表示结构化字段尚未迁移，“证据不足／待核实”表示已评估但依据不足，“待重评”表示旧结论需要重新核验。方向、触发条件、网关处理分别记录；不经过网关不等于上传，未过滤不等于默认触发。来源差异须结合版本和路径查看，不能强行合并成确定结论。", ""]
     if upstream:
         lines += [f"固定研究上游：[{escape(upstream['repository'].removeprefix('https://github.com/'))}]({report_link(upstream['repository'])})；报告版本：{escape('、'.join(upstream['versions']))}（不代表官方最新发布版本）；读取提交：`{escape(upstream['commit'][:12])}`。", ""]
-    lines += [f"去重后 **{len(groups)} 项机制**；**{pending} 项含待重评来源**；**{conflicts} 项存在来源结论差异**。最近保存的报告核验记录：{escape(latest or '未说明')}。", "",
+    lines += [f"去重后 **{len(groups)} 项机制**；**{pending} 项含待重评来源**；**{conflicts} 项存在来源结论差异**；**{unmigrated} 条来源记录待回填字段**。最近保存的报告核验记录：{escape(latest or '未说明')}。", "",
               "研究快照：" + ("部分完成，保留旧评估及其基准，待重评项不作当前确定结论。" if pending or incomplete else "当前已展示来源的有效性见各行；报告队列及执行错误另记运行日志。"), "",
               "| 报告版本 | 机制 | 信号方向 | 默认触发 | 网关处理 | 评估状态 | 证据 |", "| --- | --- | --- | --- | --- | --- | --- |"]
     lines += ["| " + " | ".join(row) + " |" for row in groups]
